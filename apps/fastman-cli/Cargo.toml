@@ -1,0 +1,17 @@
+[package]
+name = "fastman-cli"
+description = "Headless CLI for listing, importing, and executing Fastman API requests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+fastman-core = { path = "../../crates/fastman-core" }
+anyhow.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3"

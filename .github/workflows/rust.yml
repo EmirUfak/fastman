@@ -1,0 +1,21 @@
+name: Rust core
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test headless core
+        run: cargo test --locked -p fastman-core -p fastman-cli
+      - name: Clippy headless core
+        run: cargo clippy --locked -p fastman-core -p fastman-cli --all-targets -- -D warnings
+# Intentionally not claiming a verified GPUI desktop CI setup. Add after
+# native dependencies are installed and platform smoke builds succeed.

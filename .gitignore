@@ -1,0 +1,12 @@
+/target/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.log
+fastman-data/
+.taste-skill/
+.env
+.env.*
+!*.example

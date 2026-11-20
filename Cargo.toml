@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/fastman-core", "apps/fastman-desktop", "apps/fastman-cli"]
+default-members = ["apps/fastman-desktop"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+keywords = ["api-client", "http", "rest", "local-first"]
+categories = ["development-tools", "web-programming::http-client"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

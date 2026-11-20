@@ -1,0 +1,16 @@
+[package]
+name = "fastman-desktop"
+description = "Native, local-first API development client built with Rust and GPUI Kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+fastman-core = { path = "../../crates/fastman-core" }
+gpui-kit = "=0.10.0"
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
