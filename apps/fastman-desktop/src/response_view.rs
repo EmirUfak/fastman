@@ -2,24 +2,342 @@ use crate::response_body_view::{
     CodeLines, HighlightedLine, MAX_HIGHLIGHTED_JSON_LINES, MAX_PRETTY_JSON_SOURCE_BYTES,
     precompute_json_lines, precompute_plain_lines, render_virtual_code_lines,
 };
-use crate::theme::{count_pill, status_badge, svg_icon};
+use crate::theme::{brand_accent, count_pill, status_badge, svg_icon};
 use fastman_core::HttpResponse;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariants as _},
     clipboard::Clipboard,
+    dialog::DialogEntrance,
     empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle},
     input::Input,
     notification::Notification,
     spinner::Spinner,
+    switch::Switch,
     tab::{Tab, TabBar},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::sync::Arc;
+use std::{fs, path::Path, sync::Arc};
 
 use super::WorkspaceView;
+
+const UI_SETTINGS_FILE: &str = "ui-settings.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponsePosition {
+    Bottom,
+    Left,
+    #[default]
+    Right,
+}
+
+impl ResponsePosition {
+    pub const ALL: [Self; 3] = [Self::Bottom, Self::Left, Self::Right];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "bottom" => Some(Self::Bottom),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bottom => "Bottom",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+
+    pub fn layout_hint(self) -> &'static str {
+        match self {
+            Self::Bottom => "Stacked",
+            Self::Left | Self::Right => "Vertical split",
+        }
+    }
+
+    pub fn icon_path(self) -> &'static str {
+        match self {
+            Self::Bottom => "icons/panel-bottom.svg",
+            Self::Left => "icons/panel-left.svg",
+            Self::Right => "icons/panel-right.svg",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UiSettings {
+    pub response_position: ResponsePosition,
+    pub response_raw: bool,
+    pub response_wrap: bool,
+}
+
+impl UiSettings {
+    pub fn load_from_root(root: &Path) -> Self {
+        let path = root.join(UI_SETTINGS_FILE);
+        let Ok(bytes) = fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Self::default();
+        };
+        Self {
+            response_position: value
+                .get("response_position")
+                .and_then(|v| v.as_str())
+                .and_then(ResponsePosition::from_str)
+                .unwrap_or_default(),
+            response_raw: value
+                .get("response_raw")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            response_wrap: value
+                .get("response_wrap")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn save_to_root(self, root: &Path) {
+        if fs::create_dir_all(root).is_err() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "response_position": self.response_position.as_str(),
+            "response_raw": self.response_raw,
+            "response_wrap": self.response_wrap,
+        });
+        if let Ok(encoded) = serde_json::to_vec_pretty(&payload) {
+            let _ = fs::write(root.join(UI_SETTINGS_FILE), encoded);
+        }
+    }
+}
+
+pub struct ResponseSettingsDialogView {
+    workspace: WeakEntity<WorkspaceView>,
+}
+
+impl ResponseSettingsDialogView {
+    pub fn new(workspace: WeakEntity<WorkspaceView>) -> Self {
+        Self { workspace }
+    }
+}
+
+impl Render for ResponseSettingsDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (position, response_raw, response_wrap) = self
+            .workspace
+            .upgrade()
+            .map(|entity| {
+                let view = entity.read(cx);
+                (
+                    view.response_position,
+                    view.response_raw,
+                    view.response_wrap,
+                )
+            })
+            .unwrap_or_default();
+
+        let border = cx.theme().border;
+        let muted_fg = cx.theme().muted_foreground;
+        let secondary_bg = cx.theme().secondary;
+        let is_dark = cx.theme().is_dark();
+        let accent = brand_accent(is_dark);
+
+        let position_cards = ResponsePosition::ALL.into_iter().map(|pos| {
+            let selected = pos == position;
+            let weak_ws = self.workspace.clone();
+            let weak_modal = cx.weak_entity();
+            div()
+                .id(SharedString::from(format!("response-pos-{}", pos.as_str())))
+                .flex_1()
+                .min_w_0()
+                .cursor_pointer()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if selected { accent } else { border })
+                .bg(if selected {
+                    accent.opacity(0.10)
+                } else {
+                    secondary_bg.opacity(0.45)
+                })
+                .hover(|s| {
+                    s.bg(if selected {
+                        accent.opacity(0.14)
+                    } else {
+                        secondary_bg.opacity(0.75)
+                    })
+                })
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .on_click(move |_, _, cx| {
+                    let _ = weak_ws.update(cx, |view, cx| {
+                        view.set_response_position(pos, cx);
+                    });
+                    let _ = weak_modal.update(cx, |_, cx| cx.notify());
+                })
+                .child(svg_icon(pos.icon_path()).small().text_color(if selected {
+                    accent
+                } else {
+                    muted_fg
+                }))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(if selected {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(if selected {
+                            cx.theme().foreground
+                        } else {
+                            muted_fg
+                        })
+                        .child(pos.label()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(muted_fg)
+                        .child(pos.layout_hint()),
+                )
+        });
+
+        let weak_ws_pretty = self.workspace.clone();
+        let weak_modal_pretty = cx.weak_entity();
+        let weak_ws_wrap = self.workspace.clone();
+        let weak_modal_wrap = cx.weak_entity();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Position"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(muted_fg)
+                                    .child("Choose where the response panel is anchored."),
+                            ),
+                    )
+                    .child(div().flex().items_center().gap_2().children(position_cards)),
+            )
+            .child(div().h(px(1.)).w_full().bg(border))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2p5()
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Display"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Pretty-print JSON"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(muted_fg)
+                                            .child("Format valid JSON responses automatically."),
+                                    ),
+                            )
+                            .child(
+                                Switch::new("response-setting-pretty")
+                                    .checked(!response_raw)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_ws_pretty.update(cx, |view, cx| {
+                                            view.toggle_response_raw(cx);
+                                        });
+                                        let _ = weak_modal_pretty.update(cx, |_, cx| cx.notify());
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Word wrap"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(muted_fg)
+                                            .child("Wrap long lines inside the response body."),
+                                    ),
+                            )
+                            .child(
+                                Switch::new("response-setting-wrap")
+                                    .checked(response_wrap)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_ws_wrap.update(cx, |view, cx| {
+                                            view.toggle_response_wrap(cx);
+                                        });
+                                        let _ = weak_modal_wrap.update(cx, |_, cx| cx.notify());
+                                    }),
+                            ),
+                    ),
+            )
+    }
+}
 
 pub(super) fn format_bytes(bytes: usize) -> String {
     if bytes < 1024 {
@@ -150,6 +468,80 @@ impl ResponseCacheEntry {
 }
 
 impl WorkspaceView {
+    pub(super) fn ui_settings(&self) -> UiSettings {
+        UiSettings {
+            response_position: self.response_position,
+            response_raw: self.response_raw,
+            response_wrap: self.response_wrap,
+        }
+    }
+
+    pub(super) fn persist_ui_settings(&self) {
+        self.ui_settings().save_to_root(self.workspace_store.root());
+    }
+
+    pub(super) fn set_response_position(
+        &mut self,
+        position: ResponsePosition,
+        cx: &mut Context<Self>,
+    ) {
+        if self.response_position == position {
+            return;
+        }
+        self.response_position = position;
+        self.persist_ui_settings();
+        self.set_status(
+            format!("Response position: {}", position.label()),
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(super) fn toggle_response_raw(&mut self, cx: &mut Context<Self>) {
+        self.response_raw = !self.response_raw;
+        self.refresh_response_search_matches(cx);
+        self.persist_ui_settings();
+        cx.notify();
+    }
+
+    pub(super) fn toggle_response_wrap(&mut self, cx: &mut Context<Self>) {
+        self.response_wrap = !self.response_wrap;
+        self.persist_ui_settings();
+        cx.notify();
+    }
+
+    pub(super) fn open_response_settings_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_workspace = cx.weak_entity();
+        let modal_view = cx.new(|_| ResponseSettingsDialogView::new(weak_workspace));
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .w(px(380.))
+                .centered()
+                .entrance(DialogEntrance::Fade)
+                .title("Response Area Settings")
+                .close_button(true)
+                .overlay_closable(true)
+                .keyboard(true)
+                .child(modal_view.clone())
+                .footer(
+                    div().w_full().flex().justify_end().child(
+                        Button::new("response-settings-done")
+                            .small()
+                            .primary()
+                            .label("Done")
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            }),
+                    ),
+                )
+        });
+    }
+
     pub(super) fn render_response_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let bg = cx.theme().background;
         let tab_bar_bg = cx.theme().tab_bar;
@@ -177,11 +569,10 @@ impl WorkspaceView {
         let match_count = self.response_search_matches;
 
         let toolbar = div()
-            .h(px(38.))
+            .h(px(36.))
             .px_3()
             .flex_shrink_0()
             .bg(tab_bar_bg)
-            .border_t_1()
             .border_b_1()
             .border_color(border)
             .flex()
@@ -189,154 +580,186 @@ impl WorkspaceView {
             .justify_between()
             .gap_2()
             .child(
-                TabBar::new("response-tabs")
-                    .underline()
-                    .small()
-                    .selected_index(self.response_tab)
-                    .on_click(cx.listener(|view, idx, _, cx| {
-                        view.response_tab = *idx;
-                        cx.notify();
-                    }))
-                    .child(
-                        Tab::new()
-                            .prefix(
-                                div()
-                                    .pr_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(svg_icon("icons/braces.svg").xsmall()),
-                            )
-                            .label("Body"),
-                    )
-                    .child(
-                        Tab::new()
-                            .prefix(
-                                div()
-                                    .pr_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(svg_icon("icons/layers.svg").xsmall()),
-                            )
-                            .label("Headers")
-                            .when(header_count > 0, |t| t.suffix(count_pill(header_count, cx))),
-                    )
-                    .child(
-                        Tab::new()
-                            .prefix(
-                                div()
-                                    .pr_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(svg_icon("icons/cookie.svg").xsmall()),
-                            )
-                            .label("Cookies")
-                            .when(cookie_count > 0, |t| t.suffix(count_pill(cookie_count, cx))),
-                    ),
-            )
-            .when_some(response, |bar, resp| {
-                let copy_text = display_body.clone().unwrap_or_default();
-                bar.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .flex_shrink_0()
-                        .child(status_badge(resp.status, &resp.reason, cx))
-                        .child(meta_pill(
-                            Some("icons/clock.svg"),
-                            resp.elapsed_label.clone(),
-                            cx,
-                        ))
-                        .child(meta_pill(None, resp.size_label.clone(), cx))
-                        .when(resp.truncated, |row| {
-                            row.child(
-                                div()
-                                    .h(px(22.))
-                                    .px_2()
-                                    .rounded(px(5.))
-                                    .bg(cx.theme().warning.opacity(0.18))
-                                    .text_color(cx.theme().warning)
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(svg_icon("icons/triangle-alert.svg").xsmall())
-                                    .child("2 MiB cap"),
-                            )
-                        })
-                        .when(self.response_tab == 0, |row| {
-                            row.when(has_valid_json, |r| {
-                                let mut btn = Button::new("toggle-raw-pretty")
-                                    .xsmall()
-                                    .label(if self.response_raw { "Raw" } else { "Pretty" })
-                                    .tooltip("Toggle formatted JSON / raw response")
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.response_raw = !view.response_raw;
-                                        view.refresh_response_search_matches(cx);
-                                        cx.notify();
-                                    }));
-                                btn = if !self.response_raw {
-                                    btn.secondary()
-                                } else {
-                                    btn.ghost()
-                                };
-                                r.child(btn)
-                            })
-                            .child({
-                                let mut btn = Button::new("toggle-wrap")
-                                    .xsmall()
-                                    .icon(svg_icon("icons/text-wrap.svg").xsmall())
-                                    .tooltip("Toggle word wrap")
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.response_wrap = !view.response_wrap;
-                                        cx.notify();
-                                    }));
-                                btn = if self.response_wrap {
-                                    btn.secondary()
-                                } else {
-                                    btn.ghost()
-                                };
-                                btn
-                            })
-                            .child({
-                                let mut btn = Button::new("toggle-find")
-                                    .xsmall()
-                                    .icon(svg_icon("icons/search.svg").xsmall())
-                                    .tooltip("Search response")
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.response_find_open = !view.response_find_open;
-                                        if view.response_find_open {
-                                            view.response_search
-                                                .read(cx)
-                                                .focus_handle(cx)
-                                                .focus(window, cx);
-                                        }
-                                        view.refresh_response_search_matches(cx);
-                                        cx.notify();
-                                    }));
-                                btn = if self.response_find_open {
-                                    btn.secondary()
-                                } else {
-                                    btn.ghost()
-                                };
-                                btn
-                            })
-                        })
+                div().flex_shrink_0().child(
+                    TabBar::new("response-tabs")
+                        .underline()
+                        .small()
+                        .selected_index(self.response_tab)
+                        .on_click(cx.listener(|view, idx, _, cx| {
+                            view.response_tab = *idx;
+                            cx.notify();
+                        }))
                         .child(
-                            Clipboard::new("copy-response-body")
-                                .xsmall()
-                                .value(copy_text)
-                                .tooltip("Copy response body")
-                                .on_copied(|_, window, cx| {
-                                    window.push_notification(
-                                        Notification::success("Response body copied to clipboard"),
-                                        cx,
-                                    );
-                                }),
+                            Tab::new()
+                                .prefix(
+                                    div()
+                                        .pr_1()
+                                        .flex()
+                                        .items_center()
+                                        .child(svg_icon("icons/braces.svg").xsmall()),
+                                )
+                                .label("Body"),
+                        )
+                        .child(
+                            Tab::new()
+                                .prefix(
+                                    div()
+                                        .pr_1()
+                                        .flex()
+                                        .items_center()
+                                        .child(svg_icon("icons/layers.svg").xsmall()),
+                                )
+                                .label("Headers")
+                                .when(header_count > 0, |t| t.suffix(count_pill(header_count, cx))),
+                        )
+                        .child(
+                            Tab::new()
+                                .prefix(
+                                    div()
+                                        .pr_1()
+                                        .flex()
+                                        .items_center()
+                                        .child(svg_icon("icons/cookie.svg").xsmall()),
+                                )
+                                .label("Cookies")
+                                .when(cookie_count > 0, |t| t.suffix(count_pill(cookie_count, cx))),
                         ),
-                )
-            });
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .id("response-toolbar-actions")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_1p5()
+                            .overflow_x_scroll()
+                            .when_some(response, |bar, resp| {
+                                let copy_text = display_body.clone().unwrap_or_default();
+                                bar.child(status_badge(resp.status, &resp.reason, cx))
+                                    .child(meta_pill(
+                                        Some("icons/clock.svg"),
+                                        resp.elapsed_label.clone(),
+                                        cx,
+                                    ))
+                                    .child(meta_pill(None, resp.size_label.clone(), cx))
+                                    .when(resp.truncated, |row| {
+                                        row.child(
+                                            div()
+                                                .h(px(22.))
+                                                .px_2()
+                                                .rounded(px(5.))
+                                                .bg(cx.theme().warning.opacity(0.18))
+                                                .text_color(cx.theme().warning)
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .flex_shrink_0()
+                                                .child(
+                                                    svg_icon("icons/triangle-alert.svg").xsmall(),
+                                                )
+                                                .child("2 MiB cap"),
+                                        )
+                                    })
+                                    .when(self.response_tab == 0, |row| {
+                                        row.when(has_valid_json, |r| {
+                                            let mut btn = Button::new("toggle-raw-pretty")
+                                                .xsmall()
+                                                .label(if self.response_raw {
+                                                    "Raw"
+                                                } else {
+                                                    "Pretty"
+                                                })
+                                                .tooltip("Toggle formatted JSON / raw response")
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.toggle_response_raw(cx);
+                                                }));
+                                            btn = if !self.response_raw {
+                                                btn.secondary()
+                                            } else {
+                                                btn.ghost()
+                                            };
+                                            r.child(btn)
+                                        })
+                                        .child({
+                                            let mut btn = Button::new("toggle-wrap")
+                                                .xsmall()
+                                                .icon(svg_icon("icons/text-wrap.svg").xsmall())
+                                                .tooltip("Toggle word wrap")
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.toggle_response_wrap(cx);
+                                                }));
+                                            btn = if self.response_wrap {
+                                                btn.secondary()
+                                            } else {
+                                                btn.ghost()
+                                            };
+                                            btn
+                                        })
+                                        .child({
+                                            let mut btn = Button::new("toggle-find")
+                                                .xsmall()
+                                                .icon(svg_icon("icons/search.svg").xsmall())
+                                                .tooltip("Search response")
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    view.response_find_open =
+                                                        !view.response_find_open;
+                                                    if view.response_find_open {
+                                                        view.response_search
+                                                            .read(cx)
+                                                            .focus_handle(cx)
+                                                            .focus(window, cx);
+                                                    }
+                                                    view.refresh_response_search_matches(cx);
+                                                    cx.notify();
+                                                }));
+                                            btn = if self.response_find_open {
+                                                btn.secondary()
+                                            } else {
+                                                btn.ghost()
+                                            };
+                                            btn
+                                        })
+                                    })
+                                    .child(
+                                        Clipboard::new("copy-response-body")
+                                            .xsmall()
+                                            .value(copy_text)
+                                            .tooltip("Copy response body")
+                                            .on_copied(|_, window, cx| {
+                                                window.push_notification(
+                                                    Notification::success(
+                                                        "Response body copied to clipboard",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }),
+                                    )
+                            }),
+                    )
+                    .child(
+                        Button::new("response-settings")
+                            .ghost()
+                            .xsmall()
+                            .icon(svg_icon("icons/settings.svg").xsmall())
+                            .tooltip("Response area settings")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_response_settings_dialog(window, cx);
+                            })),
+                    ),
+            );
 
         let find_bar = (self.response_find_open && response.is_some() && self.response_tab == 0)
             .then(|| {
@@ -469,11 +892,6 @@ impl WorkspaceView {
                     } else {
                         CodeLines::Plain(resp.raw_lines.clone())
                     };
-                    let line_count = match &code_lines {
-                        CodeLines::Json(lines) => lines.len(),
-                        CodeLines::Plain(lines) => lines.len(),
-                    };
-                    let uses_virtual_list = !self.response_wrap || line_count > 400;
                     let search_lower = if self.response_find_open {
                         self.response_search_lower.as_str()
                     } else {
@@ -486,22 +904,12 @@ impl WorkspaceView {
                         &self.response_scroll,
                         cx,
                     );
-                    let body_container = if uses_virtual_list {
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(code_element)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .id("response-body-wrapped-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(code_element)
-                            .into_any_element()
-                    };
+                    let body_container = div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(code_element)
+                        .into_any_element();
 
                     div()
                         .flex_1()

@@ -499,14 +499,11 @@ pub fn render_virtual_code_lines(
             .id("response-body-wrap-scroll")
             .size_full()
             .overflow_y_scroll()
-            .py_1p5()
             .font_family(mono)
             .text_size(px(12.))
             .line_height(px(20.))
             .text_color(foreground)
-            .flex()
-            .flex_col()
-            .children(rows)
+            .child(div().w_full().py_1p5().flex().flex_col().children(rows))
             .into_any_element();
     }
 
@@ -586,18 +583,19 @@ fn render_code_row(
     div()
         .w_full()
         .when(!wrap, |d| d.h(px(20.)))
-        .when(wrap, |d| d.min_h(px(20.)))
+        .when(wrap, |d| d.min_h(px(20.)).flex_shrink_0())
         .flex()
         .items_start()
         .hover(move |s| s.bg(row_hover))
+        .when(cfg!(test), |d| {
+            d.debug_selector(move || format!("code-row-{idx}"))
+        })
         .child(
             div()
                 .w(px(46.))
                 .flex_shrink_0()
                 .pr_2p5()
                 .text_right()
-                .border_r_1()
-                .border_color(border)
                 .text_color(gutter_fg)
                 .text_size(px(11.))
                 .line_height(px(20.))
@@ -607,6 +605,8 @@ fn render_code_row(
             div()
                 .flex_1()
                 .min_w_0()
+                .border_l_1()
+                .border_color(border)
                 .px_3()
                 .when(!wrap, |d| d.whitespace_nowrap())
                 .child(content),
@@ -680,5 +680,75 @@ mod tests {
         assert!(lines.len() >= 2);
         let rejoined: String = lines.iter().map(|s| s.as_ref()).collect();
         assert_eq!(rejoined, single_line);
+    }
+
+    #[::core::prelude::v1::test]
+    fn wrapped_lines_do_not_overlap_when_overflowing_viewport() {
+        let result = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut cx = gpui::TestAppContext::single();
+                cx.update(gpui_kit::init);
+
+                struct WrapProbe {
+                    lines: CodeLines,
+                    scroll: UniformListScrollHandle,
+                }
+
+                impl gpui::Render for WrapProbe {
+                    fn render(
+                        &mut self,
+                        _window: &mut gpui::Window,
+                        cx: &mut gpui::Context<Self>,
+                    ) -> impl gpui::IntoElement {
+                        div().size_full().flex().flex_col().child(
+                            div().flex_1().min_h_0().overflow_hidden().child(
+                                render_virtual_code_lines(
+                                    self.lines.clone(),
+                                    true,
+                                    "",
+                                    &self.scroll,
+                                    cx,
+                                ),
+                            ),
+                        )
+                    }
+                }
+
+                let mut raw_lines: Vec<SharedString> = Vec::new();
+                raw_lines.push("long-wrapped-line ".repeat(18).into());
+                for i in 1..90 {
+                    raw_lines.push(format!("line {i} short text").into());
+                }
+                let lines = CodeLines::Plain(Arc::new(raw_lines));
+
+                let (_, vcx) = cx.add_window_view(move |_, _| WrapProbe {
+                    lines,
+                    scroll: UniformListScrollHandle::new(),
+                });
+                vcx.simulate_resize(gpui::size(px(360.), px(220.)));
+                vcx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                });
+
+                let row0 = vcx.debug_bounds("code-row-0").expect("row 0 bounds");
+                let row1 = vcx.debug_bounds("code-row-1").expect("row 1 bounds");
+                assert!(
+                    row0.size.height > px(20.),
+                    "wrapped row 0 should grow taller than 20px, got {:?}",
+                    row0.size.height
+                );
+                assert!(
+                    row1.top() >= row0.bottom(),
+                    "row 1 ({:?}) overlapped row 0 ({:?})",
+                    row1,
+                    row0
+                );
+            })
+            .unwrap()
+            .join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

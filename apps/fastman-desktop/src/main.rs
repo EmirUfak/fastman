@@ -1,3 +1,6 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod command_palette;
 mod explorer;
 mod kv_editor;
 mod request_editor;
@@ -21,12 +24,14 @@ gpui_kit::actions!(
         ToggleTheme,
         OpenVariables,
         OpenImport,
+        OpenCommandPalette,
     ]
 );
 
 fn bind_shortcuts(cx: &mut App) {
     #[cfg(target_os = "macos")]
     let bindings = [
+        KeyBinding::new("cmd-k", OpenCommandPalette, None),
         KeyBinding::new("cmd-enter", SendRequest, None),
         KeyBinding::new("cmd-s", SaveRequest, None),
         KeyBinding::new("cmd-n", NewRequest, None),
@@ -37,6 +42,7 @@ fn bind_shortcuts(cx: &mut App) {
     ];
     #[cfg(not(target_os = "macos"))]
     let bindings = [
+        KeyBinding::new("ctrl-k", OpenCommandPalette, None),
         KeyBinding::new("ctrl-enter", SendRequest, None),
         KeyBinding::new("ctrl-s", SaveRequest, None),
         KeyBinding::new("ctrl-n", NewRequest, None),

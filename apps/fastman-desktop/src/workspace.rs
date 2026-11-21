@@ -1,9 +1,10 @@
+use crate::command_palette::CommandPaletteView;
 use crate::kv_editor::{KvTable, render_kv_table};
-use crate::response_view::ResponseCacheEntry;
+use crate::response_view::{ResponseCacheEntry, ResponsePosition, UiSettings};
 use crate::theme::{count_pill, svg_icon};
 use crate::{
-    CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenImport, OpenVariables, SaveRequest,
-    SendRequest, ToggleTheme,
+    CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenCommandPalette, OpenImport,
+    OpenVariables, SaveRequest, SendRequest, ToggleTheme,
 };
 use anyhow::{Context as _, Result};
 use fastman_core::{
@@ -18,11 +19,12 @@ use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Sizable as _, Theme, ThemeMode, WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants as _},
-    dialog::DialogButtonProps,
+    dialog::{DialogButtonProps, DialogEntrance},
     input::{
         EditorState, InlineToken, Input, InputContent, InputEvent, InputState, Textarea,
         TextareaState,
     },
+    kbd::Kbd,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -442,9 +444,11 @@ pub struct WorkspaceView {
     pub(super) body_json_valid: bool,
     pub(super) last_url: String,
     pub(super) active_curl_confirm: Option<WeakEntity<CurlImportConfirmView>>,
+    pub(super) active_command_palette: Option<WeakEntity<CommandPaletteView>>,
     pub(super) template_inspection: fastman_core::template::RequestTemplateInspection,
     pub(super) explorer_filter_lower: String,
     pub(super) response_tab: usize,
+    pub(super) response_position: ResponsePosition,
     pub(super) response_raw: bool,
     pub(super) response_wrap: bool,
     pub(super) response_find_open: bool,
@@ -610,6 +614,8 @@ impl WorkspaceView {
             .context("Build networking runtime")?;
         let engine = HttpEngine::new().context("Build HTTP client")?;
 
+        let ui_settings = UiSettings::load_from_root(store.root());
+
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             workspace_store: store.clone(),
@@ -657,11 +663,13 @@ impl WorkspaceView {
             body_json_valid: true,
             last_url: String::new(),
             active_curl_confirm: None,
+            active_command_palette: None,
             template_inspection: fastman_core::template::RequestTemplateInspection::default(),
             explorer_filter_lower: String::new(),
             response_tab: 0,
-            response_raw: false,
-            response_wrap: false,
+            response_position: ui_settings.response_position,
+            response_raw: ui_settings.response_raw,
+            response_wrap: ui_settings.response_wrap,
             response_find_open: false,
             response_search,
             response_search_lower: String::new(),
@@ -947,7 +955,7 @@ impl WorkspaceView {
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
-    fn set_status(
+    pub(super) fn set_status(
         &mut self,
         message: impl Into<SharedString>,
         is_error: bool,
@@ -1454,7 +1462,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn switch_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn switch_project(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index == self.active_project || index >= self.projects.len() {
             return;
         }
@@ -1466,6 +1479,17 @@ impl WorkspaceView {
         }
         self.cancel(cx);
         self.active_project = index;
+        if self
+            .project_selector
+            .read(cx)
+            .selected_index(cx)
+            .map(|p| p.row)
+            != Some(index)
+        {
+            self.project_selector.update(cx, |sel, cx| {
+                sel.set_selected_index(Some(IndexPath::default().row(index)), window, cx);
+            });
+        }
         self.selected_id = self.current().first_request_id();
         self.open_tabs = self.selected_id.clone().into_iter().collect();
         self.target_folder = None;
@@ -1476,7 +1500,26 @@ impl WorkspaceView {
         self.set_status(format!("Project: {}", self.current().name), false, cx);
     }
 
-    fn switch_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_folder_from_palette(
+        &mut self,
+        id: String,
+        ancestor_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        for ancestor in ancestor_ids {
+            self.expanded.insert(ancestor);
+        }
+        self.expanded.insert(id.clone());
+        self.target_folder = Some(id);
+        cx.notify();
+    }
+
+    pub(super) fn switch_workspace(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index == self.active_workspace || index >= self.workspaces.len() {
             return;
         }
@@ -2736,7 +2779,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next = if cx.theme().is_dark() {
             ThemeMode::Light
         } else {
@@ -2746,10 +2789,90 @@ impl WorkspaceView {
         crate::theme::apply_crisp_motion(cx);
         self.set_status(format!("Theme: {}", next.name()), false, cx);
     }
+
+    pub(super) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx)
+            && self
+                .active_command_palette
+                .as_ref()
+                .is_some_and(|weak| weak.upgrade().is_some())
+        {
+            self.active_command_palette = None;
+            window.close_dialog(cx);
+            return;
+        }
+
+        let weak_workspace = cx.weak_entity();
+        let palette_view =
+            cx.new(|cx| CommandPaletteView::new(self, weak_workspace.clone(), window, cx));
+        self.active_command_palette = Some(palette_view.downgrade());
+        let initial_focus = Cell::new(true);
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                let palette = palette_view.clone();
+                palette.update(cx, |view, cx| view.focus(window, cx));
+            }
+            let weak_close = weak_workspace.clone();
+            dialog
+                .w(px(640.))
+                .close_button(false)
+                .entrance(DialogEntrance::None)
+                .py_2()
+                .on_close(move |_, _, cx| {
+                    let _ = weak_close.update(cx, |view, _| {
+                        view.active_command_palette = None;
+                    });
+                })
+                .child(palette_view.clone())
+        });
+    }
+
+    fn render_request_response_area(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.response_position {
+            ResponsePosition::Bottom => v_resizable("request-response-panels-bottom")
+                .child(
+                    resizable_panel()
+                        .size(px(360.))
+                        .size_range(px(200.)..px(900.))
+                        .child(self.render_request_panel(cx)),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(180.)..px(900.))
+                        .child(self.render_response_panel(cx)),
+                )
+                .into_any_element(),
+            ResponsePosition::Left => h_resizable("request-response-panels-left")
+                .child(
+                    resizable_panel()
+                        .size_range(px(260.)..Pixels::MAX)
+                        .child(self.render_response_panel(cx)),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(280.)..Pixels::MAX)
+                        .child(self.render_request_panel(cx)),
+                )
+                .into_any_element(),
+            ResponsePosition::Right => h_resizable("request-response-panels-right")
+                .child(
+                    resizable_panel()
+                        .size_range(px(280.)..Pixels::MAX)
+                        .child(self.render_request_panel(cx)),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(260.)..Pixels::MAX)
+                        .child(self.render_response_panel(cx)),
+                )
+                .into_any_element(),
+        }
+    }
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
         let title_bar_bg = cx.theme().title_bar;
         let title_border = cx.theme().title_bar_border;
@@ -2823,6 +2946,21 @@ impl Render for WorkspaceView {
                     }),
             )
             .child(div().flex_1())
+            .child(
+                Button::new("open-command-palette")
+                    .small()
+                    .outline()
+                    .icon(svg_icon("icons/search.svg").small())
+                    .label("Commands")
+                    .when_some(
+                        Kbd::global_binding_for_action(&OpenCommandPalette, window),
+                        |btn, kbd| btn.child(kbd),
+                    )
+                    .tooltip("Open Command Palette (Ctrl+K)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_command_palette(window, cx);
+                    })),
+            )
             .child(
                 Button::new("open-variables")
                     .small()
@@ -2961,6 +3099,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|view, _: &OpenImport, window, cx| {
                 view.open_import_dialog(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &OpenCommandPalette, window, cx| {
+                view.open_command_palette(window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -2979,20 +3120,9 @@ impl Render for WorkspaceView {
                         )
                         .child(
                             resizable_panel().child(
-                                div().size_full().child(
-                                    v_resizable("request-response-panels")
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(360.))
-                                                .size_range(px(200.)..px(700.))
-                                                .child(self.render_request_panel(cx)),
-                                        )
-                                        .child(
-                                            resizable_panel()
-                                                .size_range(px(180.)..px(700.))
-                                                .child(self.render_response_panel(cx)),
-                                        ),
-                                ),
+                                div()
+                                    .size_full()
+                                    .child(self.render_request_response_area(cx)),
                             ),
                         ),
                 ),
@@ -3476,6 +3606,221 @@ mod tests {
             assert_eq!(
                 confirm.read(cx).report.unsupported_flags,
                 vec!["--form".to_string(), "-k".to_string()]
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn response_position_defaults_to_right_and_persists_across_reloads() {
+        run_view_test(check_response_position_and_settings_dialog);
+    }
+
+    fn check_response_position_and_settings_dialog() {
+        use crate::response_view::ResponsePosition;
+        use gpui_kit::component::WindowExt as _;
+
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.response_position, ResponsePosition::Right);
+                assert!(!window.has_active_dialog(cx));
+
+                view.open_response_settings_dialog(window, cx);
+                assert!(window.has_active_dialog(cx));
+                window.close_dialog(cx);
+
+                view.set_response_position(ResponsePosition::Left, cx);
+                assert_eq!(view.response_position, ResponsePosition::Left);
+
+                view.toggle_response_wrap(cx);
+                assert!(view.response_wrap);
+
+                view.toggle_response_raw(cx);
+                assert!(view.response_raw);
+
+                view.set_response_position(ResponsePosition::Bottom, cx);
+                assert_eq!(view.response_position, ResponsePosition::Bottom);
+            });
+        })
+        .unwrap();
+
+        // Reload in a fresh view against the same store root and verify persisted UI settings.
+        let (window2, view2) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window2, |_, _, cx| {
+            let v = view2.read(cx);
+            assert_eq!(v.response_position, ResponsePosition::Bottom);
+            assert!(v.response_wrap);
+            assert!(v.response_raw);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn command_palette_toggles_filters_and_executes_targets() {
+        run_view_test(check_command_palette_flow);
+    }
+
+    fn check_command_palette_flow() {
+        use crate::command_palette::{
+            PaletteAction, PaletteSection, PaletteTarget, execute_palette_target, filter_catalog,
+        };
+        use crate::response_view::ResponsePosition;
+        use gpui_kit::component::WindowExt as _;
+
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+
+        let mut proj1 = store.create("Payments API").unwrap();
+        let mut parent = Folder::new("Billing");
+        let mut child = Folder::new("Invoices");
+        let child_id = child.id.clone();
+        let parent_id = parent.id.clone();
+        let invoice_req =
+            ApiRequest::new("POST", "Create Invoice", "https://api.example/v1/invoices");
+        let invoice_req_id = invoice_req.id.clone();
+        child.requests.push(invoice_req);
+        parent.folders.push(child);
+        proj1.collections[0].folders.push(parent);
+        let health_req = ApiRequest::new("GET", "Health Check", "https://api.example/health");
+        proj1.collections[0].requests.push(health_req);
+        store.save(&proj1).unwrap();
+
+        let proj2 = store.create("Auth Service").unwrap();
+        store.save(&proj2).unwrap();
+
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            let weak_view = view.downgrade();
+            view.update(cx, |view, cx| {
+                let payments_ix = view
+                    .projects
+                    .iter()
+                    .position(|p| p.name == "Payments API")
+                    .expect("Payments API project");
+                view.switch_project(payments_ix, window, cx);
+
+                assert!(!window.has_active_dialog(cx));
+                view.open_command_palette(window, cx);
+                assert!(window.has_active_dialog(cx));
+
+                let palette = view
+                    .active_command_palette
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .expect("palette view entity");
+                {
+                    let catalog = &palette.read(cx).catalog;
+                    let groups = filter_catalog(catalog, "post invo");
+                    assert_eq!(groups[0].0, PaletteSection::Requests);
+                    assert_eq!(groups[0].1[0].title, "Create Invoice");
+
+                    let folder_groups = filter_catalog(catalog, "Invoices");
+                    assert!(
+                        folder_groups
+                            .iter()
+                            .any(|(sec, entries)| *sec == PaletteSection::Folders
+                                && entries.iter().any(|e| e.title == "Invoices"))
+                    );
+                }
+
+                // Calling open_command_palette again toggles the palette closed.
+                view.open_command_palette(window, cx);
+                assert!(!window.has_active_dialog(cx));
+                assert!(view.active_command_palette.is_none());
+            });
+
+            // Execute Request navigation target.
+            execute_palette_target(
+                PaletteTarget::Request {
+                    id: invoice_req_id.clone(),
+                },
+                &weak_view,
+                window,
+                cx,
+            );
+            view.update(cx, |view, _| {
+                assert_eq!(view.selected_id.as_deref(), Some(invoice_req_id.as_str()));
+                assert!(view.open_tabs.contains(&invoice_req_id));
+                view.expanded.clear();
+            });
+
+            // Execute nested Folder target: expands ancestor & folder and focuses it.
+            execute_palette_target(
+                PaletteTarget::Folder {
+                    id: child_id.clone(),
+                    ancestor_ids: vec![parent_id.clone()],
+                },
+                &weak_view,
+                window,
+                cx,
+            );
+            view.update(cx, |view, _| {
+                assert!(view.expanded.contains(&parent_id));
+                assert!(view.expanded.contains(&child_id));
+                assert_eq!(view.target_folder.as_deref(), Some(child_id.as_str()));
+            });
+
+            // Execute CycleResponsePosition action.
+            execute_palette_target(
+                PaletteTarget::Action(PaletteAction::CycleResponsePosition),
+                &weak_view,
+                window,
+                cx,
+            );
+            assert_eq!(view.read(cx).response_position, ResponsePosition::Bottom);
+
+            // Execute Project switch and check project_selector sync.
+            let target_proj_idx = view
+                .read(cx)
+                .projects
+                .iter()
+                .position(|p| p.name == "Auth Service")
+                .expect("Auth Service project");
+            execute_palette_target(
+                PaletteTarget::Project {
+                    index: target_proj_idx,
+                },
+                &weak_view,
+                window,
+                cx,
+            );
+            let v = view.read(cx);
+            assert_eq!(v.active_project, target_proj_idx);
+            assert_eq!(
+                v.project_selector
+                    .read(cx)
+                    .selected_index(cx)
+                    .map(|p| p.row),
+                Some(target_proj_idx)
             );
         })
         .unwrap();

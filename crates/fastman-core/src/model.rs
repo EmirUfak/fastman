@@ -136,12 +136,8 @@ fn delete_folder_in(folders: &mut Vec<Folder>, folder_id: &str) -> bool {
 }
 
 fn take_folder_in(folders: &mut Vec<Folder>, folder_id: &str) -> Option<Folder> {
-    if let Some(index) = folders.iter().position(|f| f.id == folder_id) {
-        return Some(folders.remove(index));
-    }
-    folders
-        .iter_mut()
-        .find_map(|f| take_folder_in(&mut f.folders, folder_id))
+    let (folders, index) = find_folder_vec_mut_in(folders, folder_id)?;
+    Some(folders.remove(index))
 }
 
 fn find_folder_location_in<'a>(
@@ -170,10 +166,8 @@ fn take_request_in(
     folders: &mut [Folder],
     request_id: &str,
 ) -> Option<ApiRequest> {
-    if let Some(index) = requests.iter().position(|r| r.id == request_id) {
-        return Some(requests.remove(index));
-    }
-    folders.iter_mut().find_map(|f| f.take_request(request_id))
+    let (requests, index) = find_request_vec_mut_in(requests, folders, request_id)?;
+    Some(requests.remove(index))
 }
 
 fn find_request_vec_mut_in<'a>(
@@ -215,31 +209,18 @@ fn find_folder_vec_mut_in<'a>(
         .find_map(|f| find_folder_vec_mut_in(&mut f.folders, folder_id))
 }
 
-fn find_folder_bounds_in(folders: &[Folder], folder_id: &str) -> Option<(usize, usize)> {
-    if let Some(index) = folders.iter().position(|f| f.id == folder_id) {
-        return Some((index, folders.len()));
-    }
-    folders
-        .iter()
-        .find_map(|f| find_folder_bounds_in(&f.folders, folder_id))
-}
-
 fn duplicate_request_in(
     requests: &mut Vec<ApiRequest>,
     folders: &mut [Folder],
     request_id: &str,
 ) -> Option<String> {
-    if let Some(index) = requests.iter().position(|r| r.id == request_id) {
-        let mut copy = requests[index].clone();
-        copy.id = new_id();
-        copy.name = format!("{} (copy)", copy.name);
-        let new_request_id = copy.id.clone();
-        requests.insert(index + 1, copy);
-        return Some(new_request_id);
-    }
-    folders
-        .iter_mut()
-        .find_map(|f| f.duplicate_request(request_id))
+    let (requests, index) = find_request_vec_mut_in(requests, folders, request_id)?;
+    let mut copy = requests[index].clone();
+    copy.id = new_id();
+    copy.name = format!("{} (copy)", copy.name);
+    let new_request_id = copy.id.clone();
+    requests.insert(index + 1, copy);
+    Some(new_request_id)
 }
 
 impl Folder {
@@ -545,9 +526,8 @@ impl Project {
 
     /// Returns `(index, total_siblings)` for a folder within its immediate parent.
     pub fn folder_order_bounds(&self, folder_id: &str) -> Option<(usize, usize)> {
-        self.collections
-            .iter()
-            .find_map(|c| find_folder_bounds_in(&c.folders, folder_id))
+        self.find_folder_location(folder_id)
+            .map(|(_, _, index, len)| (index, len))
     }
 
     /// Flattened `(folder_id, display_path)` list of all folders in the project.

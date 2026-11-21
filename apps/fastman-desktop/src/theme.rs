@@ -180,8 +180,9 @@ pub fn dot_indicator(color: Hsla) -> AnyElement {
 pub fn apply_crisp_motion(cx: &mut App) {
     gpui_kit::component::Theme::update(cx, |theme| {
         theme.motion.duration_fast = std::time::Duration::from_millis(90);
-        theme.motion.duration_normal = std::time::Duration::from_millis(140);
+        theme.motion.duration_normal = std::time::Duration::from_millis(160);
         theme.motion.duration_slow = std::time::Duration::from_millis(200);
+        theme.motion.easing_enter = gpui_kit::base::Easing::EaseOut;
         theme.motion.spring_control =
             gpui_kit::base::Spring::new(std::time::Duration::from_millis(140));
         theme.motion.spring_move =
