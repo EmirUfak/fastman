@@ -413,11 +413,7 @@ impl Project {
         if trimmed.is_empty() {
             return false;
         }
-        if let Some(collection) = self
-            .collections
-            .iter_mut()
-            .find(|c| c.id == collection_id)
-        {
+        if let Some(collection) = self.collections.iter_mut().find(|c| c.id == collection_id) {
             collection.name = trimmed.to_owned();
             return true;
         }

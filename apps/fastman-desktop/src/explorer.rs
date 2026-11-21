@@ -531,11 +531,7 @@ impl WorkspaceView {
                                 .icon(svg_icon("icons/trash.svg"))
                                 .on_click(move |_, window, cx| {
                                     let _ = v_del.update(cx, |view, cx| {
-                                        view.confirm_delete_collection(
-                                            id_del.clone(),
-                                            window,
-                                            cx,
-                                        );
+                                        view.confirm_delete_collection(id_del.clone(), window, cx);
                                     });
                                 }),
                         )

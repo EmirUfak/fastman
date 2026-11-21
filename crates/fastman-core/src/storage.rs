@@ -616,6 +616,58 @@ mod tests {
     }
 
     #[test]
+    fn contending_save_leaves_project_unchanged_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let first = ProjectStore::at(root.path());
+        let second = ProjectStore::at(root.path());
+        let mut project = first.create("Original").unwrap();
+        second.load(&project.id).unwrap();
+        let project_dir = root.path().join(&project.id);
+        let lock = DirLockGuard::acquire(&project_dir).unwrap();
+
+        project.name = "Updated".into();
+        let error = second.save(&project).unwrap_err();
+        assert!(error.to_string().contains("waiting for project save lock"));
+        assert!(project_dir.join(".save.lock").exists());
+        assert_eq!(first.load(&project.id).unwrap().name, "Original");
+
+        drop(lock);
+        second.save(&project).unwrap();
+        assert_eq!(first.load(&project.id).unwrap().name, "Updated");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_replacement_preserves_previous_project_and_cleans_up_temp_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let mut project = store.create("Original").unwrap();
+        let project_dir = root.path().join(&project.id);
+        // Permit reads and writes but deny renaming the open destination.
+        let open_project = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(project_dir.join("project.json"))
+            .unwrap();
+
+        project.name = "Updated".into();
+        let error = store.save(&project).unwrap_err();
+        assert!(error.to_string().contains("Back up previous project"));
+        assert_eq!(store.load(&project.id).unwrap().name, "Original");
+        let files: Vec<_> = fs::read_dir(&project_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["project.json"]);
+
+        drop(open_project);
+        store.save(&project).unwrap();
+        assert_eq!(store.load(&project.id).unwrap().name, "Updated");
+    }
+
+    #[test]
     fn detects_concurrent_save_conflicts_and_recovers_interrupted_backup() {
         let dir = tempfile::tempdir().unwrap();
         let store_a = ProjectStore::at(dir.path());

@@ -361,7 +361,14 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self> {
-        let store = ProjectStore::system_default()?;
+        Self::with_store(ProjectStore::system_default()?, window, cx)
+    }
+
+    fn with_store(
+        store: ProjectStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
         let (workspaces, mut startup_warnings) = store.workspaces_resilient()?;
         let (mut projects, proj_warnings) = store.list_resilient()?;
         startup_warnings.extend(proj_warnings);
@@ -2366,6 +2373,90 @@ impl WorkspaceView {
         Theme::change(next, Some(window), cx);
         crate::theme::apply_crisp_motion(cx);
         self.set_status(format!("Theme: {}", next.name()), false, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceView;
+    use fastman_core::storage::ProjectStore;
+    use gpui::{AppContext, TestAppContext};
+
+    #[test]
+    fn project_switch_saves_draft_but_keeps_it_open_on_conflict() {
+        // Building the full view in debug mode exceeds the default test stack on Windows.
+        let result = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_project_switch)
+            .unwrap()
+            .join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn check_project_switch() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let other_instance = ProjectStore::at(root.path());
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+        let saved_url = "https://example.com/saved";
+        let draft_url = "https://example.com/draft";
+        let external_url = "https://example.com/external";
+
+        let (project_id, request_id) = cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let ids = (view.current().id.clone(), view.selected_id.clone().unwrap());
+                    view.projects.push(store.create("Second project").unwrap());
+                    view.url
+                        .update(cx, |input, cx| input.replace_all(saved_url, window, cx));
+                    ids
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 1);
+                assert!(!view.dirty);
+                view.switch_project(0, window, cx);
+                view.url
+                    .update(cx, |input, cx| input.replace_all(draft_url, window, cx));
+            });
+        })
+        .unwrap();
+
+        let mut external = other_instance.load(&project_id).unwrap();
+        assert_eq!(external.find_request(&request_id).unwrap().url, saved_url);
+        external.find_request_mut(&request_id).unwrap().url = external_url.into();
+        other_instance.save(&external).unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 0);
+                assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
+                assert_eq!(view.url.read(cx).value().as_ref(), draft_url);
+                assert!(view.dirty);
+                assert!(view.status_is_error);
+                assert!(view.status.contains("modified on disk"));
+            });
+        })
+        .unwrap();
+        let disk = other_instance.load(&project_id).unwrap();
+        assert_eq!(disk.find_request(&request_id).unwrap().url, external_url);
     }
 }
 

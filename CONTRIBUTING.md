@@ -23,6 +23,15 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
+### Desktop save and navigation smoke test
+
+The automated project-switch test covers saving and conflict handling without a native window. Use this smoke test to also check the visible editor and error notification.
+
+1. Set `FASTMAN_HOME` to a new temporary directory and start the desktop app with `cargo run --locked -p fastman-desktop`. Use test data only.
+2. Create a second project. In the first project, change a request URL without saving, switch projects, then switch back. Verify the new URL is still present after restarting the app.
+3. Open two instances using the same `FASTMAN_HOME`. In the first instance, change the request URL without saving. In the second, change the same request to a different URL and save it.
+4. In the first instance, try switching projects. Verify that the app reports a save conflict, stays on the current project and request, and still shows the unsaved URL. Restart the second instance and verify its saved URL is still on disk.
+
 ## Engineering guidelines
 
 1. **Keep `fastman-core` GUI-free:** Do not introduce GPUI or windowing dependencies into `crates/fastman-core`.
