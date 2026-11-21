@@ -329,15 +329,53 @@ impl WorkspaceView {
                     .tooltip("Save request (Ctrl+S)")
                     .on_click(cx.listener(|view, _, window, cx| view.save_with_toast(window, cx))),
             )
-            .child(
+            .child({
+                let curl_view = cx.weak_entity();
+                let has_sensitive = self.dirty
+                    || self.auth_kind != 0
+                    || self.current_request().is_some_and(|req| {
+                        fastman_core::curl::to_curl_export(req, &self.current().variables, true)
+                            .is_ok_and(|res| res.had_secrets || res.had_variables)
+                    });
                 Button::new("copy-curl")
                     .outline()
+                    .dropdown_caret(true)
                     .icon(svg_icon("icons/terminal.svg").small())
                     .tooltip("Copy as cURL")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.copy_request_as_curl(None, window, cx);
-                    })),
-            );
+                    .dropdown_menu(move |mut menu, _, _| {
+                        let v_safe = curl_view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(if has_sensitive {
+                                "Copy Redacted cURL (Safe)"
+                            } else {
+                                "Copy as cURL"
+                            })
+                            .icon(svg_icon(if has_sensitive {
+                                "icons/shield-check.svg"
+                            } else {
+                                "icons/terminal.svg"
+                            }))
+                            .on_click(move |_, window, cx| {
+                                let _ = v_safe.update(cx, |view, cx| {
+                                    view.copy_request_as_curl(None, false, window, cx);
+                                });
+                            }),
+                        );
+                        if has_sensitive {
+                            let v_full = curl_view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new("Copy Full cURL (Includes Secrets)...")
+                                    .icon(svg_icon("icons/triangle-alert.svg"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = v_full.update(cx, |view, cx| {
+                                            view.copy_request_as_curl(None, true, window, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    })
+            });
 
         let body_tag = match self.body_kind {
             1 => Some("JSON"),
@@ -630,7 +668,7 @@ impl WorkspaceView {
                                     .xsmall()
                                     .text_color(cx.theme().success),
                             )
-                            .child("Session-only: credentials stay in memory and are excluded from saved project JSON."),
+                            .child("Session-only: Auth fields stay in memory and are excluded from saved project JSON (avoid putting secrets inside saved {{variables}})."),
                     )
                     .into_any_element()
             }
@@ -908,8 +946,54 @@ impl WorkspaceView {
                                 .items_center()
                                 .justify_between()
                                 .text_size(px(12.))
-                                .child(div().text_color(muted_fg).child("Redirect Limit"))
-                                .child(div().font_weight(FontWeight::MEDIUM).child("Up to 10 hops")),
+                                .child(div().text_color(muted_fg).child("Redirect Policy"))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Up to 10 same-origin hops"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .text_color(muted_fg)
+                                        .child("Cross-Origin & HTTPS Downgrade"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_color(cx.theme().success)
+                                        .child(svg_icon("icons/shield-check.svg").xsmall())
+                                        .child("Blocked"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .text_size(px(12.))
+                                .child(div().text_color(muted_fg).child("Environment Proxy"))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(11.5))
+                                        .child(
+                                            fastman_core::http::configured_env_proxy_summary()
+                                                .unwrap_or_else(|| {
+                                                    "None in env (OS proxy may apply)".to_owned()
+                                                }),
+                                        ),
+                                ),
                         ),
                 )
                 .into_any_element(),

@@ -1,6 +1,6 @@
 use crate::json_highlight::{
-    CodeLines, HighlightedLine, precompute_json_lines, precompute_plain_lines,
-    render_virtual_code_lines,
+    CodeLines, HighlightedLine, MAX_HIGHLIGHTED_JSON_LINES, MAX_PRETTY_JSON_SOURCE_BYTES,
+    precompute_json_lines, precompute_plain_lines, render_virtual_code_lines,
 };
 use crate::theme::{count_pill, format_bytes, format_duration, status_badge, svg_icon};
 use fastman_core::HttpResponse;
@@ -50,6 +50,7 @@ pub struct ResponseCacheEntry {
     pub error: Option<SharedString>,
     pub sent_method: SharedString,
     pub sent_url: SharedString,
+    pub approx_bytes: usize,
 }
 
 impl ResponseCacheEntry {
@@ -58,9 +59,19 @@ impl ResponseCacheEntry {
         sent_method: impl Into<SharedString>,
         sent_url: impl Into<SharedString>,
     ) -> Self {
-        let pretty_body = serde_json::from_str::<serde_json::Value>(&response.body)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok());
+        let mut pretty_body = (response.body.len() <= MAX_PRETTY_JSON_SOURCE_BYTES)
+            .then(|| {
+                serde_json::from_str::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            })
+            .flatten();
+        if let Some(ref pretty) = pretty_body {
+            let too_many_lines = pretty.lines().nth(MAX_HIGHLIGHTED_JSON_LINES).is_some();
+            if pretty.len() > 2 * 1024 * 1024 || too_many_lines {
+                pretty_body = None;
+            }
+        }
         let raw_lines = Arc::new(precompute_plain_lines(&response.body));
         let pretty_lines = pretty_body
             .as_deref()
@@ -68,13 +79,18 @@ impl ResponseCacheEntry {
             .map(Arc::new)
             .unwrap_or_else(|| Arc::new(Vec::new()));
         let cookies = Arc::new(parse_cookies(&response));
-        let headers = Arc::new(
+        let headers: Arc<Vec<(SharedString, SharedString)>> = Arc::new(
             response
                 .headers
                 .into_iter()
                 .map(|(k, v)| (SharedString::from(k), SharedString::from(v)))
                 .collect(),
         );
+        let approx_bytes = response.body.len()
+            + pretty_body.as_ref().map_or(0, String::len)
+            + raw_lines.len() * 32
+            + pretty_lines.len() * 64
+            + headers.len() * 64;
 
         Self {
             response: Some(PrecomputedResponse {
@@ -94,6 +110,7 @@ impl ResponseCacheEntry {
             error: None,
             sent_method: sent_method.into(),
             sent_url: sent_url.into(),
+            approx_bytes,
         }
     }
 
@@ -102,11 +119,14 @@ impl ResponseCacheEntry {
         sent_method: impl Into<SharedString>,
         sent_url: impl Into<SharedString>,
     ) -> Self {
+        let error = error.into();
+        let approx_bytes = error.len() + 128;
         Self {
             response: None,
-            error: Some(error.into()),
+            error: Some(error),
             sent_method: sent_method.into(),
             sent_url: sent_url.into(),
+            approx_bytes,
         }
     }
 }
@@ -894,6 +914,10 @@ fn classify_error(err: &str) -> &'static str {
         "Invalid URL"
     } else if lower.contains("timed out") || lower.contains("timeout") {
         "Request Timed Out"
+    } else if lower.contains("redirect") {
+        "Redirect Blocked"
+    } else if lower.contains("exceeds maximum") {
+        "Payload Too Large"
     } else if lower.contains("dns") || lower.contains("connect") {
         "Connection Failed"
     } else {

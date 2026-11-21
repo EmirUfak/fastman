@@ -4,6 +4,10 @@ use gpui_kit::*;
 use std::{ops::Range, sync::Arc};
 
 const MAX_WRAP_LINES: usize = 400;
+const MAX_DISPLAY_LINE_BYTES: usize = 4096;
+const MAX_DISPLAY_LINES: usize = 50_000;
+pub const MAX_PRETTY_JSON_SOURCE_BYTES: usize = 512 * 1024;
+pub const MAX_HIGHLIGHTED_JSON_LINES: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonTokenKind {
@@ -176,6 +180,7 @@ pub fn precompute_json_lines(text: &str) -> Vec<HighlightedLine> {
         }];
     }
     text.lines()
+        .take(MAX_HIGHLIGHTED_JSON_LINES)
         .map(|line| {
             let mut tokens = Vec::new();
             let mut offset = 0usize;
@@ -194,12 +199,41 @@ pub fn precompute_json_lines(text: &str) -> Vec<HighlightedLine> {
         .collect()
 }
 
-/// Split plain text into `SharedString` lines once per response.
+/// Split plain text into `SharedString` lines once per response, chunking
+/// abnormally long lines so UI text layout stays bounded.
 pub fn precompute_plain_lines(text: &str) -> Vec<SharedString> {
     if text.is_empty() {
         return vec!["".into()];
     }
-    text.lines().map(|line| line.to_owned().into()).collect()
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.len() <= MAX_DISPLAY_LINE_BYTES {
+            out.push(line.to_owned().into());
+            if out.len() >= MAX_DISPLAY_LINES {
+                break;
+            }
+            continue;
+        }
+        let mut start = 0;
+        while start < line.len() {
+            if out.len() >= MAX_DISPLAY_LINES {
+                return out;
+            }
+            let mut end = (start + MAX_DISPLAY_LINE_BYTES).min(line.len());
+            while end > start && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = line.len();
+            }
+            out.push(line[start..end].to_owned().into());
+            start = end;
+        }
+    }
+    if out.is_empty() {
+        out.push("".into());
+    }
+    out
 }
 
 /// Count case-insensitive occurrences of `needle` in `haystack`.
@@ -208,9 +242,29 @@ pub fn count_search_matches(haystack: &str, needle: &str) -> usize {
     if needle_trimmed.is_empty() {
         return 0;
     }
-    let hay_lower = haystack.to_ascii_lowercase();
+    if needle_trimmed.is_ascii() {
+        let hay = haystack.as_bytes();
+        let ned = needle_trimmed.as_bytes();
+        if hay.len() < ned.len() {
+            return 0;
+        }
+        let mut count = 0;
+        let mut i = 0;
+        while i + ned.len() <= hay.len() {
+            if hay[i..i + ned.len()].eq_ignore_ascii_case(ned) {
+                count += 1;
+                i += ned.len();
+            } else {
+                i += 1;
+            }
+        }
+        return count;
+    }
     let ned_lower = needle_trimmed.to_ascii_lowercase();
-    hay_lower.match_indices(&ned_lower).count()
+    haystack
+        .lines()
+        .map(|line| line.to_ascii_lowercase().match_indices(&ned_lower).count())
+        .sum()
 }
 
 fn token_color(kind: JsonTokenKind, is_dark: bool, muted_fg: Hsla, foreground: Hsla) -> Hsla {
@@ -615,5 +669,14 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    #[::core::prelude::v1::test]
+    fn chunks_oversized_single_plain_line_without_splitting_utf8() {
+        let single_line = "ğ".repeat(5000);
+        let lines = precompute_plain_lines(&single_line);
+        assert!(lines.len() >= 2);
+        let rejoined: String = lines.iter().map(|s| s.as_ref()).collect();
+        assert_eq!(rejoined, single_line);
     }
 }

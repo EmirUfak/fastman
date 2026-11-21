@@ -248,3 +248,47 @@ async fn slow_request_times_out() {
     assert!(matches!(error, fastman_core::http::HttpError::Transport(ref e) if e.is_timeout()));
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn avoids_duplicate_content_type_and_auth_headers_and_redacts_error_urls() {
+    let mut request = ApiRequest::new("POST", "dedup", "");
+    request.auth = Auth::Bearer {
+        token: "new_secret".into(),
+    };
+    request
+        .headers
+        .push(KeyValue::new("Authorization", "Bearer stale_secret"));
+    request.headers.push(KeyValue::new(
+        "Content-Type",
+        "application/merge-patch+json",
+    ));
+    request.body = HttpBody::Json(r#"{"x":1}"#.into());
+    let (wire, _) = exchange(request, BTreeMap::new()).await;
+    let lower = wire.to_ascii_lowercase();
+    assert_eq!(lower.matches("content-type:").count(), 1, "{wire}");
+    assert!(lower.contains("content-type: application/merge-patch+json"));
+    assert_eq!(lower.matches("authorization:").count(), 1, "{wire}");
+    assert!(wire.contains("Bearer new_secret"));
+    assert!(!wire.contains("stale_secret"));
+
+    // Empty ApiKeyQuery name rejected cleanly.
+    let mut bad_key = ApiRequest::new("GET", "badkey", "http://127.0.0.1:9");
+    bad_key.auth = Auth::ApiKeyQuery {
+        name: "  ".into(),
+        value: "secret_canary".into(),
+    };
+    let engine = HttpEngine::new().unwrap();
+    assert!(engine.send(&bad_key, &BTreeMap::new()).await.is_err());
+
+    // Transport errors must not leak ApiKeyQuery secrets in the formatted URL.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut closed = ApiRequest::new("GET", "closed", format!("http://{addr}/fail"));
+    closed.auth = Auth::ApiKeyQuery {
+        name: "api_key".into(),
+        value: "secret_canary_99".into(),
+    };
+    let err = engine.send(&closed, &BTreeMap::new()).await.unwrap_err();
+    assert!(!err.to_string().contains("secret_canary_99"), "{err}");
+}

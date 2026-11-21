@@ -1,12 +1,30 @@
-//! Best-effort cURL command parser and generator.
+//! Best-effort cURL command parser and generator with shell/argument injection guards
+//! and optional credential redaction.
 
-use crate::http::interpolate;
+use crate::http::MAX_INTERPOLATED_BYTES;
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
+use crate::security::{
+    is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name, is_valid_header_name,
+    is_valid_http_method, percent_decode, percent_encode, redact_url_secrets,
+    try_extract_auth_from_header, validate_template_or_http_url,
+};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
+pub const MAX_CURL_IMPORT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurlExport {
+    pub command: String,
+    pub had_secrets: bool,
+    pub had_variables: bool,
+}
+
 /// Parse a POSIX-style `curl ...` command string into an [`ApiRequest`].
 pub fn parse_curl(input: &str) -> Result<ApiRequest> {
+    if input.len() > MAX_CURL_IMPORT_BYTES {
+        bail!("cURL command exceeds maximum size ({MAX_CURL_IMPORT_BYTES} bytes)");
+    }
     let tokens = tokenize_shell(input)?;
     if tokens.is_empty() {
         bail!("Empty cURL command");
@@ -40,30 +58,40 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
         }
 
         if let Some(rest) = match_flag(tok, &tokens, &mut idx, "-X", "--request") {
-            explicit_method = Some(rest.to_uppercase());
+            let candidate = rest.trim().to_uppercase();
+            if !is_valid_http_method(&candidate) {
+                bail!("Invalid HTTP method in cURL command: {rest}");
+            }
+            explicit_method = Some(candidate);
         } else if let Some(rest) = match_flag(tok, &tokens, &mut idx, "-H", "--header") {
+            if rest.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+                bail!("Header contains disallowed control characters");
+            }
             if let Some((k, v)) = rest.split_once(':') {
                 let key = k.trim();
                 let value = v.trim();
-                if key.eq_ignore_ascii_case("authorization")
-                    && let Some(token) = value
-                        .strip_prefix("Bearer ")
-                        .or_else(|| value.strip_prefix("bearer "))
+                if matches!(auth, Auth::None)
+                    && key.eq_ignore_ascii_case("authorization")
+                    && let Some(extracted) = try_extract_auth_from_header(key, value)
                 {
-                    auth = Auth::Bearer {
-                        token: token.trim().to_owned(),
-                    };
+                    auth = extracted;
                 } else if !key.is_empty() {
                     headers.push(KeyValue::new(key, value));
                 }
             }
         } else if let Some(rest) = match_flag(tok, &tokens, &mut idx, "-A", "--user-agent") {
-            headers.push(KeyValue::new("User-Agent", rest));
+            if !rest.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+                headers.push(KeyValue::new("User-Agent", rest));
+            }
         } else if let Some(rest) = match_flag(tok, &tokens, &mut idx, "-u", "--user") {
             let (user, pass) = rest.split_once(':').unwrap_or((&rest, ""));
             auth = Auth::Basic {
                 username: user.to_owned(),
                 password: pass.to_owned(),
+            };
+        } else if let Some(rest) = match_exact_flag(tok, &tokens, &mut idx, "--oauth2-bearer") {
+            auth = Auth::Bearer {
+                token: rest.trim().to_owned(),
             };
         } else if let Some(rest) = match_exact_flag(tok, &tokens, &mut idx, "--data-urlencode") {
             if let Some((k, v)) = rest.split_once('=') {
@@ -94,6 +122,7 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
         .map(|u| normalize_url(&u))
         .filter(|u| !u.is_empty())
         .ok_or_else(|| anyhow::anyhow!("No URL found in cURL command"))?;
+    validate_template_or_http_url(&raw_url)?;
 
     let (base_url, mut params) = split_query_params(&raw_url);
     let has_body = !body_parts.is_empty() || !urlencoded_parts.is_empty();
@@ -108,13 +137,20 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
             }
         })
     };
+    if !is_valid_http_method(&method) {
+        bail!("Invalid HTTP method in cURL command: {method}");
+    }
 
     let mut body = HttpBody::None;
-    if force_get && !body_parts.is_empty() {
+    if force_get && (!body_parts.is_empty() || !urlencoded_parts.is_empty()) {
         for part in &body_parts {
             params.extend(parse_urlencoded_pairs(part));
         }
+        params.extend(urlencoded_parts);
     } else if !urlencoded_parts.is_empty() {
+        for part in &body_parts {
+            urlencoded_parts.extend(parse_urlencoded_pairs(part));
+        }
         body = HttpBody::FormUrlEncoded(urlencoded_parts);
     } else if !body_parts.is_empty() {
         let joined = body_parts.join("&");
@@ -149,78 +185,203 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
     Ok(request)
 }
 
-/// Format an [`ApiRequest`] as a POSIX shell `curl` command.
-pub fn to_curl(request: &ApiRequest, variables: &BTreeMap<String, String>) -> String {
-    let resolve = |text: &str| interpolate(text, variables).unwrap_or_else(|_| text.to_owned());
+/// Format an [`ApiRequest`] as a POSIX shell `curl` command with all variables resolved.
+pub fn to_curl(request: &ApiRequest, variables: &BTreeMap<String, String>) -> Result<String> {
+    Ok(to_curl_export(request, variables, false)?.command)
+}
 
-    let mut parts = Vec::new();
-    parts.push("curl".to_owned());
+struct CurlResolver<'a> {
+    variables: &'a BTreeMap<String, String>,
+    redact_secrets: bool,
+    had_variables: bool,
+    had_secrets: bool,
+}
+
+impl<'a> CurlResolver<'a> {
+    fn resolve(&mut self, text: &str) -> Result<String> {
+        expand_template_for_curl(
+            text,
+            self.variables,
+            self.redact_secrets,
+            &mut self.had_variables,
+            &mut self.had_secrets,
+        )
+    }
+}
+
+/// Format an [`ApiRequest`] as a POSIX shell `curl` command, optionally redacting credentials
+/// and leaving `{{variables}}` unexpanded.
+pub fn to_curl_export(
+    request: &ApiRequest,
+    variables: &BTreeMap<String, String>,
+    redact_secrets: bool,
+) -> Result<CurlExport> {
     let method = request.method.trim().to_uppercase();
-    if method != "GET" {
-        parts.push(format!("-X {method}"));
+    if !is_valid_http_method(&method) {
+        bail!("Invalid HTTP method: {}", request.method);
     }
 
-    let mut full_url = resolve(&request.url);
-    let mut query_pairs: Vec<(String, String)> = request
-        .params
-        .iter()
-        .filter(|p| p.enabled && !p.key.trim().is_empty())
-        .map(|p| (resolve(&p.key), resolve(&p.value)))
-        .collect();
-    if let Auth::ApiKeyQuery { name, value } = &request.auth
-        && !name.trim().is_empty()
-    {
-        query_pairs.push((name.clone(), resolve(value)));
+    let mut resolver = CurlResolver {
+        variables,
+        redact_secrets,
+        had_variables: false,
+        had_secrets: false,
+    };
+
+    let mut full_url = resolver.resolve(&request.url)?;
+    validate_template_or_http_url(&full_url)?;
+
+    if redact_secrets {
+        let redacted = redact_url_secrets(&full_url);
+        if redacted != full_url {
+            resolver.had_secrets = true;
+            full_url = redacted;
+        }
+    } else if contains_url_userinfo(&full_url) || url_has_sensitive_query(&full_url) {
+        resolver.had_secrets = true;
     }
+
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
+    for p in &request.params {
+        if !p.enabled || p.key.trim().is_empty() {
+            continue;
+        }
+        let k = resolver.resolve(&p.key)?;
+        let v = resolver.resolve(&p.value)?;
+        if is_sensitive_param_name(&k) && !v.trim().is_empty() {
+            resolver.had_secrets = true;
+            if redact_secrets {
+                query_pairs.push((k, "<REDACTED>".to_owned()));
+                continue;
+            }
+        }
+        query_pairs.push((k, v));
+    }
+
+    if let Auth::ApiKeyQuery { name, value } = &request.auth {
+        let resolved_name = resolver.resolve(name)?;
+        let key = resolved_name.trim();
+        if !key.is_empty() {
+            resolver.had_secrets = true;
+            let val = if redact_secrets {
+                "<REDACTED>".to_owned()
+            } else {
+                resolver.resolve(value)?
+            };
+            query_pairs.push((key.to_owned(), val));
+        }
+    }
+
     if !query_pairs.is_empty() {
-        let sep = if full_url.contains('?') { '&' } else { '?' };
-        full_url.push(sep);
+        let (base_and_query, frag) = full_url
+            .split_once('#')
+            .map_or((full_url.as_str(), None), |(b, f)| (b, Some(f)));
+        let sep = if base_and_query.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let encoded: Vec<String> = query_pairs
             .iter()
             .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
             .collect();
-        full_url.push_str(&encoded.join("&"));
+        full_url = match frag {
+            Some(f) => format!("{base_and_query}{sep}{}#{f}", encoded.join("&")),
+            None => format!("{base_and_query}{sep}{}", encoded.join("&")),
+        };
     }
-    parts.push(shell_quote(&full_url));
+
+    let mut parts = Vec::new();
+    parts.push("curl".to_owned());
+    if full_url.contains(['{', '}', '[', ']']) {
+        parts.push("-g".to_owned());
+    }
+    if method != "GET" {
+        parts.push(format!("-X {}", shell_quote(&method)));
+    }
+    parts.push(format!("--url {}", shell_quote(&full_url)));
 
     let mut has_content_type = false;
     for header in &request.headers {
         if !header.enabled || header.key.trim().is_empty() {
             continue;
         }
-        if header.key.eq_ignore_ascii_case("content-type") {
+        let key_raw = resolver.resolve(&header.key)?;
+        let key = key_raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if key.starts_with('@')
+            || key.contains(':')
+            || key.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'))
+            || (!key.contains("{{") && !is_valid_header_name(key))
+        {
+            bail!("Invalid header name: {key}");
+        }
+        let value = resolver.resolve(&header.value)?;
+        if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+            bail!("Header value for {key} contains disallowed control characters");
+        }
+        if key.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
+        let emitted_value = if is_sensitive_header_name(key) && !value.trim().is_empty() {
+            resolver.had_secrets = true;
+            if redact_secrets {
+                "<REDACTED>".to_owned()
+            } else {
+                value
+            }
+        } else {
+            value
+        };
         parts.push(format!(
             "-H {}",
-            shell_quote(&format!(
-                "{}: {}",
-                resolve(&header.key),
-                resolve(&header.value)
-            ))
+            shell_quote(&format!("{key}: {emitted_value}"))
         ));
     }
 
     match &request.auth {
         Auth::None | Auth::ApiKeyQuery { .. } => {}
         Auth::Basic { username, password } => {
-            parts.push(format!(
-                "-u {}",
-                shell_quote(&format!("{}:{}", resolve(username), resolve(password)))
-            ));
+            resolver.had_secrets = true;
+            let user = resolver.resolve(username)?;
+            let pass = if redact_secrets {
+                "<REDACTED>".to_owned()
+            } else {
+                resolver.resolve(password)?
+            };
+            parts.push(format!("-u {}", shell_quote(&format!("{user}:{pass}"))));
         }
         Auth::Bearer { token } => {
+            resolver.had_secrets = true;
+            let tok = if redact_secrets {
+                "<REDACTED>".to_owned()
+            } else {
+                resolver.resolve(token)?
+            };
             parts.push(format!(
                 "-H {}",
-                shell_quote(&format!("Authorization: Bearer {}", resolve(token)))
+                shell_quote(&format!("Authorization: Bearer {tok}"))
             ));
         }
         Auth::ApiKeyHeader { name, value } => {
-            if !name.trim().is_empty() {
-                parts.push(format!(
-                    "-H {}",
-                    shell_quote(&format!("{}: {}", name, resolve(value)))
-                ));
+            let resolved_name = resolver.resolve(name)?;
+            let key = resolved_name.trim();
+            if !key.is_empty() {
+                if key.starts_with('@')
+                    || key.contains(':')
+                    || (!key.contains("{{") && !is_valid_header_name(key))
+                {
+                    bail!("Invalid API key header name: {key}");
+                }
+                resolver.had_secrets = true;
+                let val = if redact_secrets {
+                    "<REDACTED>".to_owned()
+                } else {
+                    resolver.resolve(value)?
+                };
+                parts.push(format!("-H {}", shell_quote(&format!("{key}: {val}"))));
             }
         }
     }
@@ -232,36 +393,166 @@ pub fn to_curl(request: &ApiRequest, variables: &BTreeMap<String, String>) -> St
                 parts.push("-H 'Content-Type: application/json'".to_owned());
             }
             if !text.is_empty() {
-                parts.push(format!("-d {}", shell_quote(&resolve(text))));
+                parts.push(format!(
+                    "--data-raw {}",
+                    shell_quote(&resolver.resolve(text)?)
+                ));
             }
         }
         HttpBody::Text(text) => {
             if !text.is_empty() {
-                parts.push(format!("-d {}", shell_quote(&resolve(text))));
+                parts.push(format!(
+                    "--data-raw {}",
+                    shell_quote(&resolver.resolve(text)?)
+                ));
             }
         }
         HttpBody::FormUrlEncoded(rows) => {
             for row in rows {
-                if row.enabled && !row.key.trim().is_empty() {
+                if !row.enabled || row.key.trim().is_empty() {
+                    continue;
+                }
+                let k = resolver.resolve(&row.key)?;
+                let mut v = resolver.resolve(&row.value)?;
+                if is_sensitive_param_name(&k) && !v.trim().is_empty() {
+                    resolver.had_secrets = true;
+                    if redact_secrets {
+                        v = "<REDACTED>".to_owned();
+                    }
+                }
+                // Avoid curl's `@file` / `name@file` reader in `--data-urlencode`.
+                if k.contains('@') || k.contains('=') || k.starts_with('<') {
+                    parts.push(format!(
+                        "--data-raw {}",
+                        shell_quote(&format!("{}={}", percent_encode(&k), percent_encode(&v)))
+                    ));
+                } else {
                     parts.push(format!(
                         "--data-urlencode {}",
-                        shell_quote(&format!("{}={}", resolve(&row.key), resolve(&row.value)))
+                        shell_quote(&format!("{k}={v}"))
                     ));
                 }
             }
         }
     }
 
-    parts.join(" \\\n  ")
+    Ok(CurlExport {
+        command: parts.join(" \\\n  "),
+        had_secrets: resolver.had_secrets,
+        had_variables: resolver.had_variables,
+    })
 }
 
+fn expand_template_for_curl(
+    input: &str,
+    variables: &BTreeMap<String, String>,
+    redact_secrets: bool,
+    had_variables: &mut bool,
+    had_secrets: &mut bool,
+) -> Result<String> {
+    let mut output = String::with_capacity(input.len().min(MAX_INTERPOLATED_BYTES));
+    let mut remainder = input;
+    while let Some(start) = remainder.find("{{") {
+        push_bounded_curl(&mut output, &remainder[..start])?;
+        let after_open = &remainder[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            push_bounded_curl(&mut output, &remainder[start..])?;
+            return Ok(output);
+        };
+        let raw_token = &remainder[start..start + 2 + end + 2];
+        let name = after_open[..end].trim();
+        if let Some(value) = variables.get(name) {
+            *had_variables = true;
+            if is_sensitive_var_name(name) && !value.trim().is_empty() {
+                *had_secrets = true;
+            }
+            if redact_secrets {
+                push_bounded_curl(&mut output, raw_token)?;
+            } else {
+                push_bounded_curl(&mut output, value)?;
+            }
+        } else {
+            push_bounded_curl(&mut output, raw_token)?;
+        }
+        remainder = &after_open[end + 2..];
+    }
+    push_bounded_curl(&mut output, remainder)?;
+    Ok(output)
+}
+
+fn push_bounded_curl(output: &mut String, piece: &str) -> Result<()> {
+    let next = output
+        .len()
+        .checked_add(piece.len())
+        .filter(|&n| n <= MAX_INTERPOLATED_BYTES);
+    if next.is_none() {
+        bail!("Interpolated value exceeds maximum size ({MAX_INTERPOLATED_BYTES} bytes)");
+    }
+    output.push_str(piece);
+    Ok(())
+}
+
+fn contains_url_userinfo(raw: &str) -> bool {
+    raw.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn url_has_sensitive_query(raw: &str) -> bool {
+    let before_frag = raw.split('#').next().unwrap_or(raw);
+    let Some((_, query)) = before_frag.split_once('?') else {
+        return false;
+    };
+    query.split('&').filter(|s| !s.is_empty()).any(|part| {
+        let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        is_sensitive_param_name(&percent_decode(k)) && !percent_decode(v).trim().is_empty()
+    })
+}
+
+/// Quote a string safely for POSIX shells. Uses ANSI-C `$'...'` quoting when control
+/// bytes (`< 0x20` or `0x7f`) are present so terminal escape sequences and newlines
+/// cannot break out of bracketed paste or execute extra commands.
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    if !value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return format!("'{}'", value.replace('\'', "'\\''"));
+    }
+    let mut out = String::with_capacity(value.len() + 4);
+    out.push_str("$'");
+    for b in value.bytes() {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x00..=0x1f | 0x7f => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\x{b:02x}");
+            }
+            _ => out.push(b as char),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn normalize_url(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.contains("://") || trimmed.starts_with("{{") {
+    let has_non_port_scheme = trimmed.split(['/', '?', '#']).next().is_some_and(|head| {
+        head.split_once(':').is_some_and(|(scheme, rest)| {
+            !scheme.is_empty()
+                && !scheme.starts_with('[')
+                && scheme
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+                && (rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+    });
+    if trimmed.is_empty()
+        || trimmed.contains("://")
+        || trimmed.starts_with("{{")
+        || has_non_port_scheme
+    {
         trimmed.to_owned()
     } else {
         format!("https://{trimmed}")
@@ -299,48 +590,6 @@ fn parse_urlencoded_pairs(query: &str) -> Vec<KeyValue> {
             KeyValue::new(percent_decode(k), percent_decode(v))
         })
         .collect()
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                    && let Ok(byte) = u8::from_str_radix(hex, 16)
-                {
-                    out.push(byte);
-                    i += 3;
-                    continue;
-                }
-                out.push(bytes[i]);
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 fn match_flag(
@@ -418,6 +667,44 @@ fn takes_separate_value(tok: &str) -> bool {
             | "--max-time"
             | "--connect-timeout"
             | "--resolve"
+            | "--oauth2-bearer"
+            | "-E"
+            | "--cert"
+            | "--cert-type"
+            | "--key"
+            | "--key-type"
+            | "--pass"
+            | "-U"
+            | "--proxy-user"
+            | "-F"
+            | "--form"
+            | "--form-string"
+            | "-T"
+            | "--upload-file"
+            | "-K"
+            | "--config"
+            | "--cacert"
+            | "--capath"
+            | "-D"
+            | "--dump-header"
+            | "-w"
+            | "--write-out"
+            | "--interface"
+            | "--max-redirs"
+            | "--retry"
+            | "--retry-delay"
+            | "--retry-max-time"
+            | "--proto"
+            | "--proto-redir"
+            | "--connect-to"
+            | "--dns-servers"
+            | "--unix-socket"
+            | "--abstract-unix-socket"
+            | "--aws-sigv4"
+            | "--pinnedpubkey"
+            | "--crlfile"
+            | "--etag-save"
+            | "--etag-compare"
     )
 }
 
@@ -556,6 +843,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_curl_handles_basic_header_oauth2_bearer_and_unknown_flag_values() {
+        // Basic Authorization header should decode into session-only Auth::Basic.
+        let basic_cmd = "curl -H 'Authorization: Basic YWxpY2U6c2VjcmV0' https://example.com/me";
+        let basic_req = parse_curl(basic_cmd).unwrap();
+        assert_eq!(
+            basic_req.auth,
+            Auth::Basic {
+                username: "alice".into(),
+                password: "secret".into(),
+            }
+        );
+        assert!(basic_req.headers.is_empty());
+
+        // --oauth2-bearer and -U must not turn their secret args into request URLs.
+        let oauth_cmd =
+            "curl --oauth2-bearer top_secret -U proxy_u:proxy_p https://api.example.com/data";
+        let oauth_req = parse_curl(oauth_cmd).unwrap();
+        assert_eq!(oauth_req.url, "https://api.example.com/data");
+        assert_eq!(
+            oauth_req.auth,
+            Auth::Bearer {
+                token: "top_secret".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_curl_get_moves_data_urlencode_to_params() {
+        let cmd = "curl -G --data-urlencode 'q=hello world' https://api.example.com/search";
+        let req = parse_curl(cmd).unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.body, HttpBody::None);
+        assert_eq!(req.params, vec![KeyValue::new("q", "hello world")]);
+    }
+
+    #[test]
     fn to_curl_roundtrip_with_variables() {
         let mut req = ApiRequest::new("POST", "Create", "{{base}}/users");
         req.params.push(KeyValue::new("dry", "true"));
@@ -569,8 +892,8 @@ mod tests {
             ("env".into(), "staging".into()),
             ("tok".into(), "secret".into()),
         ]);
-        let generated = to_curl(&req, &vars);
-        assert!(generated.contains("-X POST"));
+        let generated = to_curl(&req, &vars).unwrap();
+        assert!(generated.contains("-X 'POST'"));
         assert!(generated.contains("https://api.example.com/users?dry=true"));
         assert!(generated.contains("X-Env: staging"));
         assert!(generated.contains("Authorization: Bearer secret"));
@@ -585,5 +908,82 @@ mod tests {
                 token: "secret".into()
             }
         );
+    }
+
+    #[test]
+    fn to_curl_rejects_shell_injection_methods_and_quotes_token_chars() {
+        for bad in [
+            "GET;id",
+            "GET$(id)",
+            "GET`id`",
+            "GET\nid",
+            "GET 'touch /tmp/x'",
+            "GET \"x\"",
+        ] {
+            if bad == "GET`id`" {
+                // Backtick is an RFC 9110 tchar, so verify it IS shell-quoted safely!
+                let req = ApiRequest::new(bad, "test", "https://example.com");
+                let out = to_curl(&req, &BTreeMap::new()).unwrap();
+                assert!(out.contains("-X 'GET`ID`'"), "{out}");
+                continue;
+            }
+            let req = ApiRequest::new(bad, "test", "https://example.com");
+            assert!(to_curl(&req, &BTreeMap::new()).is_err(), "accepted {bad}");
+            assert!(
+                parse_curl(&format!("curl -X \"{bad}\" https://example.com")).is_err(),
+                "parsed {bad}"
+            );
+        }
+        // Valid RFC 9110 tokens with shell-active chars (& or ') must be safely quoted.
+        let req = ApiRequest::new("POST&'ID", "test", "https://example.com");
+        let out = to_curl(&req, &BTreeMap::new()).unwrap();
+        assert!(out.contains("-X 'POST&'\\''ID'"), "{out}");
+    }
+
+    #[test]
+    fn to_curl_escapes_control_chars_avoids_at_file_reads_and_preserves_fragments() {
+        let mut req = ApiRequest::new("POST", "Body", "https://example.com/p#sec");
+        req.params.push(KeyValue::new("a", "1"));
+        req.body = HttpBody::Text("@/etc/passwd\x1b[201~\nid".into());
+        let out = to_curl(&req, &BTreeMap::new()).unwrap();
+        assert!(out.contains("https://example.com/p?a=1#sec"), "{out}");
+        assert!(
+            out.contains("--data-raw $'@/etc/passwd\\x1b[201~\\nid'"),
+            "{out}"
+        );
+        assert!(!out.contains("\x1b"), "raw ESC leaked into command");
+
+        // Disallowed URL scheme rejected.
+        let file_req = ApiRequest::new("GET", "File", "file:///etc/passwd");
+        assert!(to_curl(&file_req, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn to_curl_redacts_secrets_and_variables_when_requested() {
+        let mut req = ApiRequest::new("GET", "Auth", "{{base}}/items?api_key=raw_q");
+        req.headers
+            .push(KeyValue::new("Authorization", "Token custom_tok"));
+        req.headers
+            .push(KeyValue::new("Accept", "application/json"));
+        req.auth = Auth::Bearer {
+            token: "{{tok}}".into(),
+        };
+        let vars = BTreeMap::from([
+            ("base".into(), "https://api.example.com".into()),
+            ("tok".into(), "live_secret_value".into()),
+        ]);
+        let redacted = to_curl_export(&req, &vars, true).unwrap();
+        assert!(redacted.had_secrets);
+        assert!(redacted.had_variables);
+        assert!(!redacted.command.contains("live_secret_value"));
+        assert!(!redacted.command.contains("custom_tok"));
+        assert!(!redacted.command.contains("raw_q"));
+        assert!(redacted.command.contains("{{base}}"));
+        assert!(
+            redacted
+                .command
+                .contains("Authorization: Bearer <REDACTED>")
+        );
+        assert!(redacted.command.contains("Authorization: <REDACTED>"));
     }
 }

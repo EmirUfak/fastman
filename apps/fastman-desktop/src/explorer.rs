@@ -14,6 +14,131 @@ use gpui_kit::*;
 
 use super::WorkspaceView;
 
+#[derive(Clone)]
+struct DraggedRequest {
+    id: String,
+    method: String,
+    name: String,
+}
+
+struct DraggedRequestPreview(DraggedRequest);
+
+impl Render for DraggedRequestPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2p5()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .shadow_md()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(method_badge(&self.0.method, Some(px(42.)), cx))
+            .child(
+                div()
+                    .max_w(px(180.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cx.theme().foreground)
+                    .child(self.0.name.clone()),
+            )
+    }
+}
+
+#[derive(Clone)]
+struct DraggedFolder {
+    id: String,
+    name: String,
+}
+
+struct DraggedFolderPreview(DraggedFolder);
+
+impl Render for DraggedFolderPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2p5()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().drag_border)
+            .shadow_md()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .child(
+                svg_icon("icons/folder-closed.svg")
+                    .small()
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                div()
+                    .max_w(px(180.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cx.theme().foreground)
+                    .child(self.0.name.clone()),
+            )
+    }
+}
+
+fn drag_highlight_box(style: StyleRefinement, cx: &App) -> StyleRefinement {
+    let accent = crate::theme::brand_accent(cx.theme().is_dark());
+    style
+        .bg(accent.opacity(0.14))
+        .border_1()
+        .border_color(accent)
+}
+
+fn drag_line_top(style: StyleRefinement, cx: &App) -> StyleRefinement {
+    let accent = crate::theme::brand_accent(cx.theme().is_dark());
+    style
+        .border_t_2()
+        .border_color(accent)
+        .bg(accent.opacity(0.08))
+}
+
+fn drag_line_bottom(style: StyleRefinement, cx: &App) -> StyleRefinement {
+    let accent = crate::theme::brand_accent(cx.theme().is_dark());
+    style
+        .border_b_2()
+        .border_color(accent)
+        .bg(accent.opacity(0.08))
+}
+
+fn root_explorer_context_menu(
+    menu: gpui_kit::component::menu::PopupMenu,
+    weak_view: WeakEntity<WorkspaceView>,
+) -> gpui_kit::component::menu::PopupMenu {
+    let v1 = weak_view.clone();
+    let v2 = weak_view;
+    menu.item(
+        PopupMenuItem::new("New Request")
+            .icon(svg_icon("icons/file-plus.svg"))
+            .on_click(move |_, window, cx| {
+                let _ = v1.update(cx, |view, cx| {
+                    view.target_folder = None;
+                    view.add_request(window, cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new("New Folder")
+            .icon(svg_icon("icons/folder-plus.svg"))
+            .on_click(move |_, _, cx| {
+                let _ = v2.update(cx, |view, cx| {
+                    view.target_folder = None;
+                    view.add_folder(cx);
+                });
+            }),
+    )
+}
+
 impl WorkspaceView {
     pub(super) fn render_explorer_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let sidebar_bg = cx.theme().sidebar;
@@ -21,6 +146,7 @@ impl WorkspaceView {
         let muted_fg = cx.theme().muted_foreground;
         let tree_items = self.render_explorer_tree(&self.explorer_filter_lower, cx);
         let has_matches = !tree_items.is_empty();
+        let is_dragging = cx.has_active_drag();
 
         div()
             .size_full()
@@ -109,19 +235,50 @@ impl WorkspaceView {
                     ),
             )
             .child(div().h(px(1.)).bg(border))
-            .child(
+            .child({
+                let header_view = cx.weak_entity();
                 div()
+                    .id("collections-root-drop")
                     .flex()
                     .items_center()
                     .justify_between()
                     .px_1()
+                    .py_0p5()
+                    .rounded(cx.theme().radius)
+                    .cursor_pointer()
+                    .when(is_dragging, |el| {
+                        el.border_1().border_dashed().border_color(border)
+                    })
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.target_folder = None;
+                        cx.notify();
+                    }))
+                    .drag_over::<DraggedRequest>(|style, _, _, cx| drag_highlight_box(style, cx))
+                    .on_drop(cx.listener(|view, drag: &DraggedRequest, window, cx| {
+                        view.move_request_to_folder(&drag.id, None, window, cx);
+                    }))
+                    .drag_over::<DraggedFolder>(|style, _, _, cx| drag_highlight_box(style, cx))
+                    .on_drop(cx.listener(|view, drag: &DraggedFolder, window, cx| {
+                        view.move_folder_to_folder(&drag.id, None, window, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        root_explorer_context_menu(menu, header_view.clone())
+                    })
                     .child(
                         div()
                             .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(muted_fg)
-                            .child("COLLECTIONS"),
+                            .child("EXPLORER"),
                     )
+                    .when(is_dragging && self.explorer_filter_lower.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(muted_fg)
+                                .child("Drop here for root"),
+                        )
+                    })
                     .when(!self.explorer_filter_lower.is_empty(), |el| {
                         el.child(
                             div()
@@ -129,8 +286,8 @@ impl WorkspaceView {
                                 .text_color(muted_fg)
                                 .child("Filtered"),
                         )
-                    }),
-            )
+                    })
+            })
             .child(
                 div()
                     .id("explorer-scroll")
@@ -140,22 +297,89 @@ impl WorkspaceView {
                     .flex()
                     .flex_col()
                     .gap_0p5()
-                    .when(has_matches, |el| el.children(tree_items))
-                    .when(!has_matches, |el| {
-                        el.justify_center().items_center().child(
-                            Empty::new().header(
-                                EmptyHeader::new()
-                                    .media(
-                                        EmptyMedia::new()
-                                            .with_variant(EmptyMediaVariant::Icon)
-                                            .child(svg_icon("icons/search.svg")),
+                    .when(has_matches, |el| {
+                        let empty_space_view = cx.weak_entity();
+                        el.children(tree_items).child(
+                            div()
+                                .id("explorer-root-drop")
+                                .flex_1()
+                                .min_h(px(40.))
+                                .rounded(cx.theme().radius)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(is_dragging, |el| {
+                                    el.border_1().border_dashed().border_color(border)
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.target_folder = None;
+                                    cx.notify();
+                                }))
+                                .drag_over::<DraggedRequest>(|style, _, _, cx| {
+                                    drag_highlight_box(style, cx)
+                                })
+                                .on_drop(cx.listener(|view, drag: &DraggedRequest, window, cx| {
+                                    view.move_request_to_folder(&drag.id, None, window, cx);
+                                }))
+                                .drag_over::<DraggedFolder>(|style, _, _, cx| {
+                                    drag_highlight_box(style, cx)
+                                })
+                                .on_drop(cx.listener(|view, drag: &DraggedFolder, window, cx| {
+                                    view.move_folder_to_folder(&drag.id, None, window, cx);
+                                }))
+                                .context_menu(move |menu, _, _| {
+                                    root_explorer_context_menu(menu, empty_space_view.clone())
+                                })
+                                .when(is_dragging, |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(muted_fg)
+                                            .child("Drop here to move to root"),
                                     )
-                                    .title(EmptyTitle::new().child("No matching requests"))
-                                    .description(
-                                        EmptyDescription::new()
-                                            .child("Try another search term or add a request."),
+                                }),
+                        )
+                    })
+                    .when(!has_matches, |el| {
+                        let no_match_view = cx.weak_entity();
+                        let empty_filter = self.explorer_filter_lower.is_empty();
+                        el.child(
+                            div()
+                                .id("explorer-empty-state")
+                                .flex_1()
+                                .size_full()
+                                .flex()
+                                .justify_center()
+                                .items_center()
+                                .context_menu(move |menu, _, _| {
+                                    root_explorer_context_menu(menu, no_match_view.clone())
+                                })
+                                .child(
+                                    Empty::new().header(
+                                        EmptyHeader::new()
+                                            .media(
+                                                EmptyMedia::new()
+                                                    .with_variant(EmptyMediaVariant::Icon)
+                                                    .child(svg_icon(if empty_filter {
+                                                        "icons/folder-open.svg"
+                                                    } else {
+                                                        "icons/search.svg"
+                                                    })),
+                                            )
+                                            .title(EmptyTitle::new().child(if empty_filter {
+                                                "No requests or folders yet"
+                                            } else {
+                                                "No matching requests"
+                                            }))
+                                            .description(EmptyDescription::new().child(
+                                                if empty_filter {
+                                                    "Add a request or folder above, or right-click here."
+                                                } else {
+                                                    "Try another search term or add a request."
+                                                },
+                                            )),
                                     ),
-                            ),
+                                ),
                         )
                     }),
             )
@@ -164,11 +388,29 @@ impl WorkspaceView {
 
     fn render_explorer_tree(&self, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        for collection in &self.current().collections {
+        let collections = &self.current().collections;
+        if collections.len() <= 1 {
+            if let Some(collection) = collections.first() {
+                for folder in &collection.folders {
+                    self.render_folder(folder, 0., &[], query, cx, &mut out);
+                }
+                for req in &collection.requests {
+                    if query.is_empty() || request_matches(req, query) {
+                        self.render_request_link(req, 0., &[], cx, &mut out);
+                    }
+                }
+            }
+            return out;
+        }
+
+        let coll_len = collections.len();
+        for (coll_idx, collection) in collections.iter().enumerate() {
             let id = collection.id.clone();
             let open = !query.is_empty() || self.expanded.contains(&id);
             let count = count_collection_requests(&collection.folders, &collection.requests);
             let title = collection.name.clone();
+            let can_move_up = coll_idx > 0;
+            let can_move_down = coll_idx + 1 < coll_len;
             let has_match = query.is_empty()
                 || collection.name.to_ascii_lowercase().contains(query)
                 || collection
@@ -181,6 +423,7 @@ impl WorkspaceView {
             }
 
             let view_ctx = cx.weak_entity();
+            let id_menu = id.clone();
             out.push(
                 div()
                     .id(format!("collection-row-{id}"))
@@ -203,9 +446,31 @@ impl WorkspaceView {
                             cx.notify();
                         }
                     }))
+                    .drag_over::<DraggedRequest>(|style, _, _, cx| drag_highlight_box(style, cx))
+                    .on_drop(cx.listener({
+                        let id = id.clone();
+                        move |view, drag: &DraggedRequest, window, cx| {
+                            view.move_request_to_collection(&drag.id, &id, window, cx);
+                        }
+                    }))
+                    .drag_over::<DraggedFolder>(|style, _, _, cx| drag_highlight_box(style, cx))
+                    .on_drop(cx.listener({
+                        let id = id.clone();
+                        move |view, drag: &DraggedFolder, window, cx| {
+                            view.move_folder_to_collection(&drag.id, &id, window, cx);
+                        }
+                    }))
                     .context_menu(move |menu, _, _| {
                         let v1 = view_ctx.clone();
                         let v2 = view_ctx.clone();
+                        let v_ren = view_ctx.clone();
+                        let v_up = view_ctx.clone();
+                        let v_down = view_ctx.clone();
+                        let v_del = view_ctx.clone();
+                        let id_ren = id_menu.clone();
+                        let id_up = id_menu.clone();
+                        let id_down = id_menu.clone();
+                        let id_del = id_menu.clone();
                         menu.item(
                             PopupMenuItem::new("New Request")
                                 .icon(svg_icon("icons/file-plus.svg"))
@@ -223,6 +488,54 @@ impl WorkspaceView {
                                     let _ = v2.update(cx, |view, cx| {
                                         view.target_folder = None;
                                         view.add_folder(cx);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Rename Collection")
+                                .icon(svg_icon("icons/pencil.svg"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_ren.update(cx, |view, cx| {
+                                        view.open_name_dialog(
+                                            NameDialogKind::RenameCollection(id_ren.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Move Up")
+                                .icon(svg_icon("icons/arrow-up.svg"))
+                                .disabled(!can_move_up)
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_up.update(cx, |view, cx| {
+                                        view.move_collection_offset(&id_up, -1, window, cx);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Move Down")
+                                .icon(svg_icon("icons/arrow-down.svg"))
+                                .disabled(!can_move_down)
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_down.update(cx, |view, cx| {
+                                        view.move_collection_offset(&id_down, 1, window, cx);
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Delete Collection")
+                                .icon(svg_icon("icons/trash.svg"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_del.update(cx, |view, cx| {
+                                        view.confirm_delete_collection(
+                                            id_del.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     });
                                 }),
                         )
@@ -265,11 +578,11 @@ impl WorkspaceView {
 
             if open {
                 for folder in &collection.folders {
-                    self.render_folder(folder, 1., query, cx, &mut out);
+                    self.render_folder(folder, 1., &[], query, cx, &mut out);
                 }
                 for req in &collection.requests {
                     if query.is_empty() || request_matches(req, query) {
-                        self.render_request_link(req, 1., cx, &mut out);
+                        self.render_request_link(req, 1., &[], cx, &mut out);
                     }
                 }
             }
@@ -281,10 +594,14 @@ impl WorkspaceView {
         &self,
         folder: &Folder,
         depth: f32,
+        ancestors: &[String],
         query: &str,
         cx: &mut Context<Self>,
         out: &mut Vec<AnyElement>,
     ) {
+        if depth as usize > fastman_core::import::MAX_FOLDER_DEPTH {
+            return;
+        }
         if !query.is_empty() && !folder_matches(folder, query) {
             return;
         }
@@ -293,6 +610,23 @@ impl WorkspaceView {
         let is_target = self.target_folder.as_ref() == Some(&id);
         let label = folder.name.clone();
         let count = count_collection_requests(&folder.folders, &folder.requests);
+        let (folder_idx, folder_len) = self.current().folder_order_bounds(&id).unwrap_or((0, 1));
+        let can_move_up = folder_idx > 0;
+        let can_move_down = folder_idx + 1 < folder_len;
+        let parent_folder = self.current().folder_parent_folder(&id);
+        let valid_folder_targets: Vec<(String, String)> = self
+            .current()
+            .folder_targets()
+            .into_iter()
+            .filter(|(fid, _)| fid != &id && !self.current().is_folder_descendant(&id, fid))
+            .collect();
+        let mut disallowed_drag_ids = ancestors.to_vec();
+        disallowed_drag_ids.push(id.clone());
+        let drag_payload = DraggedFolder {
+            id: id.clone(),
+            name: label.clone(),
+        };
+        let show_folder_drop_zones = cx.has_active_drag();
         let view_ctx = cx.weak_entity();
         let id_menu = id.clone();
 
@@ -302,6 +636,7 @@ impl WorkspaceView {
                 .child(
                     div()
                         .id(format!("folder-row-{id}"))
+                        .relative()
                         .w_full()
                         .h(px(28.))
                         .px_1p5()
@@ -322,49 +657,246 @@ impl WorkspaceView {
                                 cx.notify();
                             }
                         }))
-                        .context_menu(move |menu, _, _| {
+                        .on_drag(drag_payload, |drag, _, _, cx| {
+                            cx.new(|_| DraggedFolderPreview(drag.clone()))
+                        })
+                        .drag_over::<DraggedRequest>(|style, _, _, cx| {
+                            drag_highlight_box(style, cx)
+                        })
+                        .on_drop(cx.listener({
+                            let id = id.clone();
+                            move |view, drag: &DraggedRequest, window, cx| {
+                                view.move_request_to_folder(&drag.id, Some(&id), window, cx);
+                            }
+                        }))
+                        .when(show_folder_drop_zones, |el| {
+                            let disallowed_top = disallowed_drag_ids.clone();
+                            let disallowed_mid = disallowed_drag_ids.clone();
+                            let disallowed_bot = disallowed_drag_ids.clone();
+                            let id_top = id.clone();
+                            let id_mid = id.clone();
+                            let id_bot = id.clone();
+                            el.child(
+                                div()
+                                    .id(format!("folder-drop-before-{id}"))
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(8.))
+                                    .drag_over::<DraggedFolder>(move |style, drag, _, cx| {
+                                        if disallowed_top.contains(&drag.id) {
+                                            style
+                                        } else {
+                                            drag_line_top(style, cx)
+                                        }
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |view, drag: &DraggedFolder, window, cx| {
+                                            view.move_folder_relative(
+                                                &drag.id, &id_top, false, window, cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("folder-drop-into-{id}"))
+                                    .absolute()
+                                    .top(px(8.))
+                                    .bottom(px(8.))
+                                    .left_0()
+                                    .right_0()
+                                    .rounded(cx.theme().radius)
+                                    .drag_over::<DraggedFolder>(move |style, drag, _, cx| {
+                                        if disallowed_mid.contains(&drag.id) {
+                                            style
+                                        } else {
+                                            drag_highlight_box(style, cx)
+                                        }
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |view, drag: &DraggedFolder, window, cx| {
+                                            view.move_folder_to_folder(
+                                                &drag.id,
+                                                Some(&id_mid),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("folder-drop-after-{id}"))
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(8.))
+                                    .drag_over::<DraggedFolder>(move |style, drag, _, cx| {
+                                        if disallowed_bot.contains(&drag.id) {
+                                            style
+                                        } else {
+                                            drag_line_bottom(style, cx)
+                                        }
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |view, drag: &DraggedFolder, window, cx| {
+                                            view.move_folder_relative(
+                                                &drag.id, &id_bot, true, window, cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                        })
+                        .context_menu(move |menu, window, cx| {
                             let id1 = id_menu.clone();
                             let id2 = id_menu.clone();
                             let id3 = id_menu.clone();
                             let id4 = id_menu.clone();
+                            let id_up = id_menu.clone();
+                            let id_down = id_menu.clone();
+                            let id_sub = id_menu.clone();
+                            let id_out = id_menu.clone();
                             let v1 = view_ctx.clone();
                             let v2 = view_ctx.clone();
                             let v3 = view_ctx.clone();
                             let v4 = view_ctx.clone();
-                            menu.item(
-                                PopupMenuItem::new("New Request")
-                                    .icon(svg_icon("icons/file-plus.svg"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = v1.update(cx, |view, cx| {
-                                            view.target_folder = Some(id1.clone());
-                                            view.add_request(window, cx);
-                                        });
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("New Subfolder")
-                                    .icon(svg_icon("icons/folder-plus.svg"))
-                                    .on_click(move |_, _, cx| {
-                                        let _ = v2.update(cx, |view, cx| {
-                                            view.add_subfolder(&id2, cx);
-                                        });
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Rename Folder")
-                                    .icon(svg_icon("icons/pencil.svg"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = v3.update(cx, |view, cx| {
-                                            view.open_name_dialog(
-                                                NameDialogKind::RenameFolder(id3.clone()),
-                                                window,
-                                                cx,
+                            let v_up = view_ctx.clone();
+                            let v_down = view_ctx.clone();
+                            let v_sub = view_ctx.clone();
+                            let v_out = view_ctx.clone();
+                            let current_parent = parent_folder.clone();
+                            let is_nested = current_parent.is_some();
+                            let targets = valid_folder_targets.clone();
+
+                            let menu = menu
+                                .item(
+                                    PopupMenuItem::new("New Request")
+                                        .icon(svg_icon("icons/file-plus.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v1.update(cx, |view, cx| {
+                                                view.target_folder = Some(id1.clone());
+                                                view.add_request(window, cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("New Subfolder")
+                                        .icon(svg_icon("icons/folder-plus.svg"))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = v2.update(cx, |view, cx| {
+                                                view.add_subfolder(&id2, cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Rename Folder")
+                                        .icon(svg_icon("icons/pencil.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v3.update(cx, |view, cx| {
+                                                view.open_name_dialog(
+                                                    NameDialogKind::RenameFolder(id3.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new("Move Up")
+                                        .icon(svg_icon("icons/arrow-up.svg"))
+                                        .disabled(!can_move_up)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_up.update(cx, |view, cx| {
+                                                view.move_folder_offset(&id_up, -1, window, cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Move Down")
+                                        .icon(svg_icon("icons/arrow-down.svg"))
+                                        .disabled(!can_move_down)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_down.update(cx, |view, cx| {
+                                                view.move_folder_offset(&id_down, 1, window, cx);
+                                            });
+                                        }),
+                                )
+                                .submenu_with_icon(
+                                    Some(svg_icon("icons/folder-input.svg")),
+                                    "Move to",
+                                    window,
+                                    cx,
+                                    move |mut sub, _, _| {
+                                        let at_root = current_parent.is_none();
+                                        let v_root = v_sub.clone();
+                                        let folder_root = id_sub.clone();
+                                        sub = sub.scrollable(true).item(
+                                            PopupMenuItem::new("Root")
+                                                .icon(svg_icon("icons/folder-root.svg"))
+                                                .checked(at_root)
+                                                .disabled(at_root)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = v_root.update(cx, |view, cx| {
+                                                        view.move_folder_to_folder(
+                                                            &folder_root,
+                                                            None,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        );
+                                        if !targets.is_empty() {
+                                            sub = sub.separator();
+                                        }
+                                        for (target_id, target_path) in &targets {
+                                            let is_current = current_parent.as_deref()
+                                                == Some(target_id.as_str());
+                                            let v_dest = v_sub.clone();
+                                            let folder_src = id_sub.clone();
+                                            let dest_id = target_id.clone();
+                                            sub = sub.item(
+                                                PopupMenuItem::new(target_path.clone())
+                                                    .icon(svg_icon("icons/folder-closed.svg"))
+                                                    .checked(is_current)
+                                                    .disabled(is_current)
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = v_dest.update(cx, |view, cx| {
+                                                            view.move_folder_to_folder(
+                                                                &folder_src,
+                                                                Some(&dest_id),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
                                             );
-                                        });
-                                    }),
-                            )
-                            .separator()
-                            .item(
+                                        }
+                                        sub
+                                    },
+                                );
+
+                            let menu = if is_nested {
+                                menu.item(
+                                    PopupMenuItem::new("Move Out to Root")
+                                        .icon(svg_icon("icons/folder-output.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_out.update(cx, |view, cx| {
+                                                view.move_folder_to_folder(
+                                                    &id_out, None, window, cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                            } else {
+                                menu
+                            };
+
+                            menu.separator().item(
                                 PopupMenuItem::new("Delete Folder")
                                     .icon(svg_icon("icons/trash.svg"))
                                     .on_click(move |_, window, cx| {
@@ -429,12 +961,14 @@ impl WorkspaceView {
         );
 
         if open {
+            let mut next_ancestors = ancestors.to_vec();
+            next_ancestors.push(id);
             for sub in &folder.folders {
-                self.render_folder(sub, depth + 1., query, cx, out);
+                self.render_folder(sub, depth + 1., &next_ancestors, query, cx, out);
             }
             for req in &folder.requests {
                 if query.is_empty() || request_matches(req, query) {
-                    self.render_request_link(req, depth + 1., cx, out);
+                    self.render_request_link(req, depth + 1., &next_ancestors, cx, out);
                 }
             }
         }
@@ -444,6 +978,7 @@ impl WorkspaceView {
         &self,
         request: &ApiRequest,
         depth: f32,
+        ancestors: &[String],
         cx: &mut Context<Self>,
         out: &mut Vec<AnyElement>,
     ) {
@@ -451,6 +986,19 @@ impl WorkspaceView {
         let selected = self.selected_id.as_ref() == Some(&id);
         let method = request.method.clone();
         let title = request.name.clone();
+        let (req_idx, req_len) = self.current().request_order_bounds(&id).unwrap_or((0, 1));
+        let can_move_up = req_idx > 0;
+        let can_move_down = req_idx + 1 < req_len;
+        let parent_folder = self.current().request_parent_folder(&id);
+        let folder_targets = self.current().folder_targets();
+        let disallowed_folder_ids = ancestors.to_vec();
+        let drop_target_parent = parent_folder.clone();
+        let show_request_drop_zones = cx.has_active_drag();
+        let drag_payload = DraggedRequest {
+            id: id.clone(),
+            method: method.clone(),
+            name: title.clone(),
+        };
         let view_ctx = cx.weak_entity();
         let id_menu = id.clone();
 
@@ -481,46 +1029,253 @@ impl WorkspaceView {
                                 view.open_request(id.clone(), window, cx);
                             }
                         }))
-                        .context_menu(move |menu, _, _| {
+                        .on_drag(drag_payload, |drag, _, _, cx| {
+                            cx.new(|_| DraggedRequestPreview(drag.clone()))
+                        })
+                        .drag_over::<DraggedFolder>(move |style, drag, _, cx| {
+                            if disallowed_folder_ids.contains(&drag.id) {
+                                style
+                            } else {
+                                drag_highlight_box(style, cx)
+                            }
+                        })
+                        .on_drop(cx.listener({
+                            let target_parent = drop_target_parent.clone();
+                            move |view, drag: &DraggedFolder, window, cx| {
+                                view.move_folder_to_folder(
+                                    &drag.id,
+                                    target_parent.as_deref(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .when(show_request_drop_zones, |el| {
+                            let row_id_top = id.clone();
+                            let row_id_bot = id.clone();
+                            let target_top = id.clone();
+                            let target_bot = id.clone();
+                            el.child(
+                                div()
+                                    .id(format!("request-drop-before-{id}"))
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(15.))
+                                    .drag_over::<DraggedRequest>(move |style, drag, _, cx| {
+                                        if drag.id == row_id_top {
+                                            style
+                                        } else {
+                                            drag_line_top(style, cx)
+                                        }
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |view, drag: &DraggedRequest, window, cx| {
+                                            view.move_request_relative(
+                                                &drag.id,
+                                                &target_top,
+                                                false,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("request-drop-after-{id}"))
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(15.))
+                                    .drag_over::<DraggedRequest>(move |style, drag, _, cx| {
+                                        if drag.id == row_id_bot {
+                                            style
+                                        } else {
+                                            drag_line_bottom(style, cx)
+                                        }
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |view, drag: &DraggedRequest, window, cx| {
+                                            view.move_request_relative(
+                                                &drag.id,
+                                                &target_bot,
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                        })
+                        .context_menu(move |menu, window, cx| {
                             let id1 = id_menu.clone();
                             let id2 = id_menu.clone();
                             let id3 = id_menu.clone();
+                            let id3_full = id_menu.clone();
                             let id4 = id_menu.clone();
+                            let id_up = id_menu.clone();
+                            let id_down = id_menu.clone();
+                            let id_sub = id_menu.clone();
+                            let id_out = id_menu.clone();
                             let v1 = view_ctx.clone();
                             let v2 = view_ctx.clone();
                             let v3 = view_ctx.clone();
+                            let v3_full = view_ctx.clone();
                             let v4 = view_ctx.clone();
-                            menu.item(
-                                PopupMenuItem::new("Rename")
-                                    .icon(svg_icon("icons/pencil.svg"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = v1.update(cx, |view, cx| {
-                                            view.open_request(id1.clone(), window, cx);
-                                            view.editing_request_name = true;
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Duplicate")
-                                    .icon(svg_icon("icons/copy.svg"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = v2.update(cx, |view, cx| {
-                                            view.duplicate_request(&id2, window, cx);
-                                        });
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Copy as cURL")
-                                    .icon(svg_icon("icons/terminal.svg"))
-                                    .on_click(move |_, window, cx| {
-                                        let _ = v3.update(cx, |view, cx| {
-                                            view.copy_request_as_curl(Some(&id3), window, cx);
-                                        });
-                                    }),
-                            )
-                            .separator()
-                            .item(
+                            let v_up = view_ctx.clone();
+                            let v_down = view_ctx.clone();
+                            let v_sub = view_ctx.clone();
+                            let v_out = view_ctx.clone();
+                            let current_parent = parent_folder.clone();
+                            let in_folder = current_parent.is_some();
+                            let targets = folder_targets.clone();
+
+                            let menu = menu
+                                .item(
+                                    PopupMenuItem::new("Rename")
+                                        .icon(svg_icon("icons/pencil.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v1.update(cx, |view, cx| {
+                                                view.open_request(id1.clone(), window, cx);
+                                                view.editing_request_name = true;
+                                                view.request_name
+                                                    .read(cx)
+                                                    .focus_handle(cx)
+                                                    .focus(window, cx);
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Duplicate")
+                                        .icon(svg_icon("icons/copy.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v2.update(cx, |view, cx| {
+                                                view.duplicate_request(&id2, window, cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Copy as cURL (Redacted)")
+                                        .icon(svg_icon("icons/terminal.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v3.update(cx, |view, cx| {
+                                                view.copy_request_as_curl(
+                                                    Some(&id3),
+                                                    false,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Copy Full cURL (With Secrets)...")
+                                        .icon(svg_icon("icons/triangle-alert.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v3_full.update(cx, |view, cx| {
+                                                view.copy_request_as_curl(
+                                                    Some(&id3_full),
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new("Move Up")
+                                        .icon(svg_icon("icons/arrow-up.svg"))
+                                        .disabled(!can_move_up)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_up.update(cx, |view, cx| {
+                                                view.move_request_offset(&id_up, -1, window, cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Move Down")
+                                        .icon(svg_icon("icons/arrow-down.svg"))
+                                        .disabled(!can_move_down)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_down.update(cx, |view, cx| {
+                                                view.move_request_offset(&id_down, 1, window, cx);
+                                            });
+                                        }),
+                                )
+                                .submenu_with_icon(
+                                    Some(svg_icon("icons/folder-input.svg")),
+                                    "Move to",
+                                    window,
+                                    cx,
+                                    move |mut sub, _, _| {
+                                        let at_root = current_parent.is_none();
+                                        let v_root = v_sub.clone();
+                                        let req_root = id_sub.clone();
+                                        sub = sub.scrollable(true).item(
+                                            PopupMenuItem::new("Root")
+                                                .icon(svg_icon("icons/folder-root.svg"))
+                                                .checked(at_root)
+                                                .disabled(at_root)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = v_root.update(cx, |view, cx| {
+                                                        view.move_request_to_folder(
+                                                            &req_root, None, window, cx,
+                                                        );
+                                                    });
+                                                }),
+                                        );
+                                        if !targets.is_empty() {
+                                            sub = sub.separator();
+                                        }
+                                        for (folder_id, folder_path) in &targets {
+                                            let is_current = current_parent.as_deref()
+                                                == Some(folder_id.as_str());
+                                            let v_folder = v_sub.clone();
+                                            let req_folder = id_sub.clone();
+                                            let dest_id = folder_id.clone();
+                                            sub = sub.item(
+                                                PopupMenuItem::new(folder_path.clone())
+                                                    .icon(svg_icon("icons/folder-closed.svg"))
+                                                    .checked(is_current)
+                                                    .disabled(is_current)
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = v_folder.update(cx, |view, cx| {
+                                                            view.move_request_to_folder(
+                                                                &req_folder,
+                                                                Some(&dest_id),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        sub
+                                    },
+                                );
+
+                            let menu = if in_folder {
+                                menu.item(
+                                    PopupMenuItem::new("Move Out of Folder")
+                                        .icon(svg_icon("icons/folder-output.svg"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = v_out.update(cx, |view, cx| {
+                                                view.move_request_to_folder(
+                                                    &id_out, None, window, cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                            } else {
+                                menu
+                            };
+
+                            menu.separator().item(
                                 PopupMenuItem::new("Delete")
                                     .icon(svg_icon("icons/trash.svg"))
                                     .on_click(move |_, window, cx| {

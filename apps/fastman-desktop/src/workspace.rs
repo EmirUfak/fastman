@@ -1,6 +1,6 @@
 use crate::kv_editor::{KvTable, render_kv_table};
 use crate::response_view::ResponseCacheEntry;
-use crate::theme::{brand_accent, count_pill, svg_icon};
+use crate::theme::{count_pill, svg_icon};
 use crate::{
     CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenImport, OpenVariables, SaveRequest,
     SendRequest, ToggleTheme,
@@ -9,6 +9,10 @@ use anyhow::{Context as _, Result};
 use fastman_core::{
     ApiRequest, Auth, Collection, Folder, HttpBody, HttpEngine, Project, ProjectStore, Workspace,
     curl, import,
+    security::{
+        SensitiveFieldFinding, collect_sensitive_request_findings, sanitize_request_credentials,
+        summarize_sensitive_findings,
+    },
 };
 use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -26,10 +30,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
+
+const MAX_CACHED_RESPONSES: usize = 16;
+const MAX_TOTAL_CACHE_BYTES: usize = 24 * 1024 * 1024;
 
 pub(super) const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 pub(super) const AUTH_TYPES: &[&str] = &[
@@ -74,6 +81,7 @@ pub(super) enum NameDialogKind {
     NewWorkspace,
     NewProject,
     RenameFolder(String),
+    RenameCollection(String),
 }
 
 pub struct VariablesSheetView {
@@ -115,7 +123,7 @@ impl Render for VariablesSheetView {
                 div()
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
-                    .child("Use {{variable_name}} inside URLs, query params, headers, auth, or body payloads."),
+                    .child("Use {{variable_name}} inside URLs, query params, headers, auth, or body payloads. Saved in plaintext project JSON—avoid storing real secrets here."),
             )
             .child(
                 div()
@@ -145,10 +153,17 @@ impl Render for VariablesSheetView {
     }
 }
 
+pub enum PendingSensitiveImport {
+    Postman(import::ImportReport),
+    Curl(ApiRequest, Vec<SensitiveFieldFinding>),
+}
+
 pub struct ImportDialogView {
     pub mode: usize,
     pub input: Entity<TextareaState>,
     pub error: Option<String>,
+    pub pending_sensitive: Option<PendingSensitiveImport>,
+    pub sensitive_choice: usize,
 }
 
 impl ImportDialogView {
@@ -162,12 +177,70 @@ impl ImportDialogView {
             mode: 0,
             input,
             error: None,
+            pending_sensitive: None,
+            sensitive_choice: 0,
         }
     }
 }
 
 impl Render for ImportDialogView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(pending) = &self.pending_sensitive {
+            let (count, summary, is_curl) = match pending {
+                PendingSensitiveImport::Postman(report) => (
+                    report.sensitive_fields.len(),
+                    summarize_sensitive_findings(&report.sensitive_fields),
+                    false,
+                ),
+                PendingSensitiveImport::Curl(_, findings) => {
+                    (findings.len(), summarize_sensitive_findings(findings), true)
+                }
+            };
+            let source_label = if is_curl {
+                "This cURL command"
+            } else {
+                "This Postman collection"
+            };
+            return div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    Alert::warning(
+                        "sensitive-import-warning",
+                        format!(
+                            "{source_label} contains {count} sensitive field(s): {summary}. Custom headers, query params, and URLs are persisted in plaintext project JSON, while Auth tab fields remain session-only."
+                        ),
+                    )
+                    .title("Plaintext Credential Risk"),
+                )
+                .child(
+                    TabBar::new("sensitive-import-choice")
+                        .segmented()
+                        .small()
+                        .selected_index(self.sensitive_choice)
+                        .on_click(cx.listener(|view, idx, _, cx| {
+                            view.sensitive_choice = *idx;
+                            cx.notify();
+                        }))
+                        .child(Tab::new().label("Move / Strip Secrets (Safe)"))
+                        .child(Tab::new().label("Keep in Plaintext JSON")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if self.sensitive_choice == 0 {
+                            "Recognized Bearer, Basic, and API key fields move to session-only Auth (not saved to disk); remaining cookies/custom secrets are stripped."
+                        } else {
+                            "All imported headers, query params, and URLs will be saved in plaintext to project.json."
+                        }),
+                )
+                .when_some(self.error.as_ref(), |el, err| {
+                    el.child(Alert::error("import-error", err.clone()).title("Import failed"))
+                });
+        }
+
         let placeholder = if self.mode == 0 {
             "Paste Postman Collection v2.1 JSON..."
         } else {
@@ -206,9 +279,9 @@ impl Render for ImportDialogView {
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
                     .child(if self.mode == 0 {
-                        "Creates a new local project from the collection. Scripts and auth stay inert."
+                        "Creates a new local project from the collection. Scripts stay inert; sensitive headers prompt before saving."
                     } else {
-                        "Imports method, URL, query params, headers, auth, and body as a new request."
+                        "Imports method, URL, query params, headers, auth, and body. Sensitive headers prompt before saving."
                     }),
             )
             .child(
@@ -265,6 +338,7 @@ pub struct WorkspaceView {
     pub(super) pending_abort: Option<AbortHandle>,
     pub(super) pending: Option<Task<()>>,
     pub(super) responses: HashMap<String, ResponseCacheEntry>,
+    pub(super) response_order: VecDeque<String>,
     pub(super) cached_request_count: usize,
     pub(super) params_active_count: usize,
     pub(super) headers_active_count: usize,
@@ -288,8 +362,9 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self> {
         let store = ProjectStore::system_default()?;
-        let workspaces = store.workspaces()?;
-        let mut projects = store.list()?;
+        let (workspaces, mut startup_warnings) = store.workspaces_resilient()?;
+        let (mut projects, proj_warnings) = store.list_resilient()?;
+        startup_warnings.extend(proj_warnings);
         if projects.is_empty() {
             let mut project = store.create("My API Project")?;
             let mut folder = Folder::new("Examples");
@@ -468,6 +543,7 @@ impl WorkspaceView {
             pending_abort: None,
             pending: None,
             responses: HashMap::new(),
+            response_order: VecDeque::new(),
             cached_request_count: 0,
             params_active_count: 0,
             headers_active_count: 0,
@@ -491,6 +567,11 @@ impl WorkspaceView {
         view.expand_all();
         view.load_editor(window, cx);
         view.focus_handle.focus(window, cx);
+        if !startup_warnings.is_empty() {
+            let summary = startup_warnings.join("; ");
+            view.set_status(format!("Loaded with warnings: {summary}"), true, cx);
+            window.push_notification(Notification::warning(summary), cx);
+        }
 
         Ok(view)
     }
@@ -900,6 +981,39 @@ impl WorkspaceView {
         Ok(())
     }
 
+    fn save_if_dirty(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.save(cx)
+    }
+
+    fn cache_response(&mut self, request_id: String, entry: ResponseCacheEntry) {
+        self.response_order.retain(|id| id != &request_id);
+        self.response_order.push_back(request_id.clone());
+        self.responses.insert(request_id, entry);
+
+        let mut total_bytes: usize = self.responses.values().map(|e| e.approx_bytes).sum();
+        while (self.responses.len() > MAX_CACHED_RESPONSES || total_bytes > MAX_TOTAL_CACHE_BYTES)
+            && self.responses.len() > 1
+        {
+            let Some(oldest_id) = self.response_order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.responses.remove(&oldest_id) {
+                total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
+            }
+        }
+    }
+
+    fn prune_responses_to_current_project(&mut self) {
+        let current = self.current().clone();
+        self.responses
+            .retain(|id, _| current.find_request(id).is_some());
+        self.response_order
+            .retain(|id| self.responses.contains_key(id));
+    }
+
     pub(super) fn save_with_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.save(cx) {
             Ok(()) => {
@@ -937,7 +1051,7 @@ impl WorkspaceView {
         if self.selected_id.as_ref() == Some(&id) {
             return;
         }
-        if let Err(error) = self.save(cx) {
+        if let Err(error) = self.save_if_dirty(cx) {
             let msg = format!("Cannot switch tab: {error:#}");
             self.set_status(msg.clone(), true, cx);
             window.push_notification(Notification::error(msg), cx);
@@ -953,7 +1067,7 @@ impl WorkspaceView {
 
     pub(super) fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_id.as_deref() == Some(id) {
-            if let Err(error) = self.save(cx) {
+            if let Err(error) = self.save_if_dirty(cx) {
                 let msg = format!("Cannot close tab: {error:#}");
                 self.set_status(msg.clone(), true, cx);
                 window.push_notification(Notification::error(msg), cx);
@@ -973,7 +1087,7 @@ impl WorkspaceView {
         if index == self.active_project || index >= self.projects.len() {
             return;
         }
-        if let Err(error) = self.save(cx) {
+        if let Err(error) = self.save_if_dirty(cx) {
             let msg = format!("Cannot switch project: {error:#}");
             self.set_status(msg.clone(), true, cx);
             window.push_notification(Notification::error(msg), cx);
@@ -984,6 +1098,7 @@ impl WorkspaceView {
         self.selected_id = self.current().first_request_id();
         self.open_tabs = self.selected_id.clone().into_iter().collect();
         self.target_folder = None;
+        self.prune_responses_to_current_project();
         self.refresh_request_count();
         self.expand_all();
         self.load_editor(window, cx);
@@ -994,21 +1109,22 @@ impl WorkspaceView {
         if index == self.active_workspace || index >= self.workspaces.len() {
             return;
         }
-        let result = (|| -> Result<(ProjectStore, Vec<Project>)> {
-            self.apply_editor(cx)?;
-            self.store.save(self.current())?;
+        let result = (|| -> Result<(ProjectStore, Vec<Project>, Vec<String>)> {
+            self.save_if_dirty(cx)?;
             let store = self
                 .workspace_store
                 .for_workspace(&self.workspaces[index].id)?;
-            let mut projects = store.list()?;
+            let (mut projects, warnings) = store.list_resilient()?;
             if projects.is_empty() {
                 projects.push(store.create("Project 1")?);
             }
-            Ok((store, projects))
+            Ok((store, projects, warnings))
         })();
         match result {
-            Ok((store, projects)) => {
+            Ok((store, projects, warnings)) => {
                 self.cancel(cx);
+                self.responses.clear();
+                self.response_order.clear();
                 self.store = store;
                 self.projects = projects;
                 self.active_workspace = index;
@@ -1024,11 +1140,17 @@ impl WorkspaceView {
                 self.refresh_request_count();
                 self.expand_all();
                 self.load_editor(window, cx);
-                self.set_status(
-                    format!("Workspace: {}", self.workspaces[index].name),
-                    false,
-                    cx,
-                );
+                if warnings.is_empty() {
+                    self.set_status(
+                        format!("Workspace: {}", self.workspaces[index].name),
+                        false,
+                        cx,
+                    );
+                } else {
+                    let msg = warnings.join("; ");
+                    self.set_status(format!("Loaded with warnings: {msg}"), true, cx);
+                    window.push_notification(Notification::warning(msg), cx);
+                }
             }
             Err(error) => {
                 let msg = format!("Cannot switch workspace: {error:#}");
@@ -1047,15 +1169,24 @@ impl WorkspaceView {
             self.expanded.insert(target);
             self.expanded.insert(id.clone());
             self.target_folder = Some(id);
-            let _ = self.save(cx);
+            if let Err(err) = self.save(cx) {
+                self.set_status(format!("Save failed: {err:#}"), true, cx);
+            }
             return;
+        }
+        if self.projects[self.active_project].collections.is_empty() {
+            self.projects[self.active_project]
+                .collections
+                .push(Collection::new("Default Collection"));
         }
         if let Some(collection) = self.projects[self.active_project].collections.first_mut() {
             collection.folders.push(folder);
             self.expanded.insert(collection.id.clone());
             self.expanded.insert(id.clone());
             self.target_folder = Some(id);
-            let _ = self.save(cx);
+            if let Err(err) = self.save(cx) {
+                self.set_status(format!("Save failed: {err:#}"), true, cx);
+            }
         }
     }
 
@@ -1066,7 +1197,9 @@ impl WorkspaceView {
             self.expanded.insert(parent_id.to_owned());
             self.expanded.insert(id.clone());
             self.target_folder = Some(id);
-            let _ = self.save(cx);
+            if let Err(err) = self.save(cx) {
+                self.set_status(format!("Save failed: {err:#}"), true, cx);
+            }
         }
     }
 
@@ -1081,7 +1214,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.save(cx) {
+        if let Err(error) = self.save_if_dirty(cx) {
             let msg = format!("Cannot save active request: {error:#}");
             self.set_status(msg.clone(), true, cx);
             window.push_notification(Notification::error(msg), cx);
@@ -1127,35 +1260,332 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.save(cx) {
+        if let Err(error) = self.save_if_dirty(cx) {
             window.push_notification(Notification::error(format!("Save failed: {error:#}")), cx);
             return;
         }
         if let Some(new_id) = self.projects[self.active_project].duplicate_request(id) {
             self.refresh_request_count();
-            let _ = self.store.save(self.current());
+            if let Err(error) = self.store.save(self.current()) {
+                let msg = format!("Save failed: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+                return;
+            }
             self.open_request(new_id, window, cx);
             window.push_notification(Notification::success("Request duplicated"), cx);
+        }
+    }
+
+    fn apply_editor_for_tree_move(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Err(error) = self.apply_editor(cx) {
+            let msg = format!("Cannot apply editor changes: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
+            return false;
+        }
+        true
+    }
+
+    fn persist_tree_change(
+        &mut self,
+        status: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.save(self.current()) {
+            Ok(()) => {
+                self.dirty = false;
+                self.set_status(status, false, cx);
+            }
+            Err(error) => {
+                let msg = format!("Save failed: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn move_request_offset(
+        &mut self,
+        request_id: &str,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_request_offset(request_id, delta) {
+            self.persist_tree_change("Request order updated", window, cx);
+        }
+    }
+
+    pub(super) fn move_request_to_folder(
+        &mut self,
+        request_id: &str,
+        target_folder_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_request_to_folder(request_id, target_folder_id) {
+            if let Some(folder_id) = target_folder_id {
+                self.expanded.insert(folder_id.to_owned());
+            }
+            let status = match target_folder_id
+                .and_then(|id| self.current().find_folder(id))
+                .map(|f| f.name.as_str())
+            {
+                Some(name) => format!("Moved request to '{name}'"),
+                None => "Moved request to root".into(),
+            };
+            self.persist_tree_change(status, window, cx);
+        }
+    }
+
+    pub(super) fn move_request_to_collection(
+        &mut self,
+        request_id: &str,
+        collection_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_request_to_collection(request_id, collection_id)
+        {
+            self.expanded.insert(collection_id.to_owned());
+            self.persist_tree_change("Moved request to root", window, cx);
+        }
+    }
+
+    pub(super) fn move_request_relative(
+        &mut self,
+        request_id: &str,
+        target_request_id: &str,
+        after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_request_relative(
+            request_id,
+            target_request_id,
+            after,
+        ) {
+            if let Some(folder_id) = self.current().request_parent_folder(target_request_id) {
+                self.expanded.insert(folder_id);
+            }
+            self.persist_tree_change("Request moved", window, cx);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn move_request_to_target(
+        &mut self,
+        request_id: &str,
+        target_request_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_request_to_target(request_id, target_request_id)
+        {
+            if let Some(folder_id) = self.current().request_parent_folder(target_request_id) {
+                self.expanded.insert(folder_id);
+            }
+            self.persist_tree_change("Request moved", window, cx);
+        }
+    }
+
+    pub(super) fn move_folder_offset(
+        &mut self,
+        folder_id: &str,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_folder_offset(folder_id, delta) {
+            self.persist_tree_change("Folder order updated", window, cx);
+        }
+    }
+
+    pub(super) fn move_folder_to_folder(
+        &mut self,
+        folder_id: &str,
+        target_folder_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_folder_to_folder(folder_id, target_folder_id) {
+            if let Some(target_id) = target_folder_id {
+                self.expanded.insert(target_id.to_owned());
+            }
+            let status = match target_folder_id
+                .and_then(|id| self.current().find_folder(id))
+                .map(|f| f.name.as_str())
+            {
+                Some(name) => format!("Moved folder to '{name}'"),
+                None => "Moved folder to root".into(),
+            };
+            self.persist_tree_change(status, window, cx);
+        }
+    }
+
+    pub(super) fn move_folder_to_collection(
+        &mut self,
+        folder_id: &str,
+        collection_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_folder_to_collection(folder_id, collection_id) {
+            self.expanded.insert(collection_id.to_owned());
+            self.persist_tree_change("Moved folder to root", window, cx);
+        }
+    }
+
+    pub(super) fn move_collection_offset(
+        &mut self,
+        collection_id: &str,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_collection_offset(collection_id, delta) {
+            self.persist_tree_change("Collection order updated", window, cx);
+        }
+    }
+
+    pub(super) fn move_folder_relative(
+        &mut self,
+        folder_id: &str,
+        target_folder_id: &str,
+        after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_editor_for_tree_move(window, cx) {
+            return;
+        }
+        if self.projects[self.active_project].move_folder_relative(
+            folder_id,
+            target_folder_id,
+            after,
+        ) {
+            if let Some(parent_id) = self.current().folder_parent_folder(target_folder_id) {
+                self.expanded.insert(parent_id);
+            }
+            self.persist_tree_change("Folder moved", window, cx);
         }
     }
 
     pub(super) fn copy_request_as_curl(
         &mut self,
         target_id: Option<&str>,
+        force_full: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if target_id.is_none() || target_id == self.selected_id.as_deref() {
-            let _ = self.apply_editor(cx);
+        if (target_id.is_none() || target_id == self.selected_id.as_deref())
+            && let Err(error) = self.apply_editor(cx)
+        {
+            let msg = format!("Cannot export cURL: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
+            return;
         }
         let lookup_id = target_id.or(self.selected_id.as_deref());
         let Some(req) = lookup_id.and_then(|id| self.current().find_request(id)) else {
             return;
         };
-        let cmd = curl::to_curl(req, &self.current().variables);
-        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
-        self.set_status("Copied cURL command to clipboard", false, cx);
-        window.push_notification(Notification::success("Copied as cURL command"), cx);
+        let export = match curl::to_curl_export(req, &self.current().variables, !force_full) {
+            Ok(export) => export,
+            Err(error) => {
+                let msg = format!("Cannot export cURL: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+                return;
+            }
+        };
+        if !force_full {
+            cx.write_to_clipboard(ClipboardItem::new_string(export.command));
+            if export.had_secrets || export.had_variables {
+                self.set_status("Copied redacted cURL to clipboard", false, cx);
+                window.push_notification(
+                    Notification::warning(
+                        "Copied redacted cURL (secrets & variables hidden). Use 'Copy Full cURL' to include credentials.",
+                    ),
+                    cx,
+                );
+            } else {
+                self.set_status("Copied cURL command to clipboard", false, cx);
+                window.push_notification(Notification::success("Copied as cURL command"), cx);
+            }
+            return;
+        }
+
+        if !export.had_secrets && !export.had_variables {
+            cx.write_to_clipboard(ClipboardItem::new_string(export.command));
+            self.set_status("Copied cURL command to clipboard", false, cx);
+            window.push_notification(Notification::success("Copied as cURL command"), cx);
+            return;
+        }
+
+        let full_cmd = export.command;
+        let weak_view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let cmd = full_cmd.clone();
+            let weak_ok = weak_view.clone();
+            dialog
+                .w(px(460.))
+                .title("Clipboard Security Warning")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Copy Full cURL")
+                        .ok_variant(ButtonVariant::Danger)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
+                    let _ = weak_ok.update(cx, |view, cx| {
+                        view.set_status("Copied full cURL (with credentials) to clipboard", false, cx);
+                    });
+                    window.push_notification(
+                        Notification::warning("Full cURL with credentials copied to clipboard"),
+                        cx,
+                    );
+                    true
+                })
+                .child(
+                    Alert::warning(
+                        "curl-clipboard-warning",
+                        "This command includes plaintext authentication headers, keys, or expanded project variables. Clipboard managers and other local apps may retain or read it.",
+                    )
+                    .title("Copy unredacted credentials to clipboard?"),
+                )
+        });
     }
 
     pub(super) fn open_name_dialog(
@@ -1184,6 +1614,19 @@ impl WorkspaceView {
                     .map(|f| f.name.clone())
                     .unwrap_or_default();
                 ("Rename Folder", "Folder name", current_name, "Rename")
+            }
+            NameDialogKind::RenameCollection(collection_id) => {
+                let current_name = self
+                    .current()
+                    .find_collection(collection_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                (
+                    "Rename Collection",
+                    "Collection name",
+                    current_name,
+                    "Rename",
+                )
             }
         };
 
@@ -1242,7 +1685,7 @@ impl WorkspaceView {
                             }
                         }
                         NameDialogKind::NewProject => {
-                            if let Err(err) = view.save(cx) {
+                            if let Err(err) = view.save_if_dirty(cx) {
                                 ok = false;
                                 window.push_notification(
                                     Notification::error(format!("Save failed: {err:#}")),
@@ -1282,9 +1725,38 @@ impl WorkspaceView {
                             if view.projects[view.active_project]
                                 .rename_folder(folder_id, value.clone())
                             {
-                                let _ = view.save(cx);
-                                window
-                                    .push_notification(Notification::success("Folder renamed"), cx);
+                                match view.save(cx) {
+                                    Ok(()) => window.push_notification(
+                                        Notification::success("Folder renamed"),
+                                        cx,
+                                    ),
+                                    Err(err) => {
+                                        ok = false;
+                                        window.push_notification(
+                                            Notification::error(format!("Rename failed: {err:#}")),
+                                            cx,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        NameDialogKind::RenameCollection(collection_id) => {
+                            if view.projects[view.active_project]
+                                .rename_collection(collection_id, value.clone())
+                            {
+                                match view.save(cx) {
+                                    Ok(()) => window.push_notification(
+                                        Notification::success("Collection renamed"),
+                                        cx,
+                                    ),
+                                    Err(err) => {
+                                        ok = false;
+                                        window.push_notification(
+                                            Notification::error(format!("Rename failed: {err:#}")),
+                                            cx,
+                                        );
+                                    }
+                                }
                             }
                         }
                     });
@@ -1336,6 +1808,7 @@ impl WorkspaceView {
         }
         if self.projects[self.active_project].delete_request(id) {
             self.responses.remove(id);
+            self.response_order.retain(|item| item != id);
             self.open_tabs.retain(|tab| tab != id);
             self.refresh_request_count();
             if self.selected_id.as_deref() == Some(id) {
@@ -1351,9 +1824,17 @@ impl WorkspaceView {
                 }
                 self.load_editor(window, cx);
             }
-            let _ = self.store.save(self.current());
-            self.set_status("Request deleted", false, cx);
-            window.push_notification(Notification::success("Request deleted"), cx);
+            match self.store.save(self.current()) {
+                Ok(()) => {
+                    self.set_status("Request deleted", false, cx);
+                    window.push_notification(Notification::success("Request deleted"), cx);
+                }
+                Err(error) => {
+                    let msg = format!("Save failed: {error:#}");
+                    self.set_status(msg.clone(), true, cx);
+                    window.push_notification(Notification::error(msg), cx);
+                }
+            }
         }
     }
 
@@ -1393,36 +1874,100 @@ impl WorkspaceView {
         });
     }
 
+    fn reconcile_after_container_delete(
+        &mut self,
+        status: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_request_count();
+        if self
+            .target_folder
+            .as_deref()
+            .is_some_and(|tf| self.current().find_folder(tf).is_none())
+        {
+            self.target_folder = None;
+        }
+        self.prune_responses_to_current_project();
+        let current = self.current().clone();
+        self.open_tabs
+            .retain(|tab| current.find_request(tab).is_some());
+        if self
+            .selected_id
+            .as_deref()
+            .is_some_and(|sel| current.find_request(sel).is_none())
+        {
+            self.cancel(cx);
+            self.selected_id = self
+                .open_tabs
+                .last()
+                .cloned()
+                .or_else(|| current.first_request_id());
+            if let Some(next_id) = &self.selected_id
+                && !self.open_tabs.contains(next_id)
+            {
+                self.open_tabs.push(next_id.clone());
+            }
+            self.load_editor(window, cx);
+        }
+        match self.store.save(self.current()) {
+            Ok(()) => {
+                self.set_status(status, false, cx);
+                window.push_notification(Notification::success(status), cx);
+            }
+            Err(error) => {
+                let msg = format!("Save failed: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
+        }
+    }
+
     fn delete_folder_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.projects[self.active_project].delete_folder(id) {
-            self.refresh_request_count();
-            if self.target_folder.as_deref() == Some(id) {
-                self.target_folder = None;
-            }
-            let current = self.current().clone();
-            self.open_tabs
-                .retain(|tab| current.find_request(tab).is_some());
-            if self
-                .selected_id
-                .as_deref()
-                .is_some_and(|sel| current.find_request(sel).is_none())
-            {
-                self.cancel(cx);
-                self.selected_id = self
-                    .open_tabs
-                    .last()
-                    .cloned()
-                    .or_else(|| current.first_request_id());
-                if let Some(next_id) = &self.selected_id
-                    && !self.open_tabs.contains(next_id)
-                {
-                    self.open_tabs.push(next_id.clone());
-                }
-                self.load_editor(window, cx);
-            }
-            let _ = self.store.save(self.current());
-            self.set_status("Folder deleted", false, cx);
-            window.push_notification(Notification::success("Folder deleted"), cx);
+            self.reconcile_after_container_delete("Folder deleted", window, cx);
+        }
+    }
+
+    pub(super) fn confirm_delete_collection(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .current()
+            .find_collection(&id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "this collection".into());
+        let weak_view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let weak_ok = weak_view.clone();
+            let coll_id = id.clone();
+            dialog
+                .w(px(420.))
+                .title("Delete Collection")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete Collection")
+                        .ok_variant(ButtonVariant::Danger)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = weak_ok.update(cx, |view, cx| {
+                        view.delete_collection_now(&coll_id, window, cx);
+                    });
+                    true
+                })
+                .child(div().text_size(px(13.)).child(format!(
+                    "Delete collection \"{name}\" and all folders/requests inside it? This cannot be undone."
+                )))
+        });
+    }
+
+    fn delete_collection_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.projects[self.active_project].delete_collection(id) {
+            self.reconcile_after_container_delete("Collection deleted", window, cx);
         }
     }
 
@@ -1489,6 +2034,40 @@ impl WorkspaceView {
         });
     }
 
+    fn finalize_postman_import(
+        &mut self,
+        report: import::ImportReport,
+        sanitized_summary: Option<fastman_core::security::SanitizeSummary>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let count = report.requests_imported;
+        let warnings = report.warnings.len();
+        let project_name = report.project.name.clone();
+        self.store.save(&report.project)?;
+        self.projects.push(report.project);
+        let last = self.projects.len() - 1;
+        let choices = project_choices(&self.projects);
+        self.project_selector.update(cx, |sel, cx| {
+            sel.set_items(choices, window, cx);
+            sel.set_selected_index(Some(IndexPath::default().row(last)), window, cx);
+        });
+        self.switch_project(last, window, cx);
+        let note = match sanitized_summary {
+            Some(s) => format!(
+                "Imported {count} requests into '{project_name}' (moved {} auth field(s) to session-only, stripped {})",
+                s.moved_to_session_auth, s.stripped_fields
+            ),
+            None if warnings > 0 => {
+                format!("Imported {count} requests into '{project_name}' ({warnings} warning(s))")
+            }
+            None => format!("Imported {count} requests into '{project_name}'"),
+        };
+        self.set_status(note.clone(), false, cx);
+        window.push_notification(Notification::success(note), cx);
+        Ok(())
+    }
+
     pub(super) fn open_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let modal_view = cx.new(|cx| ImportDialogView::new(window, cx));
         let initial_focus = Cell::new(true);
@@ -1504,15 +2083,71 @@ impl WorkspaceView {
             }
             let modal_ok = modal_view.clone();
             let weak_ok = weak_workspace.clone();
+            let is_confirm_step = modal_view.read(cx).pending_sensitive.is_some();
             dialog
                 .w(px(580.))
-                .title("Import Collection or cURL")
+                .title(if is_confirm_step {
+                    "Confirm Sensitive Credential Handling"
+                } else {
+                    "Import Collection or cURL"
+                })
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("Import")
+                        .ok_text(if is_confirm_step {
+                            "Continue Import"
+                        } else {
+                            "Import"
+                        })
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {
+                    let pending_step = modal_ok.update(cx, |m, _| {
+                        m.error = None;
+                        m.pending_sensitive.take().map(|p| (p, m.sensitive_choice))
+                    });
+                    if let Some((pending, choice)) = pending_step {
+                        match pending {
+                            PendingSensitiveImport::Postman(mut report) => {
+                                let sanitized = if choice == 0 {
+                                    Some(report.sanitize_credentials())
+                                } else {
+                                    None
+                                };
+                                let mut saved_ok = true;
+                                let _ = weak_ok.update(cx, |view, cx| {
+                                    if let Err(err) =
+                                        view.finalize_postman_import(report, sanitized, window, cx)
+                                    {
+                                        saved_ok = false;
+                                        modal_ok.update(cx, |m, cx| {
+                                            m.error = Some(format!("Failed to save project: {err:#}"));
+                                            cx.notify();
+                                        });
+                                    }
+                                });
+                                return saved_ok;
+                            }
+                            PendingSensitiveImport::Curl(mut req, _) => {
+                                let summary = (choice == 0)
+                                    .then(|| sanitize_request_credentials(&mut req));
+                                let label = format!("{} {}", req.method, req.name);
+                                let _ = weak_ok.update(cx, |view, cx| {
+                                    view.insert_and_open_request(req, window, cx);
+                                    let msg = match summary {
+                                        Some(s) => format!(
+                                            "Imported cURL: {label} (moved {} to session Auth, stripped {})",
+                                            s.moved_to_session_auth, s.stripped_fields
+                                        ),
+                                        None => format!("Imported cURL: {label}"),
+                                    };
+                                    view.set_status(msg.clone(), false, cx);
+                                    window.push_notification(Notification::success(msg), cx);
+                                });
+                                return true;
+                            }
+                        }
+                    }
+
                     let (mode, raw_text) = {
                         let modal = modal_ok.read(cx);
                         (modal.mode, modal.input.read(cx).value().to_string())
@@ -1525,40 +2160,38 @@ impl WorkspaceView {
                         return false;
                     }
                     if mode == 0 {
+                        if raw_text.len() > import::MAX_IMPORT_BYTES {
+                            modal_ok.update(cx, |m, cx| {
+                                m.error = Some(format!(
+                                    "Collection exceeds maximum size ({} bytes).",
+                                    import::MAX_IMPORT_BYTES
+                                ));
+                                cx.notify();
+                            });
+                            return false;
+                        }
                         match import::postman_v21(&raw_text) {
+                            Ok(report) if !report.sensitive_fields.is_empty() => {
+                                modal_ok.update(cx, |m, cx| {
+                                    m.sensitive_choice = 0;
+                                    m.pending_sensitive =
+                                        Some(PendingSensitiveImport::Postman(report));
+                                    cx.notify();
+                                });
+                                false
+                            }
                             Ok(report) => {
-                                let count = report.requests_imported;
-                                let warnings = report.warnings.len();
-                                let project_name = report.project.name.clone();
                                 let mut saved_ok = true;
                                 let _ = weak_ok.update(cx, |view, cx| {
-                                    if let Err(err) = view.store.save(&report.project) {
+                                    if let Err(err) =
+                                        view.finalize_postman_import(report, None, window, cx)
+                                    {
                                         saved_ok = false;
                                         modal_ok.update(cx, |m, cx| {
                                             m.error = Some(format!("Failed to save project: {err:#}"));
                                             cx.notify();
                                         });
-                                        return;
                                     }
-                                    view.projects.push(report.project);
-                                    let last = view.projects.len() - 1;
-                                    let choices = project_choices(&view.projects);
-                                    view.project_selector.update(cx, |sel, cx| {
-                                        sel.set_items(choices, window, cx);
-                                        sel.set_selected_index(
-                                            Some(IndexPath::default().row(last)),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    view.switch_project(last, window, cx);
-                                    let note = if warnings > 0 {
-                                        format!("Imported {count} requests into '{project_name}' ({warnings} warning(s))")
-                                    } else {
-                                        format!("Imported {count} requests into '{project_name}'")
-                                    };
-                                    view.set_status(note.clone(), false, cx);
-                                    window.push_notification(Notification::success(note), cx);
                                 });
                                 saved_ok
                             }
@@ -1571,16 +2204,40 @@ impl WorkspaceView {
                             }
                         }
                     } else {
+                        if raw_text.len() > curl::MAX_CURL_IMPORT_BYTES {
+                            modal_ok.update(cx, |m, cx| {
+                                m.error = Some(format!(
+                                    "cURL command exceeds maximum size ({} bytes).",
+                                    curl::MAX_CURL_IMPORT_BYTES
+                                ));
+                                cx.notify();
+                            });
+                            return false;
+                        }
                         match curl::parse_curl(&raw_text) {
                             Ok(req) => {
+                                let mut findings = Vec::new();
+                                collect_sensitive_request_findings(&req, &mut findings);
+                                if !findings.is_empty() {
+                                    modal_ok.update(cx, |m, cx| {
+                                        m.sensitive_choice = 0;
+                                        m.pending_sensitive =
+                                            Some(PendingSensitiveImport::Curl(req, findings));
+                                        cx.notify();
+                                    });
+                                    return false;
+                                }
                                 let label = format!("{} {}", req.method, req.name);
+                                let has_session_auth = !matches!(req.auth, Auth::None);
                                 let _ = weak_ok.update(cx, |view, cx| {
                                     view.insert_and_open_request(req, window, cx);
-                                    view.set_status(format!("Imported cURL: {label}"), false, cx);
-                                    window.push_notification(
-                                        Notification::success(format!("Imported {label}")),
-                                        cx,
-                                    );
+                                    let note = if has_session_auth {
+                                        format!("Imported cURL: {label} (Auth kept session-only)")
+                                    } else {
+                                        format!("Imported cURL: {label}")
+                                    };
+                                    view.set_status(note.clone(), false, cx);
+                                    window.push_notification(Notification::success(note), cx);
                                 });
                                 true
                             }
@@ -1609,7 +2266,7 @@ impl WorkspaceView {
     }
 
     pub(super) fn send(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        if let Err(error) = self.save(cx) {
+        if let Err(error) = self.save_if_dirty(cx) {
             let msg = format!("Cannot send: {error:#}");
             self.set_status(msg.clone(), true, cx);
             if let Some(window) = window {
@@ -1625,7 +2282,11 @@ impl WorkspaceView {
         self.cancel(cx);
         self.in_flight_request_id = Some(request_id.clone());
         self.set_status(
-            format!("Sending {} {}…", request.method, request.url),
+            format!(
+                "Sending {} {}…",
+                request.method,
+                fastman_core::security::redact_url_secrets(&request.url)
+            ),
             false,
             cx,
         );
@@ -1667,18 +2328,18 @@ impl WorkspaceView {
                 view.in_flight_request_id = None;
                 match result {
                     Ok(Ok((entry, status_line))) => {
-                        view.responses.insert(request_id, entry);
+                        view.cache_response(request_id, entry);
                         view.refresh_response_search_matches(cx);
                         view.reset_response_scroll();
                         view.set_status(status_line, false, cx);
                     }
                     Ok(Err(entry)) => {
-                        view.responses.insert(request_id, entry);
+                        view.cache_response(request_id, entry);
                         view.refresh_response_search_matches(cx);
                         view.set_status("Request failed", true, cx);
                     }
                     Err(error) => {
-                        view.responses.insert(
+                        view.cache_response(
                             request_id,
                             ResponseCacheEntry::from_error(
                                 error.to_string(),
@@ -1733,24 +2394,6 @@ impl Render for WorkspaceView {
             .bg(title_bar_bg)
             .border_b_1()
             .border_color(title_border)
-            .child(
-                div()
-                    .w(px(24.))
-                    .h(px(24.))
-                    .rounded(px(6.))
-                    .bg(brand_accent(is_dark))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(svg_icon("icons/zap.svg").xsmall().text_color(gpui::white())),
-            )
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Fastman"),
-            )
-            .child(div().text_color(muted_fg).child("/"))
             .child(
                 Button::new("workspace-selector")
                     .ghost()
