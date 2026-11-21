@@ -1,4 +1,7 @@
-use crate::json_highlight::render_code_viewer;
+use crate::json_highlight::{
+    CodeLines, HighlightedLine, precompute_json_lines, precompute_plain_lines,
+    render_virtual_code_lines,
+};
 use crate::theme::{count_pill, format_bytes, format_duration, status_badge, svg_icon};
 use fastman_core::HttpResponse;
 use gpui_kit::component::{
@@ -14,22 +17,98 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::sync::Arc;
 
 use super::WorkspaceView;
 
 #[derive(Debug, Clone)]
-pub struct ResponseCacheEntry {
-    pub response: Option<HttpResponse>,
-    pub error: Option<String>,
-    pub sent_method: String,
-    pub sent_url: String,
+pub struct PrecomputedResponse {
+    pub status: u16,
+    pub reason: SharedString,
+    pub elapsed_label: SharedString,
+    pub size_label: SharedString,
+    pub truncated: bool,
+    pub final_url: SharedString,
+    pub raw_body: SharedString,
+    pub pretty_body: Option<SharedString>,
+    pub pretty_lines: Arc<Vec<HighlightedLine>>,
+    pub raw_lines: Arc<Vec<SharedString>>,
+    pub headers: Arc<Vec<(SharedString, SharedString)>>,
+    pub cookies: Arc<Vec<ParsedCookie>>,
 }
 
 #[derive(Debug, Clone)]
-struct ParsedCookie {
-    name: String,
-    value: String,
-    attributes: String,
+pub struct ParsedCookie {
+    pub name: SharedString,
+    pub value: SharedString,
+    pub attributes: SharedString,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseCacheEntry {
+    pub response: Option<PrecomputedResponse>,
+    pub error: Option<SharedString>,
+    pub sent_method: SharedString,
+    pub sent_url: SharedString,
+}
+
+impl ResponseCacheEntry {
+    pub fn from_response(
+        response: HttpResponse,
+        sent_method: impl Into<SharedString>,
+        sent_url: impl Into<SharedString>,
+    ) -> Self {
+        let pretty_body = serde_json::from_str::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok());
+        let raw_lines = Arc::new(precompute_plain_lines(&response.body));
+        let pretty_lines = pretty_body
+            .as_deref()
+            .map(precompute_json_lines)
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+        let cookies = Arc::new(parse_cookies(&response));
+        let headers = Arc::new(
+            response
+                .headers
+                .into_iter()
+                .map(|(k, v)| (SharedString::from(k), SharedString::from(v)))
+                .collect(),
+        );
+
+        Self {
+            response: Some(PrecomputedResponse {
+                status: response.status,
+                reason: SharedString::from(response.reason),
+                elapsed_label: SharedString::from(format_duration(response.elapsed_ms)),
+                size_label: SharedString::from(format_bytes(response.bytes_received)),
+                truncated: response.truncated,
+                final_url: SharedString::from(response.final_url),
+                raw_body: SharedString::from(response.body),
+                pretty_body: pretty_body.map(SharedString::from),
+                pretty_lines,
+                raw_lines,
+                headers,
+                cookies,
+            }),
+            error: None,
+            sent_method: sent_method.into(),
+            sent_url: sent_url.into(),
+        }
+    }
+
+    pub fn from_error(
+        error: impl Into<SharedString>,
+        sent_method: impl Into<SharedString>,
+        sent_url: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            response: None,
+            error: Some(error.into()),
+            sent_method: sent_method.into(),
+            sent_url: sent_url.into(),
+        }
+    }
 }
 
 impl WorkspaceView {
@@ -46,40 +125,18 @@ impl WorkspaceView {
         let error = entry.and_then(|e| e.error.as_deref());
 
         let header_count = response.map_or(0, |r| r.headers.len());
-        let cookies = response.map(parse_cookies).unwrap_or_default();
-        let cookie_count = cookies.len();
-
-        let pretty_json = response.and_then(|r| {
-            serde_json::from_str::<serde_json::Value>(&r.body)
-                .ok()
-                .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        });
-        let has_valid_json = pretty_json.is_some();
+        let cookie_count = response.map_or(0, |r| r.cookies.len());
+        let has_valid_json = response.is_some_and(|r| r.pretty_body.is_some());
 
         let display_body = response.map(|r| {
             if !self.response_raw {
-                pretty_json.clone().unwrap_or_else(|| r.body.clone())
+                r.pretty_body.clone().unwrap_or_else(|| r.raw_body.clone())
             } else {
-                r.body.clone()
+                r.raw_body.clone()
             }
         });
 
-        let search_query = self.response_search.read(cx).value().to_string();
-        let (code_element, match_count) = if let Some(body_text) = &display_body {
-            render_code_viewer(
-                body_text,
-                has_valid_json && !self.response_raw,
-                self.response_wrap,
-                if self.response_find_open {
-                    &search_query
-                } else {
-                    ""
-                },
-                cx,
-            )
-        } else {
-            (div().into_any_element(), 0)
-        };
+        let match_count = self.response_search_matches;
 
         let toolbar = div()
             .h(px(38.))
@@ -139,7 +196,7 @@ impl WorkspaceView {
                     ),
             )
             .when_some(response, |bar, resp| {
-                let copy_text: SharedString = display_body.clone().unwrap_or_default().into();
+                let copy_text = display_body.clone().unwrap_or_default();
                 bar.child(
                     div()
                         .flex()
@@ -149,10 +206,10 @@ impl WorkspaceView {
                         .child(status_badge(resp.status, &resp.reason, cx))
                         .child(meta_pill(
                             Some("icons/clock.svg"),
-                            format_duration(resp.elapsed_ms),
+                            resp.elapsed_label.clone(),
                             cx,
                         ))
-                        .child(meta_pill(None, format_bytes(resp.bytes_received), cx))
+                        .child(meta_pill(None, resp.size_label.clone(), cx))
                         .when(resp.truncated, |row| {
                             row.child(
                                 div()
@@ -178,6 +235,7 @@ impl WorkspaceView {
                                     .tooltip("Toggle formatted JSON / raw response")
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.response_raw = !view.response_raw;
+                                        view.refresh_response_search_matches(cx);
                                         cx.notify();
                                     }));
                                 btn = if !self.response_raw {
@@ -216,6 +274,7 @@ impl WorkspaceView {
                                                 .focus_handle(cx)
                                                 .focus(window, cx);
                                         }
+                                        view.refresh_response_search_matches(cx);
                                         cx.notify();
                                     }));
                                 btn = if self.response_find_open {
@@ -261,7 +320,7 @@ impl WorkspaceView {
                                 .prefix(svg_icon("icons/search.svg").xsmall().text_color(muted_fg)),
                         ),
                     )
-                    .when(!search_query.trim().is_empty(), |el| {
+                    .when(!self.response_search_lower.is_empty(), |el| {
                         el.child(div().text_size(px(11.5)).text_color(muted_fg).child(
                             if match_count == 1 {
                                 "1 match".to_owned()
@@ -278,6 +337,7 @@ impl WorkspaceView {
                             .icon(svg_icon("icons/x.svg").xsmall())
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.response_find_open = false;
+                                view.refresh_response_search_matches(cx);
                                 cx.notify();
                             })),
                     )
@@ -363,8 +423,48 @@ impl WorkspaceView {
         } else if let Some(resp) = response {
             match self.response_tab {
                 0 => {
-                    let show_effective_url = entry
-                        .is_some_and(|e| !e.sent_url.is_empty() && e.sent_url != resp.final_url);
+                    let show_effective_url = entry.is_some_and(|e| {
+                        !e.sent_url.is_empty() && e.sent_url.as_ref() != resp.final_url.as_ref()
+                    });
+                    let code_lines = if !self.response_raw && resp.pretty_body.is_some() {
+                        CodeLines::Json(resp.pretty_lines.clone())
+                    } else {
+                        CodeLines::Plain(resp.raw_lines.clone())
+                    };
+                    let line_count = match &code_lines {
+                        CodeLines::Json(lines) => lines.len(),
+                        CodeLines::Plain(lines) => lines.len(),
+                    };
+                    let uses_virtual_list = !self.response_wrap || line_count > 400;
+                    let search_lower = if self.response_find_open {
+                        self.response_search_lower.as_str()
+                    } else {
+                        ""
+                    };
+                    let code_element = render_virtual_code_lines(
+                        code_lines,
+                        self.response_wrap,
+                        search_lower,
+                        &self.response_scroll,
+                        cx,
+                    );
+                    let body_container = if uses_virtual_list {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(code_element)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id("response-body-wrapped-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(code_element)
+                            .into_any_element()
+                    };
+
                     div()
                         .flex_1()
                         .min_h_0()
@@ -388,7 +488,7 @@ impl WorkspaceView {
                                     .child(format!(
                                         "{} URL:",
                                         entry
-                                            .map(|e| e.sent_method.as_str())
+                                            .map(|e| e.sent_method.as_ref())
                                             .unwrap_or("Effective")
                                     ))
                                     .child(
@@ -401,19 +501,11 @@ impl WorkspaceView {
                                     ),
                             )
                         })
-                        .child(
-                            div()
-                                .id("response-body-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .when(!self.response_wrap, |el| el.overflow_x_scroll())
-                                .child(code_element),
-                        )
+                        .child(body_container)
                         .into_any_element()
                 }
-                1 => render_response_headers_table(&resp.headers, cx),
-                _ => render_response_cookies_table(&cookies, cx),
+                1 => render_response_headers_table(&resp.headers, &self.headers_scroll, cx),
+                _ => render_response_cookies_table(&resp.cookies, &self.cookies_scroll, cx),
             }
         } else {
             div()
@@ -452,7 +544,7 @@ impl WorkspaceView {
     }
 }
 
-fn meta_pill(icon: Option<&'static str>, label: String, cx: &App) -> AnyElement {
+fn meta_pill(icon: Option<&'static str>, label: impl Into<SharedString>, cx: &App) -> AnyElement {
     div()
         .h(px(22.))
         .px_2()
@@ -468,11 +560,15 @@ fn meta_pill(icon: Option<&'static str>, label: String, cx: &App) -> AnyElement 
         .gap_1()
         .flex_shrink_0()
         .when_some(icon, |el, path| el.child(svg_icon(path).xsmall()))
-        .child(label)
+        .child(label.into())
         .into_any_element()
 }
 
-fn render_response_headers_table(headers: &[(String, String)], cx: &App) -> AnyElement {
+fn render_response_headers_table(
+    headers: &Arc<Vec<(SharedString, SharedString)>>,
+    scroll_handle: &UniformListScrollHandle,
+    cx: &App,
+) -> AnyElement {
     if headers.is_empty() {
         return div()
             .flex_1()
@@ -493,85 +589,33 @@ fn render_response_headers_table(headers: &[(String, String)], cx: &App) -> AnyE
             .into_any_element();
     }
 
-    let mono = cx.theme().mono_font_family.clone();
     let border = cx.theme().border;
     let row_border = cx.theme().table_row_border;
     let head_bg = cx.theme().table_head;
     let head_fg = cx.theme().table_head_foreground;
-
-    let rows: Vec<AnyElement> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, (name, value))| {
-            let val_copy: SharedString = value.clone().into();
-            div()
-                .w_full()
-                .min_h(px(30.))
-                .flex()
-                .items_center()
-                .border_t_1()
-                .border_color(row_border)
-                .hover(|s| s.bg(cx.theme().table_hover))
-                .child(
-                    div()
-                        .w(px(220.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_1()
-                        .font_family(mono.clone())
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(cx.theme().foreground)
-                        .truncate()
-                        .child(name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px_3()
-                        .py_1()
-                        .border_l_1()
-                        .border_color(row_border)
-                        .font_family(mono.clone())
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(value.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(34.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Clipboard::new(SharedString::from(format!("copy-header-{i}")))
-                                .xsmall()
-                                .value(val_copy)
-                                .tooltip("Copy header value"),
-                        ),
-                )
-                .into_any_element()
-        })
-        .collect();
+    let headers_list = headers.clone();
 
     div()
-        .id("response-headers-scroll")
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
         .p_3()
+        .flex()
+        .flex_col()
         .child(
             div()
+                .flex_1()
+                .min_h_0()
                 .w_full()
                 .rounded(cx.theme().radius)
                 .border_1()
                 .border_color(border)
                 .overflow_hidden()
+                .flex()
+                .flex_col()
                 .child(
                     div()
                         .h(px(28.))
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .bg(head_bg)
@@ -589,12 +633,88 @@ fn render_response_headers_table(headers: &[(String, String)], cx: &App) -> AnyE
                         )
                         .child(div().w(px(34.))),
                 )
-                .children(rows),
+                .child(
+                    div().flex_1().min_h_0().overflow_hidden().child(
+                        uniform_list(
+                            "response-headers-list",
+                            headers.len(),
+                            move |range, _, cx| {
+                                let mono = cx.theme().mono_font_family.clone();
+                                let fg = cx.theme().foreground;
+                                let muted_fg = cx.theme().muted_foreground;
+                                let row_border = cx.theme().table_row_border;
+                                let hover_bg = cx.theme().table_hover;
+
+                                range
+                                    .map(|i| {
+                                        let (name, value) = &headers_list[i];
+                                        div()
+                                            .w_full()
+                                            .h(px(30.))
+                                            .flex()
+                                            .items_center()
+                                            .border_t_1()
+                                            .border_color(row_border)
+                                            .hover(move |s| s.bg(hover_bg))
+                                            .child(
+                                                div()
+                                                    .w(px(220.))
+                                                    .flex_shrink_0()
+                                                    .px_3()
+                                                    .font_family(mono.clone())
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(fg)
+                                                    .truncate()
+                                                    .child(name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px_3()
+                                                    .border_l_1()
+                                                    .border_color(row_border)
+                                                    .font_family(mono.clone())
+                                                    .text_size(px(12.))
+                                                    .text_color(muted_fg)
+                                                    .truncate()
+                                                    .child(value.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(34.))
+                                                    .flex_shrink_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        Clipboard::new(SharedString::from(
+                                                            format!("copy-header-{i}"),
+                                                        ))
+                                                        .xsmall()
+                                                        .value(value.clone())
+                                                        .tooltip("Copy header value"),
+                                                    ),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .collect()
+                            },
+                        )
+                        .track_scroll(scroll_handle)
+                        .size_full(),
+                    ),
+                ),
         )
         .into_any_element()
 }
 
-fn render_response_cookies_table(cookies: &[ParsedCookie], cx: &App) -> AnyElement {
+fn render_response_cookies_table(
+    cookies: &Arc<Vec<ParsedCookie>>,
+    scroll_handle: &UniformListScrollHandle,
+    cx: &App,
+) -> AnyElement {
     if cookies.is_empty() {
         return div()
             .flex_1()
@@ -620,82 +740,33 @@ fn render_response_cookies_table(cookies: &[ParsedCookie], cx: &App) -> AnyEleme
             .into_any_element();
     }
 
-    let mono = cx.theme().mono_font_family.clone();
     let border = cx.theme().border;
     let row_border = cx.theme().table_row_border;
     let head_bg = cx.theme().table_head;
     let head_fg = cx.theme().table_head_foreground;
-
-    let rows: Vec<AnyElement> = cookies
-        .iter()
-        .map(|cookie| {
-            div()
-                .w_full()
-                .min_h(px(30.))
-                .flex()
-                .items_center()
-                .border_t_1()
-                .border_color(row_border)
-                .child(
-                    div()
-                        .w(px(170.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_1()
-                        .font_family(mono.clone())
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .truncate()
-                        .child(cookie.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px_3()
-                        .py_1()
-                        .border_l_1()
-                        .border_color(row_border)
-                        .font_family(mono.clone())
-                        .text_size(px(12.))
-                        .child(cookie.value.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px_3()
-                        .py_1()
-                        .border_l_1()
-                        .border_color(row_border)
-                        .text_size(px(11.5))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if cookie.attributes.is_empty() {
-                            "—".to_owned()
-                        } else {
-                            cookie.attributes.clone()
-                        }),
-                )
-                .into_any_element()
-        })
-        .collect();
+    let cookies_list = cookies.clone();
 
     div()
-        .id("response-cookies-scroll")
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
         .p_3()
+        .flex()
+        .flex_col()
         .child(
             div()
+                .flex_1()
+                .min_h_0()
                 .w_full()
                 .rounded(cx.theme().radius)
                 .border_1()
                 .border_color(border)
                 .overflow_hidden()
+                .flex()
+                .flex_col()
                 .child(
                     div()
                         .h(px(28.))
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .bg(head_bg)
@@ -720,7 +791,75 @@ fn render_response_cookies_table(cookies: &[ParsedCookie], cx: &App) -> AnyEleme
                                 .child("ATTRIBUTES"),
                         ),
                 )
-                .children(rows),
+                .child(
+                    div().flex_1().min_h_0().overflow_hidden().child(
+                        uniform_list(
+                            "response-cookies-list",
+                            cookies.len(),
+                            move |range, _, cx| {
+                                let mono = cx.theme().mono_font_family.clone();
+                                let muted_fg = cx.theme().muted_foreground;
+                                let row_border = cx.theme().table_row_border;
+
+                                range
+                                    .map(|i| {
+                                        let cookie = &cookies_list[i];
+                                        let attrs = if cookie.attributes.is_empty() {
+                                            SharedString::new_static("—")
+                                        } else {
+                                            cookie.attributes.clone()
+                                        };
+                                        div()
+                                            .w_full()
+                                            .h(px(30.))
+                                            .flex()
+                                            .items_center()
+                                            .border_t_1()
+                                            .border_color(row_border)
+                                            .child(
+                                                div()
+                                                    .w(px(170.))
+                                                    .flex_shrink_0()
+                                                    .px_3()
+                                                    .font_family(mono.clone())
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .truncate()
+                                                    .child(cookie.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px_3()
+                                                    .border_l_1()
+                                                    .border_color(row_border)
+                                                    .font_family(mono.clone())
+                                                    .text_size(px(12.))
+                                                    .truncate()
+                                                    .child(cookie.value.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px_3()
+                                                    .border_l_1()
+                                                    .border_color(row_border)
+                                                    .text_size(px(11.5))
+                                                    .text_color(muted_fg)
+                                                    .truncate()
+                                                    .child(attrs),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .collect()
+                            },
+                        )
+                        .track_scroll(scroll_handle)
+                        .size_full(),
+                    ),
+                ),
         )
         .into_any_element()
 }
@@ -739,9 +878,9 @@ fn parse_cookies(response: &HttpResponse) -> Vec<ParsedCookie> {
                 .collect::<Vec<_>>()
                 .join("; ");
             Some(ParsedCookie {
-                name: name.trim().to_owned(),
-                value: value.trim().to_owned(),
-                attributes: attrs,
+                name: SharedString::from(name.trim().to_owned()),
+                value: SharedString::from(value.trim().to_owned()),
+                attributes: SharedString::from(attrs),
             })
         })
         .collect()

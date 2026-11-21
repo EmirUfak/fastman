@@ -12,4 +12,4 @@ What workflow is currently missing or difficult?
 Describe the behavior you'd like to see.
 
 ## Scope check
-Have you checked [docs/FEATURE_MATRIX.md](../../docs/FEATURE_MATRIX.md) and [docs/ROADMAP.md](../../docs/ROADMAP.md)?
+Have you checked [README.md](../../README.md) current limitations?

@@ -7,4 +7,4 @@ Describe what changed and why.
 - [ ] `cargo clippy --locked -p fastman-core -p fastman-cli --all-targets -- -D warnings` passes
 - [ ] Desktop changes verified with `cargo test --locked --workspace` (if applicable)
 - [ ] No secrets, tokens, or personal paths added to fixtures or docs
-- [ ] Relevant documentation updated (`README.md`, `CHANGELOG.md`, `docs/`)
+- [ ] Relevant documentation updated (`README.md`, `CHANGELOG.md`)

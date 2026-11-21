@@ -54,6 +54,7 @@ fn main() {
         bind_shortcuts(cx);
 
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        theme::apply_crisp_motion(cx);
 
         let window_bounds = cx.primary_display().map(|display| {
             let visible = display.visible_bounds();

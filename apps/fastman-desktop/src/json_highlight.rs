@@ -1,8 +1,9 @@
 use gpui_kit::component::{ActiveTheme as _, hsl};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::{ops::Range, sync::Arc};
 
-const MAX_HIGHLIGHT_LINES: usize = 2500;
+const MAX_WRAP_LINES: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonTokenKind {
@@ -18,6 +19,27 @@ pub enum JsonTokenKind {
 pub struct TokenSpan<'a> {
     pub text: &'a str,
     pub kind: JsonTokenKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct HighlightedLine {
+    pub text: SharedString,
+    pub tokens: Vec<(Range<usize>, JsonTokenKind)>,
+}
+
+#[derive(Clone)]
+pub enum CodeLines {
+    Json(Arc<Vec<HighlightedLine>>),
+    Plain(Arc<Vec<SharedString>>),
+}
+
+impl CodeLines {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Json(lines) => lines.len(),
+            Self::Plain(lines) => lines.len(),
+        }
+    }
 }
 
 /// Tokenize a single line of JSON into syntax spans.
@@ -145,6 +167,41 @@ pub fn tokenize_json_line(line: &str) -> Vec<TokenSpan<'_>> {
     spans
 }
 
+/// Precompute syntax token byte ranges for each line of JSON once per response.
+pub fn precompute_json_lines(text: &str) -> Vec<HighlightedLine> {
+    if text.is_empty() {
+        return vec![HighlightedLine {
+            text: "".into(),
+            tokens: Vec::new(),
+        }];
+    }
+    text.lines()
+        .map(|line| {
+            let mut tokens = Vec::new();
+            let mut offset = 0usize;
+            for span in tokenize_json_line(line) {
+                let end = offset + span.text.len();
+                if span.kind != JsonTokenKind::Plain && offset < end {
+                    tokens.push((offset..end, span.kind));
+                }
+                offset = end;
+            }
+            HighlightedLine {
+                text: line.to_owned().into(),
+                tokens,
+            }
+        })
+        .collect()
+}
+
+/// Split plain text into `SharedString` lines once per response.
+pub fn precompute_plain_lines(text: &str) -> Vec<SharedString> {
+    if text.is_empty() {
+        return vec!["".into()];
+    }
+    text.lines().map(|line| line.to_owned().into()).collect()
+}
+
 /// Count case-insensitive occurrences of `needle` in `haystack`.
 pub fn count_search_matches(haystack: &str, needle: &str) -> usize {
     let needle_trimmed = needle.trim();
@@ -156,7 +213,7 @@ pub fn count_search_matches(haystack: &str, needle: &str) -> usize {
     hay_lower.match_indices(&ned_lower).count()
 }
 
-fn token_color(kind: JsonTokenKind, is_dark: bool, cx: &App) -> Hsla {
+fn token_color(kind: JsonTokenKind, is_dark: bool, muted_fg: Hsla, foreground: Hsla) -> Hsla {
     match kind {
         JsonTokenKind::Key => {
             if is_dark {
@@ -186,209 +243,319 @@ fn token_color(kind: JsonTokenKind, is_dark: bool, cx: &App) -> Hsla {
                 hsl(272., 68., 44.)
             }
         }
-        JsonTokenKind::Punctuation => cx.theme().muted_foreground,
-        JsonTokenKind::Plain => cx.theme().foreground,
+        JsonTokenKind::Punctuation => muted_fg,
+        JsonTokenKind::Plain => foreground,
     }
 }
 
-/// Render a monospace code viewer with line numbers, optional JSON syntax highlighting,
-/// optional line wrapping, and case-insensitive search highlighting.
-pub fn render_code_viewer(
-    text: &str,
-    is_json: bool,
+/// Pure helper producing strictly ascending, non-overlapping UTF-8 char-boundary segments
+/// combining syntax tokens and case-insensitive search matches.
+fn build_line_segments(
+    line: &str,
+    tokens: &[(Range<usize>, JsonTokenKind)],
+    search_lower: &str,
+) -> Vec<(Range<usize>, Option<JsonTokenKind>, bool)> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if search_lower.is_empty() {
+        return tokens
+            .iter()
+            .filter(|(r, _)| {
+                r.start < r.end
+                    && r.end <= line.len()
+                    && line.is_char_boundary(r.start)
+                    && line.is_char_boundary(r.end)
+            })
+            .map(|(r, kind)| (r.clone(), Some(*kind), false))
+            .collect();
+    }
+
+    let lower = line.to_ascii_lowercase();
+    let matches: Vec<Range<usize>> = if lower.len() == line.len() {
+        lower
+            .match_indices(search_lower)
+            .filter_map(|(start, matched)| {
+                let end = start + matched.len();
+                (start < end
+                    && end <= line.len()
+                    && line.is_char_boundary(start)
+                    && line.is_char_boundary(end))
+                .then_some(start..end)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if matches.is_empty() {
+        return tokens
+            .iter()
+            .filter(|(r, _)| {
+                r.start < r.end
+                    && r.end <= line.len()
+                    && line.is_char_boundary(r.start)
+                    && line.is_char_boundary(r.end)
+            })
+            .map(|(r, kind)| (r.clone(), Some(*kind), false))
+            .collect();
+    }
+
+    let mut boundaries = Vec::with_capacity(tokens.len() * 2 + matches.len() * 2 + 2);
+    boundaries.push(0);
+    boundaries.push(line.len());
+    for (r, _) in tokens {
+        if r.start < r.end && r.end <= line.len() {
+            boundaries.push(r.start);
+            boundaries.push(r.end);
+        }
+    }
+    for r in &matches {
+        boundaries.push(r.start);
+        boundaries.push(r.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut out: Vec<(Range<usize>, Option<JsonTokenKind>, bool)> = Vec::new();
+    let mut tok_idx = 0usize;
+    let mut match_idx = 0usize;
+
+    for pair in boundaries.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if a >= b || !line.is_char_boundary(a) || !line.is_char_boundary(b) {
+            continue;
+        }
+        while tok_idx < tokens.len() && tokens[tok_idx].0.end <= a {
+            tok_idx += 1;
+        }
+        while match_idx < matches.len() && matches[match_idx].end <= a {
+            match_idx += 1;
+        }
+        let kind = tokens
+            .get(tok_idx)
+            .and_then(|(r, k)| (r.start <= a && b <= r.end).then_some(*k));
+        let is_match = matches
+            .get(match_idx)
+            .is_some_and(|r| r.start <= a && b <= r.end);
+
+        if kind.is_none() && !is_match {
+            continue;
+        }
+        if let Some(last) = out.last_mut()
+            && last.0.end == a
+            && last.1 == kind
+            && last.2 == is_match
+        {
+            last.0.end = b;
+        } else {
+            out.push((a..b, kind, is_match));
+        }
+    }
+
+    out
+}
+
+pub fn build_line_highlights(
+    line: &str,
+    tokens: &[(Range<usize>, JsonTokenKind)],
+    search_lower: &str,
+    is_dark: bool,
+    muted_fg: Hsla,
+    foreground: Hsla,
+    highlight_bg: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    build_line_segments(line, tokens, search_lower)
+        .into_iter()
+        .map(|(range, kind, is_match)| {
+            let mut style = HighlightStyle::default();
+            if let Some(kind) = kind {
+                style.color = Some(token_color(kind, is_dark, muted_fg, foreground));
+            }
+            if is_match {
+                style.background_color = Some(highlight_bg);
+                style.font_weight = Some(FontWeight::SEMIBOLD);
+            }
+            (range, style)
+        })
+        .collect()
+}
+
+/// Render pre-tokenized response lines via virtualized `uniform_list` (or wrapped `StyledText` for small payloads).
+pub fn render_virtual_code_lines(
+    lines: CodeLines,
     wrap: bool,
-    search: &str,
+    search_lower: &str,
+    scroll_handle: &UniformListScrollHandle,
     cx: &App,
-) -> (AnyElement, usize) {
+) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let mono = cx.theme().mono_font_family.clone();
-    let gutter_fg = cx.theme().muted_foreground.opacity(0.65);
-    let border = cx.theme().border;
-    let search_trimmed = search.trim();
-    let total_matches = count_search_matches(text, search_trimmed);
-    let search_lower = search_trimmed.to_ascii_lowercase();
+    let foreground = cx.theme().foreground;
+    let muted_fg = cx.theme().muted_foreground;
+    let gutter_fg = muted_fg.opacity(0.65);
+    let border = cx.theme().border.opacity(0.6);
+    let row_hover = cx.theme().muted.opacity(0.35);
     let highlight_bg = if is_dark {
         hsla(42. / 360., 0.90, 0.50, 0.34)
     } else {
         hsla(45. / 360., 0.96, 0.52, 0.42)
     };
+    let line_count = lines.len();
 
-    let lines: Vec<&str> = if text.is_empty() {
-        vec![""]
-    } else {
-        text.lines().collect()
-    };
-
-    if lines.len() > MAX_HIGHLIGHT_LINES {
-        let preview_lines = lines.len();
-        let el = div()
-            .w_full()
+    if wrap && line_count <= MAX_WRAP_LINES {
+        let mut rows = Vec::with_capacity(line_count);
+        for idx in 0..line_count {
+            let (text, runs) = match &lines {
+                CodeLines::Json(items) => {
+                    let item = &items[idx];
+                    let runs = build_line_highlights(
+                        &item.text,
+                        &item.tokens,
+                        search_lower,
+                        is_dark,
+                        muted_fg,
+                        foreground,
+                        highlight_bg,
+                    );
+                    (item.text.clone(), runs)
+                }
+                CodeLines::Plain(items) => {
+                    let item = &items[idx];
+                    let runs = build_line_highlights(
+                        item,
+                        &[],
+                        search_lower,
+                        is_dark,
+                        muted_fg,
+                        foreground,
+                        highlight_bg,
+                    );
+                    (item.clone(), runs)
+                }
+            };
+            rows.push(render_code_row(
+                idx, text, runs, true, gutter_fg, border, row_hover,
+            ));
+        }
+        return div()
+            .id("response-body-wrap-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .py_1p5()
+            .font_family(mono)
+            .text_size(px(12.))
+            .line_height(px(20.))
+            .text_color(foreground)
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .child(
-                div()
-                    .px_2p5()
-                    .py_1p5()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().muted)
-                    .text_size(px(11.5))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "Large payload ({preview_lines} lines) — showing fast plain monospace view."
-                    )),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .font_family(mono)
-                    .text_size(px(12.))
-                    .line_height(px(19.))
-                    .text_color(cx.theme().foreground)
-                    .when(!wrap, |d| d.whitespace_nowrap())
-                    .child(text.to_owned()),
-            )
+            .children(rows)
             .into_any_element();
-        return (el, total_matches);
     }
 
-    let mut rows = Vec::with_capacity(lines.len());
-    for (idx, line) in lines.iter().enumerate() {
-        let spans = if is_json {
-            tokenize_json_line(line)
-        } else {
-            vec![TokenSpan {
-                text: line,
-                kind: JsonTokenKind::Plain,
-            }]
-        };
-
-        let mut content = div()
-            .flex_1()
-            .min_w_0()
-            .px_3()
-            .flex()
-            .flex_row()
-            .when(wrap, |d| d.flex_wrap())
-            .when(!wrap, |d| d.whitespace_nowrap());
-
-        if spans.is_empty() || (spans.len() == 1 && spans[0].text.is_empty()) {
-            content = content.child(" ");
-        } else {
-            for span in spans {
-                let color = token_color(span.kind, is_dark, cx);
-                if search_lower.is_empty() {
-                    content = content.child(
-                        div()
-                            .text_color(color)
-                            .when(!wrap, |d| d.whitespace_nowrap())
-                            .child(span.text.to_owned()),
-                    );
-                } else {
-                    content = render_highlighted_span(
-                        content,
-                        span.text,
-                        &search_lower,
-                        color,
-                        highlight_bg,
-                        wrap,
-                    );
-                }
+    let search_owned = search_lower.to_owned();
+    let mono_list = mono.clone();
+    uniform_list(
+        "response-body-list",
+        line_count,
+        move |range, _, _| -> Vec<AnyElement> {
+            let mut items = Vec::with_capacity(range.len());
+            for idx in range {
+                let (text, runs) = match &lines {
+                    CodeLines::Json(vec) => {
+                        let item = &vec[idx];
+                        let runs = build_line_highlights(
+                            &item.text,
+                            &item.tokens,
+                            &search_owned,
+                            is_dark,
+                            muted_fg,
+                            foreground,
+                            highlight_bg,
+                        );
+                        (item.text.clone(), runs)
+                    }
+                    CodeLines::Plain(vec) => {
+                        let item = &vec[idx];
+                        let runs = build_line_highlights(
+                            item,
+                            &[],
+                            &search_owned,
+                            is_dark,
+                            muted_fg,
+                            foreground,
+                            highlight_bg,
+                        );
+                        (item.clone(), runs)
+                    }
+                };
+                items.push(render_code_row(
+                    idx, text, runs, false, gutter_fg, border, row_hover,
+                ));
             }
-        }
-
-        rows.push(
-            div()
-                .w_full()
-                .min_h(px(20.))
-                .flex()
-                .items_start()
-                .hover(|s| s.bg(cx.theme().muted.opacity(0.35)))
-                .child(
-                    div()
-                        .w(px(46.))
-                        .flex_shrink_0()
-                        .pr_2p5()
-                        .text_right()
-                        .border_r_1()
-                        .border_color(border.opacity(0.6))
-                        .text_color(gutter_fg)
-                        .text_size(px(11.))
-                        .line_height(px(20.))
-                        .child((idx + 1).to_string()),
-                )
-                .child(content)
-                .into_any_element(),
-        );
-    }
-
-    let el = div()
-        .w_full()
-        .py_1p5()
-        .font_family(mono)
-        .text_size(px(12.))
-        .line_height(px(20.))
-        .flex()
-        .flex_col()
-        .children(rows)
-        .into_any_element();
-
-    (el, total_matches)
+            items
+        },
+    )
+    .size_full()
+    .py_1p5()
+    .font_family(mono_list)
+    .text_size(px(12.))
+    .line_height(px(20.))
+    .text_color(foreground)
+    .track_scroll(scroll_handle)
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .into_any_element()
 }
 
-fn render_highlighted_span(
-    mut container: Div,
-    text: &str,
-    search_lower: &str,
-    fg: Hsla,
-    highlight_bg: Hsla,
+fn render_code_row(
+    idx: usize,
+    text: SharedString,
+    runs: Vec<(Range<usize>, HighlightStyle)>,
     wrap: bool,
-) -> Div {
-    let lower = text.to_ascii_lowercase();
-    if lower.len() != text.len() || !lower.contains(search_lower) {
-        return container.child(
-            div()
-                .text_color(fg)
-                .when(!wrap, |d| d.whitespace_nowrap())
-                .child(text.to_owned()),
-        );
-    }
+    gutter_fg: Hsla,
+    border: Hsla,
+    row_hover: Hsla,
+) -> AnyElement {
+    let content: AnyElement = if text.is_empty() {
+        " ".into_any_element()
+    } else if runs.is_empty() {
+        text.into_any_element()
+    } else {
+        StyledText::new(text)
+            .with_highlights(runs)
+            .into_any_element()
+    };
 
-    let mut cursor = 0;
-    while cursor < text.len() {
-        if let Some(rel) = lower[cursor..].find(search_lower) {
-            let start = cursor + rel;
-            let end = start + search_lower.len();
-            if start > cursor {
-                container = container.child(
-                    div()
-                        .text_color(fg)
-                        .when(!wrap, |d| d.whitespace_nowrap())
-                        .child(text[cursor..start].to_owned()),
-                );
-            }
-            container = container.child(
-                div()
-                    .bg(highlight_bg)
-                    .rounded(px(2.))
-                    .text_color(fg)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .when(!wrap, |d| d.whitespace_nowrap())
-                    .child(text[start..end].to_owned()),
-            );
-            cursor = end;
-        } else {
-            container = container.child(
-                div()
-                    .text_color(fg)
-                    .when(!wrap, |d| d.whitespace_nowrap())
-                    .child(text[cursor..].to_owned()),
-            );
-            break;
-        }
-    }
-    container
+    div()
+        .w_full()
+        .when(!wrap, |d| d.h(px(20.)))
+        .when(wrap, |d| d.min_h(px(20.)))
+        .flex()
+        .items_start()
+        .hover(move |s| s.bg(row_hover))
+        .child(
+            div()
+                .w(px(46.))
+                .flex_shrink_0()
+                .pr_2p5()
+                .text_right()
+                .border_r_1()
+                .border_color(border)
+                .text_color(gutter_fg)
+                .text_size(px(11.))
+                .line_height(px(20.))
+                .child((idx + 1).to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .px_3()
+                .when(!wrap, |d| d.whitespace_nowrap())
+                .child(content),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -426,5 +593,27 @@ mod tests {
         let json = "{\n  \"status\": \"OK\",\n  \"message\": \"ok now\"\n}";
         assert_eq!(count_search_matches(json, "ok"), 2);
         assert_eq!(count_search_matches(json, "  "), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn precomputes_lines_and_keeps_highlights_ordered_and_char_safe() {
+        let json = "{\n  \"greeting\": \"Merhaba dünya\",\n  \"count\": 42\n}";
+        let lines = precompute_json_lines(json);
+        assert_eq!(lines.len(), 4);
+
+        let segs = build_line_segments(&lines[1].text, &lines[1].tokens, "dün");
+        let mut prev_end = 0;
+        let mut saw_match = false;
+        for (range, _, matched) in &segs {
+            assert!(range.start >= prev_end);
+            assert!(range.start < range.end);
+            assert!(lines[1].text.is_char_boundary(range.start));
+            assert!(lines[1].text.is_char_boundary(range.end));
+            prev_end = range.end;
+            if *matched {
+                saw_match = true;
+            }
+        }
+        assert!(saw_match);
     }
 }

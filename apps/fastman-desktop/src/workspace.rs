@@ -265,12 +265,22 @@ pub struct WorkspaceView {
     pub(super) pending_abort: Option<AbortHandle>,
     pub(super) pending: Option<Task<()>>,
     pub(super) responses: HashMap<String, ResponseCacheEntry>,
+    pub(super) cached_request_count: usize,
+    pub(super) params_active_count: usize,
+    pub(super) headers_active_count: usize,
+    pub(super) body_json_valid: bool,
+    pub(super) explorer_filter_lower: String,
     pub(super) response_tab: usize,
     pub(super) response_raw: bool,
     pub(super) response_wrap: bool,
     pub(super) response_find_open: bool,
     pub(super) response_search: Entity<InputState>,
-    pub(super) status: String,
+    pub(super) response_search_lower: String,
+    pub(super) response_search_matches: usize,
+    pub(super) response_scroll: UniformListScrollHandle,
+    pub(super) headers_scroll: UniformListScrollHandle,
+    pub(super) cookies_scroll: UniformListScrollHandle,
+    pub(super) status: SharedString,
     pub(super) status_is_error: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -346,15 +356,22 @@ impl WorkspaceView {
             },
         ));
         subscriptions.push(
-            cx.subscribe_in(&explorer_search, window, |_, _, event, _, cx| {
+            cx.subscribe_in(&explorer_search, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    view.explorer_filter_lower = view
+                        .explorer_search
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_ascii_lowercase();
                     cx.notify();
                 }
             }),
         );
         subscriptions.push(
-            cx.subscribe_in(&response_search, window, |_, _, event, _, cx| {
+            cx.subscribe_in(&response_search, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    view.refresh_response_search_matches(cx);
                     cx.notify();
                 }
             }),
@@ -384,6 +401,7 @@ impl WorkspaceView {
         subscriptions.push(
             cx.subscribe_in(&body_editor, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) && !view.suppress_dirty {
+                    view.refresh_body_json_valid(cx);
                     view.mark_dirty(cx);
                 }
             }),
@@ -450,15 +468,26 @@ impl WorkspaceView {
             pending_abort: None,
             pending: None,
             responses: HashMap::new(),
+            cached_request_count: 0,
+            params_active_count: 0,
+            headers_active_count: 0,
+            body_json_valid: true,
+            explorer_filter_lower: String::new(),
             response_tab: 0,
             response_raw: false,
-            response_wrap: true,
+            response_wrap: false,
             response_find_open: false,
             response_search,
-            status: "Ready · local-first".into(),
+            response_search_lower: String::new(),
+            response_search_matches: 0,
+            response_scroll: UniformListScrollHandle::new(),
+            headers_scroll: UniformListScrollHandle::new(),
+            cookies_scroll: UniformListScrollHandle::new(),
+            status: SharedString::new_static("Ready · local-first"),
             status_is_error: false,
             _subscriptions: subscriptions,
         };
+        view.refresh_request_count();
         view.expand_all();
         view.load_editor(window, cx);
         view.focus_handle.focus(window, cx);
@@ -489,6 +518,57 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    pub(super) fn refresh_request_count(&mut self) {
+        self.cached_request_count = self.current().request_count();
+    }
+
+    pub(super) fn refresh_kv_counts(&mut self, cx: &App) {
+        self.params_active_count = self.params_table.active_count(cx);
+        self.headers_active_count = self.headers_table.active_count(cx);
+    }
+
+    pub(super) fn refresh_body_json_valid(&mut self, cx: &App) {
+        if self.body_kind != 1 {
+            self.body_json_valid = true;
+            return;
+        }
+        let body_text = self.body_editor.read(cx).value().to_string();
+        self.body_json_valid = body_text.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(&body_text).is_ok();
+    }
+
+    pub(super) fn refresh_response_search_matches(&mut self, cx: &App) {
+        self.response_search_lower = self
+            .response_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        if !self.response_find_open || self.response_search_lower.is_empty() {
+            self.response_search_matches = 0;
+            return;
+        }
+        let body = self
+            .active_response_entry()
+            .and_then(|entry| entry.response.as_ref())
+            .map(|resp| {
+                if !self.response_raw {
+                    resp.pretty_body.as_ref().unwrap_or(&resp.raw_body)
+                } else {
+                    &resp.raw_body
+                }
+            });
+        self.response_search_matches = body.map_or(0, |text| {
+            crate::json_highlight::count_search_matches(text.as_ref(), &self.response_search_lower)
+        });
+    }
+
+    pub(super) fn reset_response_scroll(&self) {
+        self.response_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.headers_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.cookies_scroll.scroll_to_item(0, ScrollStrategy::Top);
+    }
+
     fn kv_change_handler(
         table_kind: usize,
     ) -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
@@ -509,6 +589,7 @@ impl WorkspaceView {
                     .form_table
                     .ensure_trailing_blank(window, cx, Self::kv_change_handler(2)),
             }
+            view.refresh_kv_counts(cx);
             view.mark_dirty(cx);
         }
     }
@@ -530,6 +611,7 @@ impl WorkspaceView {
                 .form_table
                 .add_row(window, cx, Self::kv_change_handler(2)),
         }
+        self.refresh_kv_counts(cx);
         cx.notify();
     }
 
@@ -551,6 +633,7 @@ impl WorkspaceView {
                 .form_table
                 .remove_row(idx, window, cx, Self::kv_change_handler(2)),
         }
+        self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
     }
 
@@ -563,6 +646,7 @@ impl WorkspaceView {
     ) {
         self.headers_table
             .append_pair(key, value, window, cx, Self::kv_change_handler(1));
+        self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
     }
 
@@ -580,6 +664,7 @@ impl WorkspaceView {
         self.suppress_dirty = true;
         Self::set_input(&self.url, base, window, cx);
         self.suppress_dirty = false;
+        self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
     }
 
@@ -594,6 +679,7 @@ impl WorkspaceView {
             Ok(formatted) => {
                 self.body_editor
                     .update(cx, |state, cx| state.set_value(formatted, window, cx));
+                self.refresh_body_json_valid(cx);
                 self.mark_dirty(cx);
             }
             Err(err) => {
@@ -638,7 +724,12 @@ impl WorkspaceView {
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
-    fn set_status(&mut self, message: impl Into<String>, is_error: bool, cx: &mut Context<Self>) {
+    fn set_status(
+        &mut self,
+        message: impl Into<SharedString>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.status = message.into();
         self.status_is_error = is_error;
         cx.notify();
@@ -737,6 +828,10 @@ impl WorkspaceView {
         }
         self.suppress_dirty = false;
         self.dirty = false;
+        self.refresh_kv_counts(cx);
+        self.refresh_body_json_valid(cx);
+        self.refresh_response_search_matches(cx);
+        self.reset_response_scroll();
         cx.notify();
     }
 
@@ -889,6 +984,7 @@ impl WorkspaceView {
         self.selected_id = self.current().first_request_id();
         self.open_tabs = self.selected_id.clone().into_iter().collect();
         self.target_folder = None;
+        self.refresh_request_count();
         self.expand_all();
         self.load_editor(window, cx);
         self.set_status(format!("Project: {}", self.current().name), false, cx);
@@ -925,6 +1021,7 @@ impl WorkspaceView {
                     selector.set_items(choices, window, cx);
                     selector.set_selected_index(Some(IndexPath::default()), window, cx);
                 });
+                self.refresh_request_count();
                 self.expand_all();
                 self.load_editor(window, cx);
                 self.set_status(
@@ -1013,6 +1110,7 @@ impl WorkspaceView {
             self.expanded.insert(coll.id.clone());
             coll.requests.push(req);
         }
+        self.refresh_request_count();
         match self.store.save(self.current()) {
             Ok(()) => self.open_request(id, window, cx),
             Err(error) => {
@@ -1034,6 +1132,7 @@ impl WorkspaceView {
             return;
         }
         if let Some(new_id) = self.projects[self.active_project].duplicate_request(id) {
+            self.refresh_request_count();
             let _ = self.store.save(self.current());
             self.open_request(new_id, window, cx);
             window.push_notification(Notification::success("Request duplicated"), cx);
@@ -1238,6 +1337,7 @@ impl WorkspaceView {
         if self.projects[self.active_project].delete_request(id) {
             self.responses.remove(id);
             self.open_tabs.retain(|tab| tab != id);
+            self.refresh_request_count();
             if self.selected_id.as_deref() == Some(id) {
                 self.selected_id = self
                     .open_tabs
@@ -1295,6 +1395,7 @@ impl WorkspaceView {
 
     fn delete_folder_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.projects[self.active_project].delete_folder(id) {
+            self.refresh_request_count();
             if self.target_folder.as_deref() == Some(id) {
                 self.target_folder = None;
             }
@@ -1531,11 +1632,30 @@ impl WorkspaceView {
 
         let generation = self.run_generation;
         let engine = self.engine.clone();
-        let sent_method = request.method.clone();
-        let sent_url = request.url.clone();
-        let handle = self
-            .runtime
-            .spawn(async move { engine.send(&request, &variables).await });
+        let sent_method = SharedString::from(request.method.clone());
+        let sent_url = SharedString::from(request.url.clone());
+        let sent_method_fallback = sent_method.clone();
+        let sent_url_fallback = sent_url.clone();
+        let handle = self.runtime.spawn(async move {
+            match engine.send(&request, &variables).await {
+                Ok(response) => {
+                    let status_line = SharedString::from(format!(
+                        "{} {} · {} · {}",
+                        response.status,
+                        response.reason,
+                        crate::theme::format_duration(response.elapsed_ms),
+                        crate::theme::format_bytes(response.bytes_received),
+                    ));
+                    let entry = ResponseCacheEntry::from_response(response, sent_method, sent_url);
+                    Ok((entry, status_line))
+                }
+                Err(error) => Err(ResponseCacheEntry::from_error(
+                    error.to_string(),
+                    sent_method,
+                    sent_url,
+                )),
+            }
+        });
         self.pending_abort = Some(handle.abort_handle());
         self.pending = Some(cx.spawn(async move |this, cx| {
             let result = handle.await;
@@ -1546,47 +1666,27 @@ impl WorkspaceView {
                 view.pending_abort = None;
                 view.in_flight_request_id = None;
                 match result {
-                    Ok(Ok(response)) => {
-                        let status_line = format!(
-                            "{} {} · {} · {}",
-                            response.status,
-                            response.reason,
-                            crate::theme::format_duration(response.elapsed_ms),
-                            crate::theme::format_bytes(response.bytes_received),
-                        );
-                        view.responses.insert(
-                            request_id,
-                            ResponseCacheEntry {
-                                response: Some(response),
-                                error: None,
-                                sent_method,
-                                sent_url,
-                            },
-                        );
+                    Ok(Ok((entry, status_line))) => {
+                        view.responses.insert(request_id, entry);
+                        view.refresh_response_search_matches(cx);
+                        view.reset_response_scroll();
                         view.set_status(status_line, false, cx);
                     }
-                    Ok(Err(error)) => {
-                        view.responses.insert(
-                            request_id,
-                            ResponseCacheEntry {
-                                response: None,
-                                error: Some(error.to_string()),
-                                sent_method,
-                                sent_url,
-                            },
-                        );
+                    Ok(Err(entry)) => {
+                        view.responses.insert(request_id, entry);
+                        view.refresh_response_search_matches(cx);
                         view.set_status("Request failed", true, cx);
                     }
                     Err(error) => {
                         view.responses.insert(
                             request_id,
-                            ResponseCacheEntry {
-                                response: None,
-                                error: Some(error.to_string()),
-                                sent_method,
-                                sent_url,
-                            },
+                            ResponseCacheEntry::from_error(
+                                error.to_string(),
+                                sent_method_fallback,
+                                sent_url_fallback,
+                            ),
                         );
+                        view.refresh_response_search_matches(cx);
                         view.set_status("Request interrupted", true, cx);
                     }
                 }
@@ -1603,6 +1703,7 @@ impl WorkspaceView {
             ThemeMode::Dark
         };
         Theme::change(next, Some(window), cx);
+        crate::theme::apply_crisp_motion(cx);
         self.set_status(format!("Theme: {}", next.name()), false, cx);
     }
 }
@@ -1619,11 +1720,8 @@ impl Render for WorkspaceView {
         let is_dark = cx.theme().is_dark();
 
         let workspace_view = cx.weak_entity();
-        let active_ws = self.active_workspace;
-        let workspace_choices: Vec<String> =
-            self.workspaces.iter().map(|w| w.name.clone()).collect();
         let var_count = self.current().variables.len();
-        let req_count = self.current().request_count();
+        let req_count = self.cached_request_count;
 
         let header = div()
             .h(px(44.))
@@ -1660,11 +1758,24 @@ impl Render for WorkspaceView {
                     .dropdown_caret(true)
                     .icon(svg_icon("icons/layers.svg").small())
                     .label(self.workspaces[self.active_workspace].name.clone())
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for (index, name) in workspace_choices.iter().enumerate() {
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        let (choices, active_ws) = workspace_view
+                            .upgrade()
+                            .map(|entity| {
+                                let view = entity.read(cx);
+                                (
+                                    view.workspaces
+                                        .iter()
+                                        .map(|w| w.name.clone())
+                                        .collect::<Vec<_>>(),
+                                    view.active_workspace,
+                                )
+                            })
+                            .unwrap_or_default();
+                        for (index, name) in choices.into_iter().enumerate() {
                             let view = workspace_view.clone();
                             menu = menu.item(
-                                PopupMenuItem::new(name.clone())
+                                PopupMenuItem::new(name)
                                     .checked(index == active_ws)
                                     .on_click(move |_, window, cx| {
                                         let _ = view.update(cx, |view, cx| {

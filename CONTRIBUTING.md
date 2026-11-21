@@ -4,7 +4,7 @@ Thank you for helping improve Fastman!
 
 ## Prerequisites
 
-Install Rust stable (`>= 1.88`) and native build prerequisites listed in [docs/BUILD.md](docs/BUILD.md).
+Install Rust stable (`>= 1.88`) and GPUI Kit's native build prerequisites for your target OS.
 
 ## Before submitting changes
 

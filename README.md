@@ -51,7 +51,7 @@ Importing a Postman file creates a new project. Import does **not** execute requ
 
 ## Build and test
 
-Install Rust stable (`>= 1.88`) and GPUI Kit's native prerequisites. See **[docs/BUILD.md](docs/BUILD.md)** for Windows, Linux, and macOS setup.
+Install Rust stable (`>= 1.88`) and GPUI Kit's native prerequisites for your target OS.
 
 ```sh
 cargo fmt --all -- --check
@@ -70,7 +70,6 @@ fastman/
     fastman-cli/        # Headless list, import, and send CLI
   crates/
     fastman-core/       # Domain model, storage, HTTP engine, importer + tests
-  docs/                 # Architecture, build, format, security, parity, roadmap
   .github/              # CI workflow and issue/PR templates
 ```
 
@@ -88,15 +87,7 @@ fastman/
 - [Changelog](CHANGELOG.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
-- [Build & platform setup](docs/BUILD.md)
-- [Architecture and data flow](docs/ARCHITECTURE.md)
-- [Feature parity matrix](docs/FEATURE_MATRIX.md)
-- [Project file format](docs/PROJECT_FORMAT.md)
-- [Security and privacy model](docs/SECURITY.md)
-- [Verification and benchmarks](docs/TESTING.md)
-- [Development roadmap](docs/ROADMAP.md)
-- [Comparable Rust projects & research](docs/RUST_PROJECTS.md)
 
 ## License
 
-Licensed under the [MIT License](LICENSE). GPUI Kit and third-party dependencies keep their own licenses; see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+Licensed under the [MIT License](LICENSE). GPUI Kit and third-party dependencies keep their own licenses.

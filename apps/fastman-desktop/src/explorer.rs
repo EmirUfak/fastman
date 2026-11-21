@@ -19,13 +19,7 @@ impl WorkspaceView {
         let sidebar_bg = cx.theme().sidebar;
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
-        let query = self
-            .explorer_search
-            .read(cx)
-            .value()
-            .trim()
-            .to_ascii_lowercase();
-        let tree_items = self.render_explorer_tree(&query, cx);
+        let tree_items = self.render_explorer_tree(&self.explorer_filter_lower, cx);
         let has_matches = !tree_items.is_empty();
 
         div()
@@ -53,7 +47,7 @@ impl WorkspaceView {
                         div()
                             .text_size(px(11.))
                             .text_color(muted_fg)
-                            .child(format!("{} req", self.current().request_count())),
+                            .child(format!("{} req", self.cached_request_count)),
                     ),
             )
             .child(
@@ -128,7 +122,7 @@ impl WorkspaceView {
                             .text_color(muted_fg)
                             .child("COLLECTIONS"),
                     )
-                    .when(!query.is_empty(), |el| {
+                    .when(!self.explorer_filter_lower.is_empty(), |el| {
                         el.child(
                             div()
                                 .text_size(px(10.5))

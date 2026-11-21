@@ -10,3 +10,4 @@ fastman-data/
 .env
 .env.*
 !*.example
+/docs/

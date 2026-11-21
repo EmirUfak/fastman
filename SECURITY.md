@@ -21,4 +21,6 @@ Instead, report vulnerabilities privately to the repository maintainers via GitH
 
 ## Security Model & Known Caveats
 
-See [docs/SECURITY.md](docs/SECURITY.md) for the current security guarantees, explicit caveats (including what is persisted to `project.json`), and planned hardening work.
+- `Auth` credentials are excluded from serialized `project.json` (`#[serde(skip)]`).
+- Custom headers, query params, bodies, and variable values **are** persisted locally; avoid storing secrets there until secure variable storage is implemented.
+- TLS verification is enabled; imported Postman collections and scripts are treated as untrusted data and never executed.

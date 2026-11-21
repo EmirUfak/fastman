@@ -193,3 +193,18 @@ pub fn format_duration(ms: u128) -> String {
         format!("{:.2} s", ms as f64 / 1000.0)
     }
 }
+
+/// Apply crisp, responsive animation timing tokens across interactive controls.
+pub fn apply_crisp_motion(cx: &mut App) {
+    gpui_kit::component::Theme::update(cx, |theme| {
+        theme.motion.duration_fast = std::time::Duration::from_millis(90);
+        theme.motion.duration_normal = std::time::Duration::from_millis(140);
+        theme.motion.duration_slow = std::time::Duration::from_millis(200);
+        theme.motion.spring_control =
+            gpui_kit::base::Spring::new(std::time::Duration::from_millis(140));
+        theme.motion.spring_move =
+            gpui_kit::base::Spring::new(std::time::Duration::from_millis(180))
+                .with_damping(0.90)
+                .with_epsilon(0.1);
+    });
+}

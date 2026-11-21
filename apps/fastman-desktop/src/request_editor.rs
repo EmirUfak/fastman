@@ -243,8 +243,8 @@ impl WorkspaceView {
         let method_view = cx.weak_entity();
         let current_method = self.method.clone();
         let in_flight = self.in_flight_request_id.is_some();
-        let params_count = self.params_table.active_count(cx);
-        let headers_count = self.headers_table.active_count(cx);
+        let params_count = self.params_active_count;
+        let headers_count = self.headers_active_count;
         let mono = cx.theme().mono_font_family.clone();
 
         let url_bar = div()
@@ -482,6 +482,7 @@ impl WorkspaceView {
                                 cx,
                                 |view, idx, cx| {
                                     view.params_table.toggle_row(idx);
+                                    view.refresh_kv_counts(cx);
                                     view.mark_dirty(cx);
                                 },
                                 |view, idx, window, cx| {
@@ -690,6 +691,7 @@ impl WorkspaceView {
                                 cx,
                                 |view, idx, cx| {
                                     view.headers_table.toggle_row(idx);
+                                    view.refresh_kv_counts(cx);
                                     view.mark_dirty(cx);
                                 },
                                 |view, idx, window, cx| {
@@ -703,10 +705,7 @@ impl WorkspaceView {
                     .into_any_element()
             }
             3 => {
-                let body_text = self.body_editor.read(cx).value().to_string();
-                let json_valid = self.body_kind != 1
-                    || body_text.trim().is_empty()
-                    || serde_json::from_str::<serde_json::Value>(&body_text).is_ok();
+                let json_valid = self.body_kind != 1 || self.body_json_valid;
 
                 let body_pills: Vec<AnyElement> = BODY_TYPES
                     .iter()
@@ -718,6 +717,7 @@ impl WorkspaceView {
                             .label(*label)
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.body_kind = i;
+                                view.refresh_body_json_valid(cx);
                                 view.mark_dirty(cx);
                             }));
                         btn = if active { btn.secondary() } else { btn.ghost() };
