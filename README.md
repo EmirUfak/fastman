@@ -2,7 +2,7 @@
 
 **A native, local-first API development client written in Rust and GPUI Kit.**
 
-> Status: **v0.1.0** (early open-source preview). Desktop launch and platform-specific behavior should be verified on your target system.
+> Status: **v0.2.0** (early open-source preview). See the [changelog](CHANGELOG.md) for release details.
 
 ## Product contract
 
@@ -10,32 +10,30 @@
 - Center/right: request tabs; method, URL, inline request name editing, Params, Auth, Headers, Body, Scripts, and Settings sections; Send / Cancel / Save; response area.
 - Native UI with no Electron or browser renderer; data stays local unless a request is explicitly sent.
 - No required account, cloud sync, advertising, or developer telemetry.
-- Postman request-builder compatibility is the **long-term target**, not a claim of full parity today.
+- Broad REST/HTTP request-builder coverage is the **long-term target**, not a claim of full feature parity today.
 
-## Implemented in v0.1.0
+## Implemented in v0.2.0
 
 | Area | What exists |
 |---|---|
 | Workspaces | Workspace switcher and `+ Workspace` creation in the header; default `My workspace` preserved |
 | Project selector | GPUI Kit `Select`, create named projects, switch projects |
-| Explorer | Collections, recursive folders, requests, expand/collapse, create folder/request |
+| Explorer | Search, nested folders, context menus, and drag-and-drop organization |
 | Tabs | Multiple closable request tabs within the active project, inline request rename |
-| Request editor | Method dropdown, URL, query params, headers, auth, None/JSON/Text/Form URL Encoded body, timeout |
-| Request execution | Reqwest async, TLS verification, max 10 redirects, 100–300,000 ms timeout, 2 MiB response cap, cancellation via Tokio task abort |
-| Response viewer | Status, duration, byte count, truncation status, header count, final URL, pretty-printed JSON or raw body |
+| Request editor | Method, URL, editable parameter and header tables, auth, body editing with JSON validation and formatting, timeout, and project variables |
+| Request execution | Reqwest async, TLS verification, up to 10 same-origin redirects, 100–300,000 ms timeout, 2 MiB response cap, and cancellation |
+| Response viewer | Status, duration, size, final URL, searchable pretty or raw body, headers, and cookies |
 | Storage | Per-project JSON (`schema_version = 1`) in OS local data directory or `FASTMAN_HOME` |
-| Postman import | v2.1 subset through CLI; scripts, collection/request auth, multipart, and complex metadata emit warnings and are **not** imported |
+| Import and export | Collection v2.1 JSON subset through desktop or CLI; desktop cURL import and redacted-by-default Copy as cURL |
 | Tests | Core unit and feature tests (nested lookup, secret exclusion, local persistence, interpolation, importer, localhost HTTP) and CLI integration tests |
 
 ### Current limitations
 
-Not yet implemented: full Postman feature parity, editable response header/cookie tabs, request tests/assertions and JS runtime, project/folder/request delete or duplicate menus, nested folder creation inside a selected folder, environment editor, OAuth 2.0, Digest, AWS SigV4, multipart/binary uploads, GraphQL tooling, WebSocket/gRPC/SSE, proxy/certificate configuration, collection runner, export formats, request history and search, large-response streaming viewer, keyboard shortcuts, and distribution packaging.
-
-**Editor note:** Params, headers, and form-urlencoded bodies currently use line-oriented key/value text areas (`# ` comments out a row) instead of interactive table rows.
+Not yet implemented: request tests/assertions and JS runtime, separate environments, OAuth 2.0, Digest, AWS SigV4, multipart/binary uploads, GraphQL tooling, WebSocket/gRPC/SSE, proxy/certificate configuration, collection runner, collection export, request history, large-response streaming, and distribution packaging.
 
 ## Usage
 
-On first launch Fastman creates **My API Project**, with an **Examples** folder and an unsent sample GET request. Network requests are made **only** after clicking **Send** (or invoking `fastman-cli send`).
+On first launch Fastman creates **My API Project** with no sample requests. Create a request to start with a blank URL. Network requests are made **only** after clicking **Send** (or invoking `fastman-cli send`).
 
 - The desktop header selects the active workspace; use **+ Workspace** to create one by name. Each workspace stores its own projects, while existing projects remain in **My workspace**.
 - The CLI currently operates on the default workspace only:
@@ -43,11 +41,11 @@ On first launch Fastman creates **My API Project**, with an **Examples** folder 
 ```sh
 cargo run -p fastman-cli -- --version
 cargo run -p fastman-cli -- list
-cargo run -p fastman-cli -- import-postman ./my_collection.json
+cargo run -p fastman-cli -- import-collection ./my_collection.json
 cargo run -p fastman-cli -- send <project-uuid> <request-uuid>
 ```
 
-Importing a Postman file creates a new project. Import does **not** execute requests or scripts.
+Importing a collection file creates a new project. Import does **not** execute requests or scripts.
 
 ## Build and test
 

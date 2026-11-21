@@ -274,7 +274,7 @@ impl WorkspaceView {
                                     )
                                     .title(EmptyTitle::new().child("No request open"))
                                     .description(EmptyDescription::new().child(
-                                        "Select a request from the explorer, create a new one, or import Postman / cURL.",
+                                        "Select a request from the explorer, create a new one, or import a Collection / cURL.",
                                     )),
                             )
                             .content(

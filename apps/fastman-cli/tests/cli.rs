@@ -11,7 +11,7 @@ fn import_list_and_error_paths() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("data");
     let input = dir.path().join("collection.json");
-    fs::write(&input, r#"{"info":{"name":"CLI Collection","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"event":[],"item":[{"name":"Request","request":{"method":"GET","url":"http://localhost"}}]}"#).unwrap();
+    fs::write(&input, r#"{"info":{"name":"CLI Collection","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},"event":[],"item":[{"name":"Request","request":{"method":"GET","url":"http://localhost"}}]}"#).unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
             .env("FASTMAN_HOME", &home)
@@ -22,7 +22,7 @@ fn import_list_and_error_paths() {
     let empty = run(&["list"]);
     assert!(empty.status.success());
     assert!(empty.stdout.is_empty());
-    let imported = run(&["import-postman", input.to_str().unwrap()]);
+    let imported = run(&["import-collection", input.to_str().unwrap()]);
     assert!(imported.status.success());
     assert!(String::from_utf8_lossy(&imported.stdout).contains("Imported 1 request(s)"));
     assert!(String::from_utf8_lossy(&imported.stderr).contains("Collection scripts not imported"));
@@ -51,7 +51,7 @@ fn import_blocks_plaintext_secrets_by_default_and_escapes_terminal_sequences() {
     let secret_col = dir.path().join("secret.json");
     fs::write(
         &secret_col,
-        r#"{"info":{"name":"Evil\u001b[31mAPI","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[{"name":"AuthReq","request":{"method":"GET","url":"https://example.com?api_key=q_canary","header":[{"key":"Authorization","value":"Token secret_canary"},{"key":"Accept","value":"application/json"}]}}]}"#,
+        r#"{"info":{"name":"Evil\u001b[31mAPI","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},"item":[{"name":"AuthReq","request":{"method":"GET","url":"https://example.com?api_key=q_canary","header":[{"key":"Authorization","value":"Token secret_canary"},{"key":"Accept","value":"application/json"}]}}]}"#,
     )
     .unwrap();
 
@@ -64,14 +64,14 @@ fn import_blocks_plaintext_secrets_by_default_and_escapes_terminal_sequences() {
     };
 
     // Default import must refuse to persist sensitive fields.
-    let refused = run(&["import-postman", secret_col.to_str().unwrap()]);
+    let refused = run(&["import-collection", secret_col.to_str().unwrap()]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--strip-secrets"));
     assert!(run(&["list"]).stdout.is_empty());
 
     // --strip-secrets saves project without persisting any canary secrets.
     let stripped = run(&[
-        "import-postman",
+        "import-collection",
         "--strip-secrets",
         secret_col.to_str().unwrap(),
     ]);
@@ -98,7 +98,7 @@ fn import_blocks_plaintext_secrets_by_default_and_escapes_terminal_sequences() {
 
     // --allow-plaintext-secrets explicitly permits storage with warning.
     let allowed = run(&[
-        "import-postman",
+        "import-collection",
         "--allow-plaintext-secrets",
         secret_col.to_str().unwrap(),
     ]);

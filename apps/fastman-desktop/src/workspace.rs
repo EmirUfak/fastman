@@ -154,7 +154,7 @@ impl Render for VariablesSheetView {
 }
 
 pub enum PendingSensitiveImport {
-    Postman(import::ImportReport),
+    Collection(import::ImportReport),
     Curl(ApiRequest, Vec<SensitiveFieldFinding>),
 }
 
@@ -171,7 +171,7 @@ impl ImportDialogView {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(10)
-                .placeholder("Paste Postman Collection v2.1 JSON...")
+                .placeholder("Paste Collection v2.1 JSON...")
         });
         Self {
             mode: 0,
@@ -187,7 +187,7 @@ impl Render for ImportDialogView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(pending) = &self.pending_sensitive {
             let (count, summary, is_curl) = match pending {
-                PendingSensitiveImport::Postman(report) => (
+                PendingSensitiveImport::Collection(report) => (
                     report.sensitive_fields.len(),
                     summarize_sensitive_findings(&report.sensitive_fields),
                     false,
@@ -199,7 +199,7 @@ impl Render for ImportDialogView {
             let source_label = if is_curl {
                 "This cURL command"
             } else {
-                "This Postman collection"
+                "This collection"
             };
             return div()
                 .flex()
@@ -242,9 +242,9 @@ impl Render for ImportDialogView {
         }
 
         let placeholder = if self.mode == 0 {
-            "Paste Postman Collection v2.1 JSON..."
+            "Paste Collection v2.1 JSON..."
         } else {
-            "Paste a cURL command (e.g. curl -X POST https://api.example.com -H 'Content-Type: application/json' -d '{\"ok\":true}')..."
+            "Paste a cURL command..."
         };
         div()
             .flex()
@@ -261,7 +261,7 @@ impl Render for ImportDialogView {
                         view.input.update(cx, |state, cx| {
                             state.set_placeholder(
                                 if *idx == 0 {
-                                    "Paste Postman Collection v2.1 JSON..."
+                                    "Paste Collection v2.1 JSON..."
                                 } else {
                                     "Paste a cURL command..."
                                 },
@@ -271,7 +271,7 @@ impl Render for ImportDialogView {
                         });
                         cx.notify();
                     }))
-                    .child(Tab::new().label("Postman v2.1 JSON"))
+                    .child(Tab::new().label("Collection v2.1 JSON"))
                     .child(Tab::new().label("cURL Command")),
             )
             .child(
@@ -373,17 +373,7 @@ impl WorkspaceView {
         let (mut projects, proj_warnings) = store.list_resilient()?;
         startup_warnings.extend(proj_warnings);
         if projects.is_empty() {
-            let mut project = store.create("My API Project")?;
-            let mut folder = Folder::new("Examples");
-            // This sample is never sent automatically.
-            folder.requests.push(ApiRequest::new(
-                "GET",
-                "Example GET",
-                "https://httpbin.org/get",
-            ));
-            project.collections[0].folders.push(folder);
-            store.save(&project)?;
-            projects.push(project);
+            projects.push(store.create("My API Project")?);
         }
         let first = projects[0].first_request_id();
         let project_selector = cx.new(|cx| {
@@ -398,14 +388,12 @@ impl WorkspaceView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter requests..."));
         let response_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in response..."));
-        let url = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("https://api.example.com/v1/resource")
-        });
+        let url = cx.new(|cx| InputState::new(window, cx).placeholder("Request URL"));
         let request_name = cx.new(|cx| InputState::new(window, cx).placeholder("Request name"));
         let body_editor = cx.new(|cx| {
             EditorState::new(window, cx).placeholder("Enter JSON or raw request payload...")
         });
-        let timeout = cx.new(|cx| InputState::new(window, cx).placeholder("30000"));
+        let timeout = cx.new(|cx| InputState::new(window, cx));
         let auth_user = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
         let auth_password = cx.new(|cx| {
             InputState::new(window, cx)
@@ -417,7 +405,7 @@ impl WorkspaceView {
                 .placeholder("Bearer token")
                 .masked(true)
         });
-        let api_key_name = cx.new(|cx| InputState::new(window, cx).placeholder("X-API-Key"));
+        let api_key_name = cx.new(|cx| InputState::new(window, cx).placeholder("API key name"));
         let api_key_value = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("API key value")
@@ -1562,16 +1550,13 @@ impl WorkspaceView {
         let (title, placeholder, initial, ok_text) = match &kind {
             NameDialogKind::NewWorkspace => (
                 "Create Workspace",
-                "Workspace name (e.g. Platform API)",
+                "Workspace name",
                 String::new(),
                 "Create",
             ),
-            NameDialogKind::NewProject => (
-                "Create Project",
-                "Project name (e.g. Billing Service)",
-                String::new(),
-                "Create",
-            ),
+            NameDialogKind::NewProject => {
+                ("Create Project", "Project name", String::new(), "Create")
+            }
             NameDialogKind::RenameFolder(folder_id) => {
                 let current_name = self
                     .current()
@@ -1999,7 +1984,7 @@ impl WorkspaceView {
         });
     }
 
-    fn finalize_postman_import(
+    fn finalize_collection_import(
         &mut self,
         report: import::ImportReport,
         sanitized_summary: Option<fastman_core::security::SanitizeSummary>,
@@ -2072,7 +2057,7 @@ impl WorkspaceView {
                     });
                     if let Some((pending, choice)) = pending_step {
                         match pending {
-                            PendingSensitiveImport::Postman(mut report) => {
+                            PendingSensitiveImport::Collection(mut report) => {
                                 let sanitized = if choice == 0 {
                                     Some(report.sanitize_credentials())
                                 } else {
@@ -2081,7 +2066,7 @@ impl WorkspaceView {
                                 let mut saved_ok = true;
                                 let _ = weak_ok.update(cx, |view, cx| {
                                     if let Err(err) =
-                                        view.finalize_postman_import(report, sanitized, window, cx)
+                                        view.finalize_collection_import(report, sanitized, window, cx)
                                     {
                                         saved_ok = false;
                                         modal_ok.update(cx, |m, cx| {
@@ -2119,7 +2104,7 @@ impl WorkspaceView {
                     };
                     if raw_text.trim().is_empty() {
                         modal_ok.update(cx, |m, cx| {
-                            m.error = Some("Paste Postman JSON or a cURL command first.".into());
+                            m.error = Some("Paste Collection JSON or a cURL command first.".into());
                             cx.notify();
                         });
                         return false;
@@ -2135,12 +2120,12 @@ impl WorkspaceView {
                             });
                             return false;
                         }
-                        match import::postman_v21(&raw_text) {
+                        match import::collection_v21(&raw_text) {
                             Ok(report) if !report.sensitive_fields.is_empty() => {
                                 modal_ok.update(cx, |m, cx| {
                                     m.sensitive_choice = 0;
                                     m.pending_sensitive =
-                                        Some(PendingSensitiveImport::Postman(report));
+                                        Some(PendingSensitiveImport::Collection(report));
                                     cx.notify();
                                 });
                                 false
@@ -2149,7 +2134,7 @@ impl WorkspaceView {
                                 let mut saved_ok = true;
                                 let _ = weak_ok.update(cx, |view, cx| {
                                     if let Err(err) =
-                                        view.finalize_postman_import(report, None, window, cx)
+                                        view.finalize_collection_import(report, None, window, cx)
                                     {
                                         saved_ok = false;
                                         modal_ok.update(cx, |m, cx| {
@@ -2334,145 +2319,6 @@ impl WorkspaceView {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::WorkspaceView;
-    use fastman_core::storage::ProjectStore;
-    use gpui::{AppContext, TestAppContext};
-
-    #[test]
-    fn project_switch_saves_draft_but_keeps_it_open_on_conflict() {
-        run_view_test(check_project_switch);
-    }
-
-    #[test]
-    fn failed_tree_move_stays_dirty_and_blocks_project_switch() {
-        run_view_test(check_failed_tree_move);
-    }
-
-    fn run_view_test(test: fn()) {
-        // Building the full view in debug mode exceeds the default test stack on Windows.
-        let result = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(test)
-            .unwrap()
-            .join();
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
-    fn check_failed_tree_move() {
-        let mut cx = TestAppContext::single();
-        let root = tempfile::tempdir().unwrap();
-        let store = ProjectStore::at(root.path());
-        cx.update(gpui_kit::init);
-        let (window, view) = cx
-            .update(|cx| {
-                gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
-                })
-            })
-            .unwrap();
-
-        cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, cx| {
-                let project_id = view.current().id.clone();
-                let request_id = view.selected_id.clone().unwrap();
-                let original_folder = view.current().request_parent_folder(&request_id).unwrap();
-                let collection_id = view.current().collections[0].id.clone();
-                view.projects.push(store.create("Second project").unwrap());
-                assert!(!view.dirty);
-
-                let other_instance = ProjectStore::at(root.path());
-                let mut external = other_instance.load(&project_id).unwrap();
-                external.name = "Externally renamed".into();
-                other_instance.save(&external).unwrap();
-
-                view.move_request_to_collection(&request_id, &collection_id, window, cx);
-                assert!(view.current().request_parent_folder(&request_id).is_none());
-                assert!(view.status.contains("modified on disk"));
-                assert!(view.dirty, "The in-memory move still needs to be saved");
-
-                view.switch_project(1, window, cx);
-                assert_eq!(view.active_project, 0);
-                assert!(view.dirty);
-                let disk = other_instance.load(&project_id).unwrap();
-                assert_eq!(disk.name, "Externally renamed");
-                assert_eq!(
-                    disk.request_parent_folder(&request_id),
-                    Some(original_folder)
-                );
-            });
-        })
-        .unwrap();
-    }
-
-    fn check_project_switch() {
-        let mut cx = TestAppContext::single();
-        let root = tempfile::tempdir().unwrap();
-        let store = ProjectStore::at(root.path());
-        let other_instance = ProjectStore::at(root.path());
-        cx.update(gpui_kit::init);
-        let (window, view) = cx
-            .update(|cx| {
-                gpui_kit::open_window(Default::default(), cx, |window, cx| {
-                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
-                })
-            })
-            .unwrap();
-        let saved_url = "https://example.com/saved";
-        let draft_url = "https://example.com/draft";
-        let external_url = "https://example.com/external";
-
-        let (project_id, request_id) = cx
-            .update_window(window, |_, window, cx| {
-                view.update(cx, |view, cx| {
-                    let ids = (view.current().id.clone(), view.selected_id.clone().unwrap());
-                    view.projects.push(store.create("Second project").unwrap());
-                    view.url
-                        .update(cx, |input, cx| input.replace_all(saved_url, window, cx));
-                    ids
-                })
-            })
-            .unwrap();
-
-        cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, cx| {
-                assert!(view.dirty);
-                view.switch_project(1, window, cx);
-                assert_eq!(view.active_project, 1);
-                assert!(!view.dirty);
-                view.switch_project(0, window, cx);
-                view.url
-                    .update(cx, |input, cx| input.replace_all(draft_url, window, cx));
-            });
-        })
-        .unwrap();
-
-        let mut external = other_instance.load(&project_id).unwrap();
-        assert_eq!(external.find_request(&request_id).unwrap().url, saved_url);
-        external.find_request_mut(&request_id).unwrap().url = external_url.into();
-        other_instance.save(&external).unwrap();
-
-        cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, cx| {
-                assert!(view.dirty);
-                view.switch_project(1, window, cx);
-                assert_eq!(view.active_project, 0);
-                assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
-                assert_eq!(view.url.read(cx).value().as_ref(), draft_url);
-                assert!(view.dirty);
-                assert!(view.status_is_error);
-                assert!(view.status.contains("modified on disk"));
-            });
-        })
-        .unwrap();
-        let disk = other_instance.load(&project_id).unwrap();
-        assert_eq!(disk.find_request(&request_id).unwrap().url, external_url);
-    }
-}
-
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
@@ -2566,7 +2412,7 @@ impl Render for WorkspaceView {
                     .outline()
                     .icon(svg_icon("icons/import.svg").small())
                     .label("Import")
-                    .tooltip("Import Postman v2.1 JSON or cURL")
+                    .tooltip("Import Collection v2.1 JSON or cURL")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_import_dialog(window, cx);
                     })),
@@ -2723,5 +2569,180 @@ impl Render for WorkspaceView {
                 ),
             )
             .child(status_bar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceView;
+    use fastman_core::model::{ApiRequest, Folder};
+    use fastman_core::storage::ProjectStore;
+    use gpui::{AppContext, TestAppContext};
+
+    #[test]
+    fn fresh_workspace_has_no_sample_requests() {
+        run_view_test(|| {
+            let cx = TestAppContext::single();
+            let root = tempfile::tempdir().unwrap();
+            let store = ProjectStore::at(root.path());
+            cx.update(gpui_kit::init);
+            cx.update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let view = WorkspaceView::with_store(store, window, cx).unwrap();
+                        assert!(view.current().collections[0].folders.is_empty());
+                        assert!(view.current().first_request_id().is_none());
+                        assert!(view.selected_id.is_none());
+                        assert!(view.url.read(cx).value().is_empty());
+                        view
+                    })
+                })
+                .unwrap();
+            });
+        });
+    }
+
+    fn seed_request(store: &ProjectStore) {
+        let mut project = store.create("Test project").unwrap();
+        let mut folder = Folder::new("Test folder");
+        folder
+            .requests
+            .push(ApiRequest::new("GET", "Test request", ""));
+        project.collections[0].folders.push(folder);
+        store.save(&project).unwrap();
+    }
+
+    #[test]
+    fn project_switch_saves_draft_but_keeps_it_open_on_conflict() {
+        run_view_test(check_project_switch);
+    }
+
+    #[test]
+    fn failed_tree_move_stays_dirty_and_blocks_project_switch() {
+        run_view_test(check_failed_tree_move);
+    }
+
+    fn run_view_test(test: fn()) {
+        // Building the full view in debug mode exceeds the default test stack on Windows.
+        let result = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn check_failed_tree_move() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let project_id = view.current().id.clone();
+                let request_id = view.selected_id.clone().unwrap();
+                let original_folder = view.current().request_parent_folder(&request_id).unwrap();
+                let collection_id = view.current().collections[0].id.clone();
+                view.projects.push(store.create("Second project").unwrap());
+                assert!(!view.dirty);
+
+                let other_instance = ProjectStore::at(root.path());
+                let mut external = other_instance.load(&project_id).unwrap();
+                external.name = "Externally renamed".into();
+                other_instance.save(&external).unwrap();
+
+                view.move_request_to_collection(&request_id, &collection_id, window, cx);
+                assert!(view.current().request_parent_folder(&request_id).is_none());
+                assert!(view.status.contains("modified on disk"));
+                assert!(view.dirty, "The in-memory move still needs to be saved");
+
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 0);
+                assert!(view.dirty);
+                let disk = other_instance.load(&project_id).unwrap();
+                assert_eq!(disk.name, "Externally renamed");
+                assert_eq!(
+                    disk.request_parent_folder(&request_id),
+                    Some(original_folder)
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    fn check_project_switch() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        let other_instance = ProjectStore::at(root.path());
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+        let saved_url = "https://example.com/saved";
+        let draft_url = "https://example.com/draft";
+        let external_url = "https://example.com/external";
+
+        let (project_id, request_id) = cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let ids = (view.current().id.clone(), view.selected_id.clone().unwrap());
+                    view.projects.push(store.create("Second project").unwrap());
+                    view.url
+                        .update(cx, |input, cx| input.replace_all(saved_url, window, cx));
+                    ids
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 1);
+                assert!(!view.dirty);
+                view.switch_project(0, window, cx);
+                view.url
+                    .update(cx, |input, cx| input.replace_all(draft_url, window, cx));
+            });
+        })
+        .unwrap();
+
+        let mut external = other_instance.load(&project_id).unwrap();
+        assert_eq!(external.find_request(&request_id).unwrap().url, saved_url);
+        external.find_request_mut(&request_id).unwrap().url = external_url.into();
+        other_instance.save(&external).unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 0);
+                assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
+                assert_eq!(view.url.read(cx).value().as_ref(), draft_url);
+                assert!(view.dirty);
+                assert!(view.status_is_error);
+                assert!(view.status.contains("modified on disk"));
+            });
+        })
+        .unwrap();
+        let disk = other_instance.load(&project_id).unwrap();
+        assert_eq!(disk.find_request(&request_id).unwrap().url, external_url);
     }
 }

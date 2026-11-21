@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 use fastman_core::{
     HttpEngine, ProjectStore,
-    import::{postman_v21, read_postman_file},
+    import::{collection_v21, read_collection_file},
     security::{sanitize_terminal_body, sanitize_terminal_line, summarize_sensitive_findings},
 };
 use std::path::Path;
 
 fn usage() {
     eprintln!(
-        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-postman [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] <project-id> <request-id>\n  fastman-cli --version\n  fastman-cli --help\n\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
+        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] <project-id> <request-id>\n  fastman-cli --version\n  fastman-cli --help\n\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
                 println!("{}\t{}", project.id, sanitize_terminal_line(&project.name));
             }
         }
-        "import-postman" => {
+        "import-collection" => {
             let mut strip_secrets = false;
             let mut allow_plaintext = false;
             let mut path: Option<String> = None;
@@ -47,17 +47,17 @@ async fn main() -> Result<()> {
                 match arg.as_str() {
                     "--strip-secrets" => strip_secrets = true,
                     "--allow-plaintext-secrets" => allow_plaintext = true,
-                    s if s.starts_with('-') => bail!("Unknown option for import-postman: {s}"),
+                    s if s.starts_with('-') => bail!("Unknown option for import-collection: {s}"),
                     _ if path.is_none() => path = Some(arg),
-                    extra => bail!("Unexpected argument for import-postman: {extra}"),
+                    extra => bail!("Unexpected argument for import-collection: {extra}"),
                 }
             }
             if strip_secrets && allow_plaintext {
                 bail!("--strip-secrets and --allow-plaintext-secrets cannot be combined");
             }
-            let path = path.context("Missing Postman JSON filename")?;
-            let json = read_postman_file(Path::new(&path))?;
-            let mut report = postman_v21(&json)?;
+            let path = path.context("Missing collection JSON filename")?;
+            let json = read_collection_file(Path::new(&path))?;
+            let mut report = collection_v21(&json)?;
             if !report.sensitive_fields.is_empty() {
                 let summary_text =
                     sanitize_terminal_line(&summarize_sensitive_findings(&report.sensitive_fields));

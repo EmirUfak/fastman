@@ -1,6 +1,6 @@
 use fastman_core::{
     HttpEngine, ProjectStore,
-    import::postman_v21,
+    import::collection_v21,
     model::{ApiRequest, Auth, Folder, HttpBody, KeyValue, Project},
 };
 use std::collections::BTreeMap;
@@ -66,19 +66,19 @@ fn projects_persist_requests_and_reject_invalid_data() {
 
 #[test]
 fn import_reports_unsupported_features_and_preserves_body() {
-    let input = r#"{"info":{"name":"Example","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+    let input = r#"{"info":{"name":"Example","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},
       "auth":{},"event":[],"item":[{"name":"Folder","item":[{"name":"Create","event":[],"request":{
       "method":"POST","url":{"raw":"https://example.com"},"auth":{},
       "header":[{"key":"X-Test","value":"yes","disabled":true}],
       "body":{"mode":"raw","raw":"{}","options":{"raw":{"language":"json"}}}}}]}]}"#;
-    let report = postman_v21(input).unwrap();
+    let report = collection_v21(input).unwrap();
     assert_eq!(report.requests_imported, 1);
     let request = &report.project.collections[0].folders[0].requests[0];
     assert_eq!(request.body, HttpBody::Json("{}".into()));
     assert!(!request.headers[0].enabled);
     assert_eq!(report.warnings.len(), 4);
-    assert!(postman_v21(r#"{"info":{"schema":"v2.0"}}"#).is_err());
-    assert!(postman_v21("not json").is_err());
+    assert!(collection_v21(r#"{"info":{"schema":"v2.0"}}"#).is_err());
+    assert!(collection_v21("not json").is_err());
 }
 
 async fn exchange(

@@ -1,4 +1,4 @@
-//! Best-effort, deliberately limited Postman collection v2.1 importer.
+//! Best-effort, deliberately limited Collection v2.1 JSON importer.
 //! Scripts, auth inheritance, file uploads and complex protocol requests are
 //! not executed and are reported as unsupported rather than silently emulated.
 
@@ -55,8 +55,8 @@ impl ImportReport {
     }
 }
 
-/// Read a Postman collection file with a strict upper size bound before allocation.
-pub fn read_postman_file(path: &Path) -> Result<String> {
+/// Read a Collection v2.1 JSON file with a strict upper size bound before allocation.
+pub fn read_collection_file(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("Open {}", path.display()))?;
     if let Ok(meta) = file.metadata()
         && meta.len() > MAX_IMPORT_BYTES as u64
@@ -88,23 +88,23 @@ impl ImportCounters {
     fn bump_item(&mut self) -> Result<()> {
         self.items += 1;
         if self.items > MAX_IMPORTED_ITEMS {
-            bail!("Postman collection exceeds maximum item limit ({MAX_IMPORTED_ITEMS})");
+            bail!("Collection exceeds maximum item limit ({MAX_IMPORTED_ITEMS})");
         }
         Ok(())
     }
 }
 
-pub fn postman_v21(input: &str) -> Result<ImportReport> {
+pub fn collection_v21(input: &str) -> Result<ImportReport> {
     if input.len() > MAX_IMPORT_BYTES {
-        bail!("Postman collection exceeds maximum size ({MAX_IMPORT_BYTES} bytes)");
+        bail!("Collection exceeds maximum size ({MAX_IMPORT_BYTES} bytes)");
     }
-    let root: Value = serde_json::from_str(input).context("Parse Postman collection")?;
+    let root: Value = serde_json::from_str(input).context("Parse collection JSON")?;
     let version = root
         .pointer("/info/schema")
         .and_then(Value::as_str)
         .unwrap_or("");
     if !version.contains("collection/v2.1") {
-        bail!("Expected a Postman Collection v2.1 export");
+        bail!("Expected a Collection v2.1 JSON export");
     }
     let name = root
         .pointer("/info/name")
@@ -161,7 +161,7 @@ fn folder(
     counters: &mut ImportCounters,
 ) -> Result<Folder> {
     if depth > MAX_FOLDER_DEPTH {
-        bail!("Postman collection exceeds maximum folder nesting depth ({MAX_FOLDER_DEPTH})");
+        bail!("Collection exceeds maximum folder nesting depth ({MAX_FOLDER_DEPTH})");
     }
     let name = item
         .get("name")
@@ -295,15 +295,15 @@ mod tests {
     use crate::model::Auth;
 
     #[test]
-    fn import_nested_postman_collection() {
+    fn import_nested_collection() {
         let sample = r#"{
-            "info":{"name":"Sample","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "info":{"name":"Sample","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},
             "item":[{"name":"Users","item":[{"name":"List","request":{
               "method":"GET","url":{"raw":"https://example.com/users"},
               "header":[{"key":"Accept","value":"application/json"}]
             }}]}]
         }"#;
-        let result = postman_v21(sample).unwrap();
+        let result = collection_v21(sample).unwrap();
         assert_eq!(result.requests_imported, 1);
         assert!(result.sensitive_fields.is_empty());
         assert_eq!(
@@ -315,16 +315,16 @@ mod tests {
     #[test]
     fn rejects_invalid_methods_schemes_and_deep_nesting() {
         let bad_method = r#"{
-            "info":{"name":"Bad","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "info":{"name":"Bad","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},
             "item":[{"name":"Evil","request":{"method":"GET; rm -rf /","url":"https://example.com"}}]
         }"#;
-        assert!(postman_v21(bad_method).is_err());
+        assert!(collection_v21(bad_method).is_err());
 
         let bad_url = r#"{
-            "info":{"name":"Bad","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "info":{"name":"Bad","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},
             "item":[{"name":"File","request":{"method":"GET","url":"file:///etc/passwd"}}]
         }"#;
-        assert!(postman_v21(bad_url).is_err());
+        assert!(collection_v21(bad_url).is_err());
 
         let mut deep =
             r#"{"name":"Leaf","request":{"method":"GET","url":"https://example.com"}}"#.to_string();
@@ -332,15 +332,15 @@ mod tests {
             deep = format!(r#"{{"name":"F","item":[{deep}]}}"#);
         }
         let deep_json = format!(
-            r#"{{"info":{{"name":"Deep","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},"item":[{deep}]}}"#
+            r#"{{"info":{{"name":"Deep","schema":"https://example.com/schema/collection/v2.1.0/collection.json"}},"item":[{deep}]}}"#
         );
-        assert!(postman_v21(&deep_json).is_err());
+        assert!(collection_v21(&deep_json).is_err());
     }
 
     #[test]
     fn detects_and_sanitizes_sensitive_headers_including_non_bearer_auth() {
         let sample = r#"{
-            "info":{"name":"  ","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "info":{"name":"  ","schema":"https://example.com/schema/collection/v2.1.0/collection.json"},
             "item":[
                 {"name":"BearerReq","request":{
                     "method":"GET",
@@ -354,7 +354,7 @@ mod tests {
                 }}
             ]
         }"#;
-        let mut report = postman_v21(sample).unwrap();
+        let mut report = collection_v21(sample).unwrap();
         assert_eq!(report.project.name, "Imported API");
         assert_eq!(report.sensitive_fields.len(), 4);
 

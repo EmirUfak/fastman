@@ -1,6 +1,6 @@
 [package]
 name = "fastman-core"
-description = "Core domain model, local storage, Postman v2.1 importer, and HTTP engine for Fastman"
+description = "Core domain model, local storage, Collection v2.1 importer, and HTTP engine for Fastman"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
