@@ -1,6 +1,7 @@
 //! Fastman domain, portable local storage, and asynchronous HTTP execution.
 //! The core crate has no dependency on GPUI and can be tested headlessly.
 
+pub mod curl;
 pub mod http;
 pub mod import;
 pub mod model;

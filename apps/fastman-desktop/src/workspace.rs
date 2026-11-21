@@ -1,39 +1,50 @@
+use crate::kv_editor::{KvTable, render_kv_table};
+use crate::response_view::ResponseCacheEntry;
+use crate::theme::{brand_accent, count_pill, svg_icon};
+use crate::{
+    CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenImport, OpenVariables, SaveRequest,
+    SendRequest, ToggleTheme,
+};
 use anyhow::{Context as _, Result};
 use fastman_core::{
-    ApiRequest, Auth, Collection, Folder, HttpBody, HttpEngine, HttpResponse, KeyValue, Project,
-    ProjectStore, Workspace,
+    ApiRequest, Auth, Collection, Folder, HttpBody, HttpEngine, Project, ProjectStore, Workspace,
+    curl, import,
 };
-use gpui_kit::base::{Disableable as _, Selectable as _};
-use gpui_kit::component::IndexPath;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    input::{Input, InputState, Textarea, TextareaState},
+    ActiveTheme as _, IndexPath, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    alert::Alert,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    dialog::DialogButtonProps,
+    input::{EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, SelectEvent, SelectItem, SelectState},
+    tab::{Tab, TabBar},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{runtime::Runtime, task::AbortHandle};
 
-const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-const SECTIONS: &[&str] = &["Params", "Auth", "Headers", "Body", "Scripts", "Settings"];
-const AUTH_TYPES: &[&str] = &[
+pub(super) const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+pub(super) const AUTH_TYPES: &[&str] = &[
     "No Auth",
     "Basic Auth",
     "Bearer Token",
     "API Key (Header)",
     "API Key (Query)",
 ];
-const BODY_TYPES: &[&str] = &["None", "JSON", "Text", "Form URL Encoded"];
+pub(super) const BODY_TYPES: &[&str] = &["None", "JSON", "Text", "Form URL Encoded"];
 
-// Project selection uses stable UUIDs; two projects may share the same name.
 #[derive(Clone)]
-struct ProjectChoice {
-    id: String,
-    name: SharedString,
+pub(super) struct ProjectChoice {
+    pub id: String,
+    pub name: SharedString,
 }
 
 impl SelectItem for ProjectChoice {
@@ -58,48 +69,209 @@ fn project_choices(projects: &[Project]) -> SearchableVec<ProjectChoice> {
     )
 }
 
+#[derive(Clone)]
+pub(super) enum NameDialogKind {
+    NewWorkspace,
+    NewProject,
+    RenameFolder(String),
+}
+
+pub struct VariablesSheetView {
+    table: KvTable,
+}
+
+impl VariablesSheetView {
+    fn new(
+        variables: &BTreeMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut table = KvTable::new("variable_name", "value", true);
+        table.load_map(variables, window, cx, Self::on_table_change());
+        Self { table }
+    }
+
+    fn on_table_change() -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
+        |view, window, cx| {
+            view.table
+                .ensure_trailing_blank(window, cx, Self::on_table_change());
+            cx.notify();
+        }
+    }
+
+    fn variables_map(&self, cx: &App) -> BTreeMap<String, String> {
+        self.table.to_map(cx)
+    }
+}
+
+impl Render for VariablesSheetView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Use {{variable_name}} inside URLs, query params, headers, auth, or body payloads."),
+            )
+            .child(
+                div()
+                    .id("variables-sheet-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(render_kv_table(
+                        "project-vars",
+                        &self.table,
+                        cx,
+                        |view, idx, cx| {
+                            view.table.toggle_row(idx);
+                            cx.notify();
+                        },
+                        |view, idx, window, cx| {
+                            view.table
+                                .remove_row(idx, window, cx, Self::on_table_change());
+                            cx.notify();
+                        },
+                        |view, window, cx| {
+                            view.table.add_row(window, cx, Self::on_table_change());
+                            cx.notify();
+                        },
+                    )),
+            )
+    }
+}
+
+pub struct ImportDialogView {
+    pub mode: usize,
+    pub input: Entity<TextareaState>,
+    pub error: Option<String>,
+}
+
+impl ImportDialogView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(10)
+                .placeholder("Paste Postman Collection v2.1 JSON...")
+        });
+        Self {
+            mode: 0,
+            input,
+            error: None,
+        }
+    }
+}
+
+impl Render for ImportDialogView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let placeholder = if self.mode == 0 {
+            "Paste Postman Collection v2.1 JSON..."
+        } else {
+            "Paste a cURL command (e.g. curl -X POST https://api.example.com -H 'Content-Type: application/json' -d '{\"ok\":true}')..."
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                TabBar::new("import-mode")
+                    .segmented()
+                    .small()
+                    .selected_index(self.mode)
+                    .on_click(cx.listener(|view, idx, window, cx| {
+                        view.mode = *idx;
+                        view.error = None;
+                        view.input.update(cx, |state, cx| {
+                            state.set_placeholder(
+                                if *idx == 0 {
+                                    "Paste Postman Collection v2.1 JSON..."
+                                } else {
+                                    "Paste a cURL command..."
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    }))
+                    .child(Tab::new().label("Postman v2.1 JSON"))
+                    .child(Tab::new().label("cURL Command")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.mode == 0 {
+                        "Creates a new local project from the collection. Scripts and auth stay inert."
+                    } else {
+                        "Imports method, URL, query params, headers, auth, and body as a new request."
+                    }),
+            )
+            .child(
+                Textarea::new(&self.input)
+                    .h(px(210.))
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(12.))
+                    .aria_label(placeholder),
+            )
+            .when_some(self.error.as_ref(), |el, err| {
+                el.child(Alert::error("import-error", err.clone()).title("Import failed"))
+            })
+    }
+}
+
 /// Retained window state: project model + editor entities + request lifecycle.
-/// Only one project is active. Other projects remain persisted on disk.
 pub struct WorkspaceView {
-    workspace_store: ProjectStore,
-    workspaces: Vec<Workspace>,
-    active_workspace: usize,
-    store: ProjectStore,
-    projects: Vec<Project>,
-    active_project: usize,
-    project_selector: Entity<SelectState<SearchableVec<ProjectChoice>>>,
-    workspace_name: Entity<InputState>,
-    project_name: Entity<InputState>,
-    creating_workspace: bool,
-    creating_project: bool,
-    editing_request_name: bool,
-    selected_id: Option<String>,
-    open_tabs: Vec<String>,
-    expanded: HashSet<String>,
-    target_folder: Option<String>,
-    method: String,
-    body_kind: usize,
-    auth_kind: usize,
-    section: usize,
-    url: Entity<InputState>,
-    request_name: Entity<InputState>,
-    params: Entity<TextareaState>,
-    headers: Entity<TextareaState>,
-    body: Entity<TextareaState>,
-    timeout: Entity<InputState>,
-    auth_user: Entity<InputState>,
-    auth_password: Entity<InputState>,
-    auth_token: Entity<InputState>,
-    api_key_name: Entity<InputState>,
-    api_key_value: Entity<InputState>,
-    runtime: Arc<Runtime>,
-    engine: HttpEngine,
-    run_generation: u64,
-    pending_abort: Option<AbortHandle>,
-    pending: Option<Task<()>>,
-    response: Option<HttpResponse>,
-    response_error: Option<String>,
-    status: String,
+    pub(super) focus_handle: FocusHandle,
+    pub(super) workspace_store: ProjectStore,
+    pub(super) workspaces: Vec<Workspace>,
+    pub(super) active_workspace: usize,
+    pub(super) store: ProjectStore,
+    pub(super) projects: Vec<Project>,
+    pub(super) active_project: usize,
+    pub(super) project_selector: Entity<SelectState<SearchableVec<ProjectChoice>>>,
+    pub(super) explorer_search: Entity<InputState>,
+    pub(super) editing_request_name: bool,
+    pub(super) selected_id: Option<String>,
+    pub(super) open_tabs: Vec<String>,
+    pub(super) expanded: HashSet<String>,
+    pub(super) target_folder: Option<String>,
+    pub(super) dirty: bool,
+    suppress_dirty: bool,
+    pub(super) method: String,
+    pub(super) body_kind: usize,
+    pub(super) auth_kind: usize,
+    pub(super) section: usize,
+    pub(super) url: Entity<InputState>,
+    pub(super) request_name: Entity<InputState>,
+    pub(super) params_table: KvTable,
+    pub(super) headers_table: KvTable,
+    pub(super) form_table: KvTable,
+    pub(super) body_editor: Entity<EditorState>,
+    pub(super) timeout: Entity<InputState>,
+    pub(super) auth_user: Entity<InputState>,
+    pub(super) auth_password: Entity<InputState>,
+    pub(super) auth_token: Entity<InputState>,
+    pub(super) api_key_name: Entity<InputState>,
+    pub(super) api_key_value: Entity<InputState>,
+    pub(super) runtime: Arc<Runtime>,
+    pub(super) engine: HttpEngine,
+    pub(super) run_generation: u64,
+    pub(super) in_flight_request_id: Option<String>,
+    pub(super) pending_abort: Option<AbortHandle>,
+    pub(super) pending: Option<Task<()>>,
+    pub(super) responses: HashMap<String, ResponseCacheEntry>,
+    pub(super) response_tab: usize,
+    pub(super) response_raw: bool,
+    pub(super) response_wrap: bool,
+    pub(super) response_find_open: bool,
+    pub(super) response_search: Entity<InputState>,
+    pub(super) status: String,
+    pub(super) status_is_error: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -130,7 +302,38 @@ impl WorkspaceView {
                 cx,
             )
         });
-        let subscription = cx.subscribe_in(
+        let explorer_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter requests..."));
+        let response_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in response..."));
+        let url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://api.example.com/v1/resource")
+        });
+        let request_name = cx.new(|cx| InputState::new(window, cx).placeholder("Request name"));
+        let body_editor = cx.new(|cx| {
+            EditorState::new(window, cx).placeholder("Enter JSON or raw request payload...")
+        });
+        let timeout = cx.new(|cx| InputState::new(window, cx).placeholder("30000"));
+        let auth_user = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
+        let auth_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+        let auth_token = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Bearer token")
+                .masked(true)
+        });
+        let api_key_name = cx.new(|cx| InputState::new(window, cx).placeholder("X-API-Key"));
+        let api_key_value = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("API key value")
+                .masked(true)
+        });
+
+        let mut subscriptions = Vec::new();
+        subscriptions.push(cx.subscribe_in(
             &project_selector,
             window,
             |view, state, event, window, cx| {
@@ -141,14 +344,74 @@ impl WorkspaceView {
                     view.switch_project(index, window, cx);
                 }
             },
+        ));
+        subscriptions.push(
+            cx.subscribe_in(&explorer_search, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
         );
+        subscriptions.push(
+            cx.subscribe_in(&response_search, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        );
+        subscriptions.push(cx.subscribe_in(
+            &url,
+            window,
+            |view, _, event, window, cx| match event {
+                InputEvent::PressEnter { .. } => view.send(Some(window), cx),
+                InputEvent::Change if !view.suppress_dirty => view.mark_dirty(cx),
+                _ => {}
+            },
+        ));
+        subscriptions.push(
+            cx.subscribe_in(
+                &request_name,
+                window,
+                |view, _, event, window, cx| match event {
+                    InputEvent::PressEnter { .. } if view.editing_request_name => {
+                        view.toggle_rename_request(window, cx);
+                    }
+                    InputEvent::Change if !view.suppress_dirty => view.mark_dirty(cx),
+                    _ => {}
+                },
+            ),
+        );
+        subscriptions.push(
+            cx.subscribe_in(&body_editor, window, |view, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) && !view.suppress_dirty {
+                    view.mark_dirty(cx);
+                }
+            }),
+        );
+        for field in [
+            &timeout,
+            &auth_user,
+            &auth_password,
+            &auth_token,
+            &api_key_name,
+            &api_key_value,
+        ] {
+            subscriptions.push(cx.subscribe_in(field, window, |view, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) && !view.suppress_dirty {
+                    view.mark_dirty(cx);
+                }
+            }));
+        }
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .context("Build networking runtime")?;
         let engine = HttpEngine::new().context("Build HTTP client")?;
+
         let mut view = Self {
+            focus_handle: cx.focus_handle(),
             workspace_store: store.clone(),
             workspaces,
             active_workspace: 0,
@@ -156,78 +419,188 @@ impl WorkspaceView {
             projects,
             active_project: 0,
             project_selector,
-            workspace_name: cx.new(|cx| InputState::new(window, cx).placeholder("Workspace name")),
-            project_name: cx.new(|cx| InputState::new(window, cx).placeholder("Project name")),
-            creating_workspace: false,
-            creating_project: false,
+            explorer_search,
             editing_request_name: false,
             selected_id: first.clone(),
             open_tabs: first.into_iter().collect(),
             expanded: HashSet::new(),
             target_folder: None,
+            dirty: false,
+            suppress_dirty: false,
             method: "GET".into(),
             body_kind: 0,
             auth_kind: 0,
             section: 0,
-            url: cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com")),
-            request_name: cx.new(|cx| InputState::new(window, cx).placeholder("Request name")),
-            params: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .rows(6)
-                    .placeholder("key=value (one per line)")
-            }),
-            headers: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .rows(6)
-                    .placeholder("Header: value (one per line)")
-            }),
-            body: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .rows(8)
-                    .placeholder("Request body")
-            }),
-            timeout: cx.new(|cx| InputState::new(window, cx).placeholder("30000")),
-            auth_user: cx.new(|cx| InputState::new(window, cx).placeholder("Username")),
-            auth_password: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Password")
-                    .masked(true)
-            }),
-            auth_token: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Bearer token")
-                    .masked(true)
-            }),
-            api_key_name: cx.new(|cx| InputState::new(window, cx).placeholder("Key name")),
-            api_key_value: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("API key")
-                    .masked(true)
-            }),
+            url,
+            request_name,
+            params_table: KvTable::new("param", "value", true),
+            headers_table: KvTable::new("Header-Name", "value", true),
+            form_table: KvTable::new("field", "value", true),
+            body_editor,
+            timeout,
+            auth_user,
+            auth_password,
+            auth_token,
+            api_key_name,
+            api_key_value,
             runtime: Arc::new(runtime),
             engine,
             run_generation: 0,
+            in_flight_request_id: None,
             pending_abort: None,
             pending: None,
-            response: None,
-            response_error: None,
+            responses: HashMap::new(),
+            response_tab: 0,
+            response_raw: false,
+            response_wrap: true,
+            response_find_open: false,
+            response_search,
             status: "Ready · local-first".into(),
-            _subscriptions: vec![subscription],
+            status_is_error: false,
+            _subscriptions: subscriptions,
         };
         view.expand_all();
         view.load_editor(window, cx);
+        view.focus_handle.focus(window, cx);
 
         Ok(view)
     }
 
-    fn current(&self) -> &Project {
+    pub(super) fn current(&self) -> &Project {
         &self.projects[self.active_project]
     }
 
-    fn current_request(&self) -> Option<&ApiRequest> {
+    pub(super) fn current_request(&self) -> Option<&ApiRequest> {
         self.selected_id
             .as_deref()
             .and_then(|id| self.current().find_request(id))
+    }
+
+    pub(super) fn active_response_entry(&self) -> Option<&ResponseCacheEntry> {
+        self.selected_id
+            .as_deref()
+            .and_then(|id| self.responses.get(id))
+    }
+
+    pub(super) fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty {
+            self.dirty = true;
+        }
+        cx.notify();
+    }
+
+    fn kv_change_handler(
+        table_kind: usize,
+    ) -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
+        move |view, window, cx| {
+            if view.suppress_dirty {
+                return;
+            }
+            match table_kind {
+                0 => {
+                    view.params_table
+                        .ensure_trailing_blank(window, cx, Self::kv_change_handler(0))
+                }
+                1 => {
+                    view.headers_table
+                        .ensure_trailing_blank(window, cx, Self::kv_change_handler(1))
+                }
+                _ => view
+                    .form_table
+                    .ensure_trailing_blank(window, cx, Self::kv_change_handler(2)),
+            }
+            view.mark_dirty(cx);
+        }
+    }
+
+    pub(super) fn add_kv_row(
+        &mut self,
+        table_kind: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match table_kind {
+            0 => self
+                .params_table
+                .add_row(window, cx, Self::kv_change_handler(0)),
+            1 => self
+                .headers_table
+                .add_row(window, cx, Self::kv_change_handler(1)),
+            _ => self
+                .form_table
+                .add_row(window, cx, Self::kv_change_handler(2)),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn remove_kv_row(
+        &mut self,
+        table_kind: usize,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match table_kind {
+            0 => self
+                .params_table
+                .remove_row(idx, window, cx, Self::kv_change_handler(0)),
+            1 => self
+                .headers_table
+                .remove_row(idx, window, cx, Self::kv_change_handler(1)),
+            _ => self
+                .form_table
+                .remove_row(idx, window, cx, Self::kv_change_handler(2)),
+        }
+        self.mark_dirty(cx);
+    }
+
+    pub(super) fn append_header_preset(
+        &mut self,
+        key: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.headers_table
+            .append_pair(key, value, window, cx, Self::kv_change_handler(1));
+        self.mark_dirty(cx);
+    }
+
+    pub(super) fn extract_url_query_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw_url = self.url.read(cx).value().to_string();
+        let Some((base, query)) = raw_url.split_once('?') else {
+            return;
+        };
+        let query = query.split('#').next().unwrap_or(query);
+        for part in query.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            self.params_table
+                .append_pair(k, v, window, cx, Self::kv_change_handler(0));
+        }
+        self.suppress_dirty = true;
+        Self::set_input(&self.url, base, window, cx);
+        self.suppress_dirty = false;
+        self.mark_dirty(cx);
+    }
+
+    pub(super) fn format_body_json(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.body_editor.read(cx).value().to_string();
+        if raw.trim().is_empty() {
+            return;
+        }
+        match serde_json::from_str::<serde_json::Value>(&raw)
+            .and_then(|val| serde_json::to_string_pretty(&val))
+        {
+            Ok(formatted) => {
+                self.body_editor
+                    .update(cx, |state, cx| state.set_value(formatted, window, cx));
+                self.mark_dirty(cx);
+            }
+            Err(err) => {
+                self.set_status(format!("JSON syntax error: {err}"), true, cx);
+                window.push_notification(Notification::error(format!("Invalid JSON: {err}")), cx);
+            }
+        }
     }
 
     fn expand_all(&mut self) {
@@ -255,8 +628,8 @@ impl WorkspaceView {
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
-    fn set_textarea(
-        state: &Entity<TextareaState>,
+    fn set_editor(
+        state: &Entity<EditorState>,
         value: impl Into<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -265,23 +638,50 @@ impl WorkspaceView {
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
+    fn set_status(&mut self, message: impl Into<String>, is_error: bool, cx: &mut Context<Self>) {
+        self.status = message.into();
+        self.status_is_error = is_error;
+        cx.notify();
+    }
+
     fn load_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_request_name = false;
+        self.suppress_dirty = true;
         let request = self.current_request().cloned();
         if let Some(request) = request {
             self.method = request.method;
             Self::set_input(&self.request_name, request.name, window, cx);
             Self::set_input(&self.url, request.url, window, cx);
-            Self::set_textarea(&self.params, format_kvs(&request.params, '='), window, cx);
-            Self::set_textarea(&self.headers, format_kvs(&request.headers, ':'), window, cx);
-            let (body_kind, body) = match request.body {
-                HttpBody::None => (0, String::new()),
-                HttpBody::Json(text) => (1, text),
-                HttpBody::Text(text) => (2, text),
-                HttpBody::FormUrlEncoded(pairs) => (3, format_kvs(&pairs, '=')),
+            self.params_table
+                .load(&request.params, window, cx, Self::kv_change_handler(0));
+            self.headers_table
+                .load(&request.headers, window, cx, Self::kv_change_handler(1));
+            match request.body {
+                HttpBody::None => {
+                    self.body_kind = 0;
+                    Self::set_editor(&self.body_editor, "", window, cx);
+                    self.form_table
+                        .load(&[], window, cx, Self::kv_change_handler(2));
+                }
+                HttpBody::Json(text) => {
+                    self.body_kind = 1;
+                    Self::set_editor(&self.body_editor, text, window, cx);
+                    self.form_table
+                        .load(&[], window, cx, Self::kv_change_handler(2));
+                }
+                HttpBody::Text(text) => {
+                    self.body_kind = 2;
+                    Self::set_editor(&self.body_editor, text, window, cx);
+                    self.form_table
+                        .load(&[], window, cx, Self::kv_change_handler(2));
+                }
+                HttpBody::FormUrlEncoded(pairs) => {
+                    self.body_kind = 3;
+                    Self::set_editor(&self.body_editor, "", window, cx);
+                    self.form_table
+                        .load(&pairs, window, cx, Self::kv_change_handler(2));
+                }
             };
-            self.body_kind = body_kind;
-            Self::set_textarea(&self.body, body, window, cx);
             Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
             self.auth_kind = match &request.auth {
                 Auth::None => 0,
@@ -290,7 +690,6 @@ impl WorkspaceView {
                 Auth::ApiKeyHeader { .. } => 3,
                 Auth::ApiKeyQuery { .. } => 4,
             };
-            // Clear all credential inputs first, avoiding carryover between requests.
             for field in [
                 &self.auth_user,
                 &self.auth_password,
@@ -327,26 +726,30 @@ impl WorkspaceView {
             ] {
                 Self::set_input(field, "", window, cx);
             }
-            for field in [&self.params, &self.headers, &self.body] {
-                Self::set_textarea(field, "", window, cx);
-            }
+            Self::set_editor(&self.body_editor, "", window, cx);
+            self.params_table
+                .load(&[], window, cx, Self::kv_change_handler(0));
+            self.headers_table
+                .load(&[], window, cx, Self::kv_change_handler(1));
+            self.form_table
+                .load(&[], window, cx, Self::kv_change_handler(2));
             Self::set_input(&self.timeout, "30000", window, cx);
         }
-        self.response = None;
-        self.response_error = None;
+        self.suppress_dirty = false;
+        self.dirty = false;
         cx.notify();
     }
 
-    /// Synchronize active editor state back to the in-memory request.
     fn apply_editor(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let Some(id) = self.selected_id.as_deref() else {
             return Ok(());
         };
         let url = self.url.read(cx).value().to_string();
-        let name = self.request_name.read(cx).value().to_string();
-        let params = parse_kvs(&self.params.read(cx).value(), '=');
-        let headers = parse_kvs(&self.headers.read(cx).value(), ':');
-        let body_text = self.body.read(cx).value().to_string();
+        let name = self.request_name.read(cx).value().trim().to_string();
+        let params = self.params_table.to_key_values(cx);
+        let headers = self.headers_table.to_key_values(cx);
+        let body_text = self.body_editor.read(cx).value().to_string();
+        let form_rows = self.form_table.to_key_values(cx);
         let timeout = self
             .timeout
             .read(cx)
@@ -357,7 +760,7 @@ impl WorkspaceView {
         let body = match self.body_kind {
             1 => HttpBody::Json(body_text),
             2 => HttpBody::Text(body_text),
-            3 => HttpBody::FormUrlEncoded(parse_kvs(&body_text, '=')),
+            3 => HttpBody::FormUrlEncoded(form_rows),
             _ => HttpBody::None,
         };
         let auth = match self.auth_kind {
@@ -380,7 +783,9 @@ impl WorkspaceView {
         };
         let method = self.method.clone();
         if let Some(request) = self.projects[self.active_project].find_request_mut(id) {
-            request.name = name;
+            if !name.is_empty() {
+                request.name = name;
+            }
             request.method = method;
             request.url = url;
             request.params = params;
@@ -392,28 +797,55 @@ impl WorkspaceView {
         Ok(())
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let result = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()));
-        self.status = match result {
-            Ok(()) => "Saved locally".into(),
-            Err(e) => format!("Save failed: {e:#}"),
-        };
+    fn save(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        self.apply_editor(cx)?;
+        self.store.save(self.current())?;
+        self.dirty = false;
+        self.set_status("Saved locally", false, cx);
+        Ok(())
+    }
+
+    pub(super) fn save_with_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.save(cx) {
+            Ok(()) => {
+                window.push_notification(Notification::success("Request saved locally"), cx);
+            }
+            Err(error) => {
+                let msg = format!("Save failed: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
+        }
+    }
+
+    pub(super) fn toggle_rename_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing_request_name {
+            match self.save(cx) {
+                Ok(()) => self.editing_request_name = false,
+                Err(error) => {
+                    let msg = format!("Cannot rename: {error:#}");
+                    self.set_status(msg.clone(), true, cx);
+                    window.push_notification(Notification::error(msg), cx);
+                }
+            }
+        } else {
+            self.editing_request_name = true;
+            self.request_name
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
         cx.notify();
     }
 
-    fn open_request(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_request(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_id.as_ref() == Some(&id) {
             return;
         }
-        // Fail safe: do not silently discard edits when switching tabs.
-        if let Err(error) = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()))
-        {
-            self.status = format!("Cannot switch: {error:#}");
-            cx.notify();
+        if let Err(error) = self.save(cx) {
+            let msg = format!("Cannot switch tab: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
             return;
         }
         self.cancel(cx);
@@ -424,14 +856,12 @@ impl WorkspaceView {
         self.load_editor(window, cx);
     }
 
-    fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_id.as_deref() == Some(id) {
-            if let Err(error) = self
-                .apply_editor(cx)
-                .and_then(|()| self.store.save(self.current()))
-            {
-                self.status = format!("Cannot close tab: {error:#}");
-                cx.notify();
+            if let Err(error) = self.save(cx) {
+                let msg = format!("Cannot close tab: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
                 return;
             }
             self.cancel(cx);
@@ -448,11 +878,10 @@ impl WorkspaceView {
         if index == self.active_project || index >= self.projects.len() {
             return;
         }
-        if let Err(error) = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()))
-        {
-            self.status = format!("Cannot switch: {error:#}");
+        if let Err(error) = self.save(cx) {
+            let msg = format!("Cannot switch project: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
             return;
         }
         self.cancel(cx);
@@ -462,6 +891,7 @@ impl WorkspaceView {
         self.target_folder = None;
         self.expand_all();
         self.load_editor(window, cx);
+        self.set_status(format!("Project: {}", self.current().name), false, cx);
     }
 
     fn switch_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -497,153 +927,612 @@ impl WorkspaceView {
                 });
                 self.expand_all();
                 self.load_editor(window, cx);
-                self.status = format!("Workspace: {}", self.workspaces[index].name);
+                self.set_status(
+                    format!("Workspace: {}", self.workspaces[index].name),
+                    false,
+                    cx,
+                );
             }
-            Err(error) => self.status = format!("Cannot switch workspace: {error:#}"),
+            Err(error) => {
+                let msg = format!("Cannot switch workspace: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
         }
-        cx.notify();
     }
 
-    fn add_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self.workspace_name.read(cx).value().to_string();
-        match self.workspace_store.create_workspace(&name) {
-            Ok(workspace) => {
-                self.workspaces.push(workspace);
-                self.creating_workspace = false;
-                Self::set_input(&self.workspace_name, "", window, cx);
-                self.switch_workspace(self.workspaces.len() - 1, window, cx);
-            }
-            Err(error) => self.status = format!("Create workspace failed: {error:#}"),
-        }
-        cx.notify();
-    }
-
-    fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()))
-        {
-            self.status = format!("Cannot add project: {error:#}");
-            return;
-        }
-        let name = self.project_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            self.status = "Project name is required".into();
-            cx.notify();
-            return;
-        }
-        match self.store.create(name) {
-            Ok(project) => {
-                self.creating_project = false;
-                Self::set_input(&self.project_name, "", window, cx);
-                self.projects.push(project);
-                let last = self.projects.len() - 1;
-                let choices = project_choices(&self.projects);
-                self.project_selector.update(cx, |selector, cx| {
-                    selector.set_items(choices, window, cx);
-                    selector.set_selected_index(Some(IndexPath::default().row(last)), window, cx);
-                });
-                self.switch_project(last, window, cx);
-            }
-            Err(error) => self.status = format!("Create project failed: {error:#}"),
-        }
-        cx.notify();
-    }
-
-    fn add_folder(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn add_folder(&mut self, cx: &mut Context<Self>) {
         let folder = Folder::new("New Folder");
         let id = folder.id.clone();
-        if let Some(collection) = self.projects[self.active_project].collections.first_mut() {
-            collection.folders.push(folder);
+        if let Some(target) = self.target_folder.clone()
+            && self.projects[self.active_project].add_subfolder(&target, folder.clone())
+        {
+            self.expanded.insert(target);
             self.expanded.insert(id.clone());
             self.target_folder = Some(id);
-            self.save(cx);
+            let _ = self.save(cx);
+            return;
+        }
+        if let Some(collection) = self.projects[self.active_project].collections.first_mut() {
+            collection.folders.push(folder);
+            self.expanded.insert(collection.id.clone());
+            self.expanded.insert(id.clone());
+            self.target_folder = Some(id);
+            let _ = self.save(cx);
         }
     }
 
-    fn add_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()))
-        {
-            self.status = format!("Cannot add request: {error:#}");
+    pub(super) fn add_subfolder(&mut self, parent_id: &str, cx: &mut Context<Self>) {
+        let folder = Folder::new("New Folder");
+        let id = folder.id.clone();
+        if self.projects[self.active_project].add_subfolder(parent_id, folder) {
+            self.expanded.insert(parent_id.to_owned());
+            self.expanded.insert(id.clone());
+            self.target_folder = Some(id);
+            let _ = self.save(cx);
+        }
+    }
+
+    pub(super) fn add_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let request = ApiRequest::new("GET", "New Request", "");
+        self.insert_and_open_request(request, window, cx);
+    }
+
+    fn insert_and_open_request(
+        &mut self,
+        request: ApiRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.save(cx) {
+            let msg = format!("Cannot save active request: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
             return;
         }
-        let request = ApiRequest::new("GET", "New Request", "");
         let id = request.id.clone();
         let mut pending = Some(request);
         if let Some(target) = self.target_folder.as_deref() {
-            fn add_to_folder(
-                folders: &mut [Folder],
-                target: &str,
-                pending: &mut Option<ApiRequest>,
-            ) {
-                for folder in folders {
-                    if folder.id == target {
-                        if let Some(request) = pending.take() {
-                            folder.requests.push(request);
-                        }
-                        return;
-                    }
-                    add_to_folder(&mut folder.folders, target, pending);
-                    if pending.is_none() {
-                        return;
-                    }
-                }
-            }
             for collection in &mut self.projects[self.active_project].collections {
-                add_to_folder(&mut collection.folders, target, &mut pending);
-                if pending.is_none() {
+                if let Some(folder) = collection.find_folder_mut(target)
+                    && let Some(req) = pending.take()
+                {
+                    folder.requests.push(req);
+                    self.expanded.insert(target.to_owned());
                     break;
                 }
             }
         }
-        if let Some(request) = pending {
+        if let Some(req) = pending {
             if self.projects[self.active_project].collections.is_empty() {
                 self.projects[self.active_project]
                     .collections
                     .push(Collection::new("Default Collection"));
             }
-            self.projects[self.active_project].collections[0]
-                .requests
-                .push(request);
+            let coll = &mut self.projects[self.active_project].collections[0];
+            self.expanded.insert(coll.id.clone());
+            coll.requests.push(req);
         }
         match self.store.save(self.current()) {
             Ok(()) => self.open_request(id, window, cx),
-            Err(error) => self.status = format!("Create request failed: {error:#}"),
+            Err(error) => {
+                let msg = format!("Create request failed: {error:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
         }
-        cx.notify();
     }
 
-    fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn duplicate_request(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.save(cx) {
+            window.push_notification(Notification::error(format!("Save failed: {error:#}")), cx);
+            return;
+        }
+        if let Some(new_id) = self.projects[self.active_project].duplicate_request(id) {
+            let _ = self.store.save(self.current());
+            self.open_request(new_id, window, cx);
+            window.push_notification(Notification::success("Request duplicated"), cx);
+        }
+    }
+
+    pub(super) fn copy_request_as_curl(
+        &mut self,
+        target_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target_id.is_none() || target_id == self.selected_id.as_deref() {
+            let _ = self.apply_editor(cx);
+        }
+        let lookup_id = target_id.or(self.selected_id.as_deref());
+        let Some(req) = lookup_id.and_then(|id| self.current().find_request(id)) else {
+            return;
+        };
+        let cmd = curl::to_curl(req, &self.current().variables);
+        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+        self.set_status("Copied cURL command to clipboard", false, cx);
+        window.push_notification(Notification::success("Copied as cURL command"), cx);
+    }
+
+    pub(super) fn open_name_dialog(
+        &mut self,
+        kind: NameDialogKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, placeholder, initial, ok_text) = match &kind {
+            NameDialogKind::NewWorkspace => (
+                "Create Workspace",
+                "Workspace name (e.g. Platform API)",
+                String::new(),
+                "Create",
+            ),
+            NameDialogKind::NewProject => (
+                "Create Project",
+                "Project name (e.g. Billing Service)",
+                String::new(),
+                "Create",
+            ),
+            NameDialogKind::RenameFolder(folder_id) => {
+                let current_name = self
+                    .current()
+                    .find_folder(folder_id)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default();
+                ("Rename Folder", "Folder name", current_name, "Rename")
+            }
+        };
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(initial)
+        });
+        let initial_focus = Cell::new(true);
+        let weak_view = cx.weak_entity();
+        let kind_ok = kind.clone();
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                input.read(cx).focus_handle(cx).focus(window, cx);
+            }
+            let input_ok = input.clone();
+            let weak_ok = weak_view.clone();
+            let kind_exec = kind_ok.clone();
+            dialog
+                .w(px(400.))
+                .title(title)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let value = input_ok.read(cx).value().trim().to_string();
+                    if value.is_empty() {
+                        window.push_notification(Notification::warning("Name cannot be empty"), cx);
+                        return false;
+                    }
+                    let mut ok = true;
+                    let _ = weak_ok.update(cx, |view, cx| match &kind_exec {
+                        NameDialogKind::NewWorkspace => {
+                            match view.workspace_store.create_workspace(&value) {
+                                Ok(ws) => {
+                                    view.workspaces.push(ws);
+                                    let idx = view.workspaces.len() - 1;
+                                    view.switch_workspace(idx, window, cx);
+                                    window.push_notification(
+                                        Notification::success(format!(
+                                            "Workspace '{value}' created"
+                                        )),
+                                        cx,
+                                    );
+                                }
+                                Err(err) => {
+                                    ok = false;
+                                    window.push_notification(
+                                        Notification::error(format!("Workspace failed: {err:#}")),
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                        NameDialogKind::NewProject => {
+                            if let Err(err) = view.save(cx) {
+                                ok = false;
+                                window.push_notification(
+                                    Notification::error(format!("Save failed: {err:#}")),
+                                    cx,
+                                );
+                                return;
+                            }
+                            match view.store.create(&value) {
+                                Ok(project) => {
+                                    view.projects.push(project);
+                                    let last = view.projects.len() - 1;
+                                    let choices = project_choices(&view.projects);
+                                    view.project_selector.update(cx, |sel, cx| {
+                                        sel.set_items(choices, window, cx);
+                                        sel.set_selected_index(
+                                            Some(IndexPath::default().row(last)),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    view.switch_project(last, window, cx);
+                                    window.push_notification(
+                                        Notification::success(format!("Project '{value}' created")),
+                                        cx,
+                                    );
+                                }
+                                Err(err) => {
+                                    ok = false;
+                                    window.push_notification(
+                                        Notification::error(format!("Project failed: {err:#}")),
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                        NameDialogKind::RenameFolder(folder_id) => {
+                            if view.projects[view.active_project]
+                                .rename_folder(folder_id, value.clone())
+                            {
+                                let _ = view.save(cx);
+                                window
+                                    .push_notification(Notification::success("Folder renamed"), cx);
+                            }
+                        }
+                    });
+                    ok
+                })
+                .child(Input::new(&input).small())
+        });
+    }
+
+    pub(super) fn confirm_delete_request(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .current()
+            .find_request(&id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "this request".into());
+        let weak_view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let weak_ok = weak_view.clone();
+            let req_id = id.clone();
+            dialog
+                .w(px(400.))
+                .title("Delete Request")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = weak_ok.update(cx, |view, cx| {
+                        view.delete_request_now(&req_id, window, cx);
+                    });
+                    true
+                })
+                .child(div().text_size(px(13.)).child(format!(
+                    "Delete \"{name}\" from this project? This cannot be undone."
+                )))
+        });
+    }
+
+    fn delete_request_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_id.as_deref() == Some(id) {
+            self.cancel(cx);
+        }
+        if self.projects[self.active_project].delete_request(id) {
+            self.responses.remove(id);
+            self.open_tabs.retain(|tab| tab != id);
+            if self.selected_id.as_deref() == Some(id) {
+                self.selected_id = self
+                    .open_tabs
+                    .last()
+                    .cloned()
+                    .or_else(|| self.current().first_request_id());
+                if let Some(next_id) = &self.selected_id
+                    && !self.open_tabs.contains(next_id)
+                {
+                    self.open_tabs.push(next_id.clone());
+                }
+                self.load_editor(window, cx);
+            }
+            let _ = self.store.save(self.current());
+            self.set_status("Request deleted", false, cx);
+            window.push_notification(Notification::success("Request deleted"), cx);
+        }
+    }
+
+    pub(super) fn confirm_delete_folder(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .current()
+            .find_folder(&id)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "this folder".into());
+        let weak_view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let weak_ok = weak_view.clone();
+            let folder_id = id.clone();
+            dialog
+                .w(px(420.))
+                .title("Delete Folder")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete Folder")
+                        .ok_variant(ButtonVariant::Danger)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = weak_ok.update(cx, |view, cx| {
+                        view.delete_folder_now(&folder_id, window, cx);
+                    });
+                    true
+                })
+                .child(div().text_size(px(13.)).child(format!(
+                    "Delete folder \"{name}\" and all requests inside it? This cannot be undone."
+                )))
+        });
+    }
+
+    fn delete_folder_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.projects[self.active_project].delete_folder(id) {
+            if self.target_folder.as_deref() == Some(id) {
+                self.target_folder = None;
+            }
+            let current = self.current().clone();
+            self.open_tabs
+                .retain(|tab| current.find_request(tab).is_some());
+            if self
+                .selected_id
+                .as_deref()
+                .is_some_and(|sel| current.find_request(sel).is_none())
+            {
+                self.cancel(cx);
+                self.selected_id = self
+                    .open_tabs
+                    .last()
+                    .cloned()
+                    .or_else(|| current.first_request_id());
+                if let Some(next_id) = &self.selected_id
+                    && !self.open_tabs.contains(next_id)
+                {
+                    self.open_tabs.push(next_id.clone());
+                }
+                self.load_editor(window, cx);
+            }
+            let _ = self.store.save(self.current());
+            self.set_status("Folder deleted", false, cx);
+            window.push_notification(Notification::success("Folder deleted"), cx);
+        }
+    }
+
+    pub(super) fn open_variables_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sheet_view =
+            cx.new(|cx| VariablesSheetView::new(&self.current().variables, window, cx));
+        let weak_workspace = cx.weak_entity();
+        let project_name = self.current().name.clone();
+        window.open_sheet(cx, move |sheet, _, _| {
+            let sheet_save = sheet_view.clone();
+            let weak_save = weak_workspace.clone();
+            sheet
+                .size(px(520.))
+                .title(format!("Variables · {project_name}"))
+                .child(sheet_view.clone())
+                .footer(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("vars-cancel")
+                                .small()
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_sheet(cx)),
+                        )
+                        .child(
+                            Button::new("vars-save")
+                                .small()
+                                .primary()
+                                .icon(svg_icon("icons/save.svg").small())
+                                .label("Save Variables")
+                                .on_click(move |_, window, cx| {
+                                    let map = sheet_save.read(cx).variables_map(cx);
+                                    let _ = weak_save.update(cx, |view, cx| {
+                                        view.projects[view.active_project].variables = map;
+                                        match view.store.save(view.current()) {
+                                            Ok(()) => {
+                                                view.set_status("Variables saved", false, cx);
+                                                window.push_notification(
+                                                    Notification::success(
+                                                        "Project variables saved",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                            Err(err) => {
+                                                let msg = format!("Save variables failed: {err:#}");
+                                                view.set_status(msg.clone(), true, cx);
+                                                window.push_notification(
+                                                    Notification::error(msg),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    });
+                                    window.close_sheet(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    pub(super) fn open_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let modal_view = cx.new(|cx| ImportDialogView::new(window, cx));
+        let initial_focus = Cell::new(true);
+        let weak_workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                modal_view
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }
+            let modal_ok = modal_view.clone();
+            let weak_ok = weak_workspace.clone();
+            dialog
+                .w(px(580.))
+                .title("Import Collection or cURL")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Import")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let (mode, raw_text) = {
+                        let modal = modal_ok.read(cx);
+                        (modal.mode, modal.input.read(cx).value().to_string())
+                    };
+                    if raw_text.trim().is_empty() {
+                        modal_ok.update(cx, |m, cx| {
+                            m.error = Some("Paste Postman JSON or a cURL command first.".into());
+                            cx.notify();
+                        });
+                        return false;
+                    }
+                    if mode == 0 {
+                        match import::postman_v21(&raw_text) {
+                            Ok(report) => {
+                                let count = report.requests_imported;
+                                let warnings = report.warnings.len();
+                                let project_name = report.project.name.clone();
+                                let mut saved_ok = true;
+                                let _ = weak_ok.update(cx, |view, cx| {
+                                    if let Err(err) = view.store.save(&report.project) {
+                                        saved_ok = false;
+                                        modal_ok.update(cx, |m, cx| {
+                                            m.error = Some(format!("Failed to save project: {err:#}"));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                    view.projects.push(report.project);
+                                    let last = view.projects.len() - 1;
+                                    let choices = project_choices(&view.projects);
+                                    view.project_selector.update(cx, |sel, cx| {
+                                        sel.set_items(choices, window, cx);
+                                        sel.set_selected_index(
+                                            Some(IndexPath::default().row(last)),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    view.switch_project(last, window, cx);
+                                    let note = if warnings > 0 {
+                                        format!("Imported {count} requests into '{project_name}' ({warnings} warning(s))")
+                                    } else {
+                                        format!("Imported {count} requests into '{project_name}'")
+                                    };
+                                    view.set_status(note.clone(), false, cx);
+                                    window.push_notification(Notification::success(note), cx);
+                                });
+                                saved_ok
+                            }
+                            Err(err) => {
+                                modal_ok.update(cx, |m, cx| {
+                                    m.error = Some(format!("{err:#}"));
+                                    cx.notify();
+                                });
+                                false
+                            }
+                        }
+                    } else {
+                        match curl::parse_curl(&raw_text) {
+                            Ok(req) => {
+                                let label = format!("{} {}", req.method, req.name);
+                                let _ = weak_ok.update(cx, |view, cx| {
+                                    view.insert_and_open_request(req, window, cx);
+                                    view.set_status(format!("Imported cURL: {label}"), false, cx);
+                                    window.push_notification(
+                                        Notification::success(format!("Imported {label}")),
+                                        cx,
+                                    );
+                                });
+                                true
+                            }
+                            Err(err) => {
+                                modal_ok.update(cx, |m, cx| {
+                                    m.error = Some(format!("{err:#}"));
+                                    cx.notify();
+                                });
+                                false
+                            }
+                        }
+                    }
+                })
+                .child(modal_view.clone())
+        });
+    }
+
+    pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
         self.run_generation = self.run_generation.wrapping_add(1);
+        self.in_flight_request_id = None;
         if let Some(abort) = self.pending_abort.take() {
             abort.abort();
         }
         self.pending = None;
-        self.status = "Request cancelled / idle".into();
-        cx.notify();
+        self.set_status("Request cancelled / idle", false, cx);
     }
 
-    fn send(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self
-            .apply_editor(cx)
-            .and_then(|()| self.store.save(self.current()))
-        {
-            self.status = format!("Cannot send: {error:#}");
-            cx.notify();
+    pub(super) fn send(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if let Err(error) = self.save(cx) {
+            let msg = format!("Cannot send: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            if let Some(window) = window {
+                window.push_notification(Notification::error(msg), cx);
+            }
             return;
         }
         let Some(request) = self.current_request().cloned() else {
             return;
         };
+        let request_id = request.id.clone();
         let variables = self.current().variables.clone();
         self.cancel(cx);
-        self.response = None;
-        self.response_error = None;
-        self.status = format!("Sending {}...", request.method);
+        self.in_flight_request_id = Some(request_id.clone());
+        self.set_status(
+            format!("Sending {} {}…", request.method, request.url),
+            false,
+            cx,
+        );
+
         let generation = self.run_generation;
         let engine = self.engine.clone();
+        let sent_method = request.method.clone();
+        let sent_url = request.url.clone();
         let handle = self
             .runtime
             .spawn(async move { engine.send(&request, &variables).await });
@@ -655,29 +1544,50 @@ impl WorkspaceView {
                     return;
                 }
                 view.pending_abort = None;
+                view.in_flight_request_id = None;
                 match result {
                     Ok(Ok(response)) => {
-                        view.status = format!(
-                            "{} {} · {} ms · {} bytes{}",
+                        let status_line = format!(
+                            "{} {} · {} · {}",
                             response.status,
                             response.reason,
-                            response.elapsed_ms,
-                            response.bytes_received,
-                            if response.truncated {
-                                " · truncated"
-                            } else {
-                                ""
-                            }
+                            crate::theme::format_duration(response.elapsed_ms),
+                            crate::theme::format_bytes(response.bytes_received),
                         );
-                        view.response = Some(response);
+                        view.responses.insert(
+                            request_id,
+                            ResponseCacheEntry {
+                                response: Some(response),
+                                error: None,
+                                sent_method,
+                                sent_url,
+                            },
+                        );
+                        view.set_status(status_line, false, cx);
                     }
                     Ok(Err(error)) => {
-                        view.status = "Request failed".into();
-                        view.response_error = Some(error.to_string());
+                        view.responses.insert(
+                            request_id,
+                            ResponseCacheEntry {
+                                response: None,
+                                error: Some(error.to_string()),
+                                sent_method,
+                                sent_url,
+                            },
+                        );
+                        view.set_status("Request failed", true, cx);
                     }
                     Err(error) => {
-                        view.status = "Request interrupted".into();
-                        view.response_error = Some(error.to_string());
+                        view.responses.insert(
+                            request_id,
+                            ResponseCacheEntry {
+                                response: None,
+                                error: Some(error.to_string()),
+                                sent_method,
+                                sent_url,
+                            },
+                        );
+                        view.set_status("Request interrupted", true, cx);
                     }
                 }
                 cx.notify();
@@ -686,767 +1596,274 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn render_folder(
-        &self,
-        folder: &Folder,
-        depth: f32,
-        cx: &mut Context<Self>,
-        out: &mut Vec<AnyElement>,
-    ) {
-        let id = folder.id.clone();
-        let open = self.expanded.contains(&id);
-        let is_target = self.target_folder.as_ref() == Some(&id);
-        let label = folder.name.clone();
-        out.push(
-            div()
-                .pl(px(depth * 14.))
-                .child(
-                    Button::new(format!("folder-{id}"))
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .accessibility_label(label.clone())
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_start()
-                                .gap_2()
-                                .child(
-                                    gpui_kit::component::Icon::default()
-                                        .path(if open {
-                                            "icons/folder-open.svg"
-                                        } else {
-                                            "icons/folder-closed.svg"
-                                        })
-                                        .small(),
-                                )
-                                .child(label),
-                        )
-                        .selected(is_target)
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if !view.expanded.insert(id.clone()) {
-                                view.expanded.remove(&id);
-                            }
-                            view.target_folder = Some(id.clone());
-                            cx.notify();
-                        })),
-                )
-                .into_any_element(),
-        );
-        if open {
-            for sub in &folder.folders {
-                self.render_folder(sub, depth + 1., cx, out);
-            }
-            for req in &folder.requests {
-                self.render_request_link(req, depth + 1., cx, out);
-            }
-        }
-    }
-
-    fn render_request_link(
-        &self,
-        request: &ApiRequest,
-        depth: f32,
-        cx: &mut Context<Self>,
-        out: &mut Vec<AnyElement>,
-    ) {
-        let id = request.id.clone();
-        let selected = self.selected_id.as_ref() == Some(&id);
-        let method = request.method.clone();
-        let title = request.name.clone();
-        let method_color = match method.as_str() {
-            "GET" => 0x79c9a5,
-            "POST" => 0xe4bb72,
-            "PUT" | "PATCH" => 0x86aee8,
-            "DELETE" => 0xe68f8f,
-            _ => 0xb9bfca,
-        };
-        out.push(
-            div()
-                .bg(if selected {
-                    rgb(0x303239)
-                } else {
-                    rgb(0x181d24)
-                })
-                .pl(px(depth * 14.))
-                .child(
-                    Button::new(format!("request-{id}"))
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .accessibility_label(format!("{method} {title}"))
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_start()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(52.))
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(method_color))
-                                        .child(method),
-                                )
-                                .child(div().child(title)),
-                        )
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            view.open_request(id.clone(), window, cx)
-                        })),
-                )
-                .into_any_element(),
-        );
-    }
-
-    fn render_explorer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut out = Vec::new();
-        for collection in &self.current().collections {
-            let id = collection.id.clone();
-            let open = self.expanded.contains(&id);
-            let title = collection.name.clone();
-            out.push(
-                Button::new(format!("collection-{id}"))
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .accessibility_label(title.clone())
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_start()
-                            .gap_2()
-                            .child(
-                                gpui_kit::component::Icon::default()
-                                    .path(if open {
-                                        "icons/folder-open.svg"
-                                    } else {
-                                        "icons/folder-closed.svg"
-                                    })
-                                    .small(),
-                            )
-                            .child(title),
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        if !view.expanded.insert(id.clone()) {
-                            view.expanded.remove(&id);
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-            if open {
-                for folder in &collection.folders {
-                    self.render_folder(folder, 1., cx, &mut out);
-                }
-                for req in &collection.requests {
-                    self.render_request_link(req, 1., cx, &mut out);
-                }
-            }
-        }
-        out
-    }
-
-    fn render_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.section {
-            0 => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child("Query parameters · key=value, one per line")
-                .child(Textarea::new(&self.params).h(px(152.)))
-                .into_any_element(),
-            1 => {
-                let kind_label = AUTH_TYPES[self.auth_kind];
-                let view = cx.weak_entity();
-                let mut panel = div().flex().flex_col().gap_2().child(
-                    Button::new("auth-kind")
-                        .label(format!("{kind_label} ▾"))
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for (i, label) in AUTH_TYPES.iter().enumerate() {
-                                let view = view.clone();
-                                menu = menu.item(PopupMenuItem::new(*label).on_click(
-                                    move |_, _, cx| {
-                                        let _ = view.update(cx, |view, cx| {
-                                            view.auth_kind = i;
-                                            cx.notify();
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        }),
-                );
-                panel = match self.auth_kind {
-                    1 => panel
-                        .child(Input::new(&self.auth_user))
-                        .child(Input::new(&self.auth_password)),
-                    2 => panel.child(Input::new(&self.auth_token)),
-                    3 | 4 => panel
-                        .child(Input::new(&self.api_key_name))
-                        .child(Input::new(&self.api_key_value)),
-                    _ => panel.child("No credentials sent"),
-                };
-                panel
-                    .child("Credentials are kept in memory, not in saved project JSON.")
-                    .into_any_element()
-            }
-            2 => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child("Headers · Header: value, one per line")
-                .child(Textarea::new(&self.headers).h(px(152.)))
-                .into_any_element(),
-            3 => {
-                let kind_label = BODY_TYPES[self.body_kind];
-                let view = cx.weak_entity();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        Button::new("body-kind")
-                            .label(format!("{kind_label} ▾"))
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for (i, label) in BODY_TYPES.iter().enumerate() {
-                                    let view = view.clone();
-                                    menu = menu.item(PopupMenuItem::new(*label).on_click(
-                                        move |_, _, cx| {
-                                            let _ = view.update(cx, |view, cx| {
-                                                view.body_kind = i;
-                                                cx.notify();
-                                            });
-                                        },
-                                    ));
-                                }
-                                menu
-                            }),
-                    )
-                    .child(Textarea::new(&self.body).h(px(152.)))
-                    .into_any_element()
-            }
-            4 => div()
-                .child(format!(
-                    "Pre-request and post-response scripts are planned and are not executed in v{}.",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .into_any_element(),
-            _ => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child("Timeout (milliseconds, 100–300000)")
-                .child(Input::new(&self.timeout))
-                .child("TLS verification enabled. Redirects limited to 10.")
-                .into_any_element(),
-        }
-    }
-
-    fn render_response(&self) -> AnyElement {
-        if let Some(response) = &self.response {
-            let pretty = serde_json::from_str::<serde_json::Value>(&response.body)
-                .ok()
-                .and_then(|v| serde_json::to_string_pretty(&v).ok());
-            let output = pretty.unwrap_or_else(|| response.body.clone());
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(format!(
-                    "{} {}    ·    {} ms    ·    {} bytes{}",
-                    response.status,
-                    response.reason,
-                    response.elapsed_ms,
-                    response.bytes_received,
-                    if response.truncated {
-                        "    ·    truncated"
-                    } else {
-                        ""
-                    }
-                ))
-                .child(div().text_color(rgb(0x9da7b5)).text_sm().child(format!(
-                    "{} headers  ·  {}",
-                    response.headers.len(),
-                    response.final_url
-                )))
-                .child(
-                    div()
-                        .id("response-body")
-                        .overflow_y_scroll()
-                        .h(px(250.))
-                        .p_2()
-                        .bg(rgb(0x11151b))
-                        .text_color(rgb(0xe5e8ef))
-                        .child(output),
-                )
-                .into_any_element()
-        } else if let Some(error) = &self.response_error {
-            div()
-                .text_color(rgb(0xf08b87))
-                .child(format!("Request failed: {error}"))
-                .into_any_element()
+    fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = if cx.theme().is_dark() {
+            ThemeMode::Light
         } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .py_4()
-                .child("No response yet")
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x9da7b5))
-                        .child("Send a request to see its status, timing and response body."),
-                )
-                .into_any_element()
-        }
+            ThemeMode::Dark
+        };
+        Theme::change(next, Some(window), cx);
+        self.set_status(format!("Theme: {}", next.name()), false, cx);
     }
-}
-
-fn format_kvs(pairs: &[KeyValue], separator: char) -> String {
-    pairs
-        .iter()
-        .map(|row| {
-            format!(
-                "{}{}{}{}",
-                if row.enabled { "" } else { "# " },
-                row.key,
-                separator,
-                row.value
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_kvs(text: &str, separator: char) -> Vec<KeyValue> {
-    text.lines()
-        .filter_map(|line| {
-            if line.trim().is_empty() {
-                return None;
-            }
-            let (enabled, content) = match line.trim_start().strip_prefix("# ") {
-                Some(other) => (false, other),
-                None => (true, line),
-            };
-            let (key, value) = content.split_once(separator)?;
-            if key.trim().is_empty() {
-                return None;
-            }
-            Some(KeyValue {
-                enabled,
-                key: key.trim().into(),
-                value: value.trim().into(),
-            })
-        })
-        .collect()
 }
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let foreground = cx.theme().foreground;
-        let background = rgb(0x161a20);
-        let secondary = rgb(0x1b2028);
-        let border = rgb(0x303741);
-        let explorer = self.render_explorer(cx);
+        let bg = cx.theme().background;
+        let title_bar_bg = cx.theme().title_bar;
+        let title_border = cx.theme().title_bar_border;
+        let status_bg = cx.theme().status_bar;
+        let status_border = cx.theme().status_bar_border;
+        let fg = cx.theme().foreground;
+        let muted_fg = cx.theme().muted_foreground;
+        let is_dark = cx.theme().is_dark();
 
-        let method_view = cx.weak_entity();
         let workspace_view = cx.weak_entity();
+        let active_ws = self.active_workspace;
         let workspace_choices: Vec<String> =
             self.workspaces.iter().map(|w| w.name.clone()).collect();
-        let mut tabs = Vec::new();
-        for id in &self.open_tabs {
-            if let Some(req) = self.current().find_request(id) {
-                let id = id.clone();
-                let label = format!("{} {}", req.method, req.name);
-                let selected = self.selected_id.as_ref() == Some(&id);
-                let close_id = id.clone();
-                tabs.push(
-                    div()
-                        .flex()
-                        .items_center()
-                        .bg(if selected { rgb(0x303741) } else { background })
-                        .rounded_md()
-                        .child(if selected && self.editing_request_name {
-                            div()
-                                .w(px(180.))
-                                .child(Input::new(&self.request_name).small())
-                                .into_any_element()
-                        } else {
-                            Button::new(format!("tab-{id}"))
-                                .ghost()
-                                .small()
-                                .label(label)
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.open_request(id.clone(), window, cx)
-                                }))
-                                .into_any_element()
-                        })
-                        .when(selected, |row| {
-                            row.child(
-                                Button::new("edit-request-name")
-                                    .ghost()
-                                    .small()
-                                    .tooltip("Edit request name")
-                                    .label(if self.editing_request_name {
-                                        "Done"
-                                    } else {
-                                        "✎"
-                                    })
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        if view.editing_request_name {
-                                            match view.apply_editor(cx) {
-                                                Ok(()) => view.editing_request_name = false,
-                                                Err(error) => {
-                                                    view.status =
-                                                        format!("Cannot edit name: {error:#}")
-                                                }
-                                            }
-                                        } else {
-                                            view.editing_request_name = true;
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .child(
-                            Button::new(format!("close-tab-{close_id}"))
-                                .ghost()
-                                .small()
-                                .label("×")
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.close_tab(&close_id, window, cx)
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        let section_buttons: Vec<AnyElement> = SECTIONS
-            .iter()
-            .enumerate()
-            .map(|(i, title)| {
-                div()
-                    .bg(if self.section == i {
-                        rgb(0x303741)
-                    } else {
-                        background
-                    })
-                    .rounded_md()
-                    .child(
-                        Button::new(format!("section-{i}"))
-                            .ghost()
-                            .small()
-                            .label(title.to_string())
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.section = i;
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+        let var_count = self.current().variables.len();
+        let req_count = self.current().request_count();
 
-        let root = div()
-            .size_full()
+        let header = div()
+            .h(px(44.))
+            .px_3()
+            .flex_shrink_0()
             .flex()
-            .flex_col()
-            .bg(background)
-            .text_size(px(13.))
-            .text_color(foreground)
+            .items_center()
+            .gap_2()
+            .bg(title_bar_bg)
+            .border_b_1()
+            .border_color(title_border)
+            .child(
+                div()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .rounded(px(6.))
+                    .bg(brand_accent(is_dark))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(svg_icon("icons/zap.svg").xsmall().text_color(gpui::white())),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Fastman"),
+            )
+            .child(div().text_color(muted_fg).child("/"))
+            .child(
+                Button::new("workspace-selector")
+                    .ghost()
+                    .small()
+                    .dropdown_caret(true)
+                    .icon(svg_icon("icons/layers.svg").small())
+                    .label(self.workspaces[self.active_workspace].name.clone())
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for (index, name) in workspace_choices.iter().enumerate() {
+                            let view = workspace_view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(index == active_ws)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view.update(cx, |view, cx| {
+                                            view.switch_workspace(index, window, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        let view_new = workspace_view.clone();
+                        menu.separator().item(
+                            PopupMenuItem::new("New Workspace...")
+                                .icon(svg_icon("icons/plus.svg"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = view_new.update(cx, |view, cx| {
+                                        view.open_name_dialog(
+                                            NameDialogKind::NewWorkspace,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("open-variables")
+                    .small()
+                    .outline()
+                    .icon(svg_icon("icons/variable.svg").small())
+                    .label("Variables")
+                    .when(var_count > 0, |btn| btn.child(count_pill(var_count, cx)))
+                    .tooltip("Edit project variables")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_variables_sheet(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("open-import")
+                    .small()
+                    .outline()
+                    .icon(svg_icon("icons/import.svg").small())
+                    .label("Import")
+                    .tooltip("Import Postman v2.1 JSON or cURL")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("toggle-theme")
+                    .small()
+                    .ghost()
+                    .icon(
+                        svg_icon(if is_dark {
+                            "icons/sun.svg"
+                        } else {
+                            "icons/moon.svg"
+                        })
+                        .small(),
+                    )
+                    .tooltip(if is_dark {
+                        "Switch to Light theme"
+                    } else {
+                        "Switch to Dark theme"
+                    })
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.toggle_theme(window, cx);
+                    })),
+            );
+
+        let status_dot_color = if self.in_flight_request_id.is_some() {
+            cx.theme().info
+        } else if self.status_is_error {
+            cx.theme().danger
+        } else {
+            cx.theme().success
+        };
+
+        let status_bar = div()
+            .h(px(26.))
+            .px_3()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .bg(status_bg)
+            .border_t_1()
+            .border_color(status_border)
+            .text_size(px(11.5))
+            .text_color(muted_fg)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_3()
-                    .h(px(44.))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .flex_shrink_0()
+                            .bg(status_dot_color),
+                    )
+                    .child(div().truncate().child(self.status.clone())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .flex_shrink_0()
-                    .bg(secondary)
-                    .border_b_1()
-                    .border_color(border)
+                    .child(format!("{req_count} requests · {var_count} variables"))
                     .child(
                         div()
-                            .text_color(rgb(0xff966c))
-                            .font_weight(FontWeight::BOLD)
-                            .child("◆"),
-                    )
-                    .child(div().font_weight(FontWeight::BOLD).child("Fastman"))
-                    .child(
-                        Button::new("workspace-selector")
-                            .ghost()
-                            .small()
-                            .label(format!("{} ▾", self.workspaces[self.active_workspace].name))
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for (index, name) in workspace_choices.iter().enumerate() {
-                                    let view = workspace_view.clone();
-                                    menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                                        move |_, window, cx| {
-                                            let _ = view.update(cx, |view, cx| {
-                                                view.switch_workspace(index, window, cx)
-                                            });
-                                        },
-                                    ));
-                                }
-                                menu
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w(px(180.))
-                            .when(self.creating_workspace, |el| {
-                                el.child(Input::new(&self.workspace_name))
-                            })
-                            .when(!self.creating_workspace, |el| el.hidden()),
-                    )
-                    .child(
-                        Button::new("create-workspace")
-                            .ghost()
-                            .small()
-                            .label(if self.creating_workspace {
-                                "Create"
-                            } else {
-                                "+ Workspace"
-                            })
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if view.creating_workspace {
-                                    view.add_workspace(window, cx);
-                                } else {
-                                    view.creating_workspace = true;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("save-global")
-                            .small()
-                            .label("Save request")
-                            .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                svg_icon("icons/shield-check.svg")
+                                    .xsmall()
+                                    .text_color(cx.theme().success),
+                            )
+                            .child("Local-first"),
                     ),
             );
 
-        root.child(
-            div().flex_1().min_h_0().child(h_resizable("workspace-panels")
-                .child(
-                    resizable_panel().size(px(252.)).size_range(px(180.)..px(520.)).child(div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_3()
-                        .bg(rgb(0x181d24))
-                        .border_r_1()
-                        .border_color(border)
-                        .child(div().text_sm().text_color(rgb(0xaeb8c5)).child("Project"))
+        div()
+            .id("fastman-root")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|view, _: &SendRequest, window, cx| {
+                view.send(Some(window), cx);
+            }))
+            .on_action(cx.listener(|view, _: &SaveRequest, window, cx| {
+                view.save_with_toast(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &NewRequest, window, cx| {
+                view.add_request(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &CloseActiveTab, window, cx| {
+                if let Some(id) = view.selected_id.clone() {
+                    view.close_tab(&id, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|view, _: &FocusUrl, window, cx| {
+                view.url.read(cx).focus_handle(cx).focus(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
+                view.explorer_search
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ToggleTheme, window, cx| {
+                view.toggle_theme(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &OpenVariables, window, cx| {
+                view.open_variables_sheet(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &OpenImport, window, cx| {
+                view.open_import_dialog(window, cx);
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(bg)
+            .text_size(px(13.))
+            .text_color(fg)
+            .child(header)
+            .child(
+                div().flex_1().min_h_0().child(
+                    h_resizable("workspace-panels")
                         .child(
-                            div()
-                                .flex_shrink_0()
-                                .child(Select::new(&self.project_selector).small()),
+                            resizable_panel()
+                                .size(px(270.))
+                                .size_range(px(210.)..px(480.))
+                                .child(self.render_explorer_panel(cx)),
                         )
                         .child(
-                            div()
-                                .when(self.creating_project, |el| {
-                                    el.child(Input::new(&self.project_name))
-                                })
-                                .when(!self.creating_project, |el| el.hidden()),
-                        )
-                        .child(
-                            Button::new("create-project")
-                                .small()
-                                .label(if self.creating_project {
-                                    "Create project"
-                                } else {
-                                    "+ New project"
-                                })
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    if view.creating_project {
-                                        view.add_project(window, cx);
-                                    } else {
-                                        view.creating_project = true;
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                        .child(div().h(px(1.)).bg(border))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("create-folder")
-                                        .small()
-                                        .label("+ Folder")
-                                        .on_click(
-                                            cx.listener(|view, _, _, cx| view.add_folder(cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("create-request")
-                                        .small()
-                                        .label("+ Request")
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.add_request(window, cx)
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .pt_2()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Collections"),
-                        )
-                        .child(
-                            div()
-                                .id("explorer-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .children(explorer),
-                        )
-                        .into_any_element()),
-                )
-                .child(
-                    resizable_panel().child(div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p_3()
-                        .child(
-                            div()
-                                .id("tabs-scroll")
-                                .flex()
-                                .gap_2()
-                                .overflow_x_scroll()
-                                .children(tabs),
-                        )
-                        .child(
-                            div().flex_1().min_h_0().child(v_resizable("request-response-panels")
-                            .child(resizable_panel().child(div().size_full().flex().flex_col().gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("method")
-                                        .small()
-                                        .label(format!("{} ▾", self.method))
-                                        .dropdown_menu(move |mut menu, _, _| {
-                                            for method in METHODS {
-                                                let view = method_view.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(*method).on_click(
-                                                        move |_, _, cx| {
-                                                            let _ = view.update(cx, |view, cx| {
-                                                                view.method = (*method).into();
-                                                                cx.notify();
-                                                            });
-                                                        },
-                                                    ),
-                                                );
-                                            }
-                                            menu
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(Input::new(&self.url).small()),
-                                )
-                                .child(
-                                    Button::new("send")
-                                        .small()
-                                        .primary()
-                                        .disabled(
-                                            self.selected_id.is_none()
-                                                || self.pending_abort.is_some(),
+                            resizable_panel().child(
+                                div().size_full().child(
+                                    v_resizable("request-response-panels")
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(360.))
+                                                .size_range(px(200.)..px(700.))
+                                                .child(self.render_request_panel(cx)),
                                         )
-                                        .label("Send")
-                                        .on_click(cx.listener(|view, _, _, cx| view.send(cx))),
-                                )
-                                .child(
-                                    Button::new("cancel")
-                                        .disabled(self.pending_abort.is_none())
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|view, _, _, cx| view.cancel(cx))),
+                                        .child(
+                                            resizable_panel()
+                                                .size_range(px(180.)..px(700.))
+                                                .child(self.render_response_panel(cx)),
+                                        ),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(border)
-                                .children(section_buttons),
-                        )
-                        .child(
-                            div()
-                                .id("section-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .pt_2()
-                                .overflow_y_scroll()
-                                .child(self.render_section(cx)),
-                        )
-                        .into_any_element()))
-                        .child(resizable_panel().child(div().size_full().flex().flex_col().gap_2()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Response"))
-                        .child(
-                            div()
-                                .id("response-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .child(self.render_response()),
-                        ).into_any_element())))
-                        )
-                        .into_any_element()),
-                )),
-        )
-        .child(
-            div()
-                .h(px(32.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .px_3()
-                .bg(secondary)
-                .border_t_1()
-                .border_color(border)
-                .text_sm()
-                .text_color(rgb(0xaeb8c5))
-                .child(self.status.clone()),
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[::core::prelude::v1::test]
-    fn key_value_editor_roundtrip() {
-        let entries = vec![
-            KeyValue::new("Accept", "application/json"),
-            KeyValue {
-                enabled: false,
-                key: "X-Optional".into(),
-                value: "value".into(),
-            },
-        ];
-        assert_eq!(parse_kvs(&format_kvs(&entries, ':'), ':'), entries);
+                            ),
+                        ),
+                ),
+            )
+            .child(status_bar)
     }
 }
