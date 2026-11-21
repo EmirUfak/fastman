@@ -386,19 +386,40 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn render_tree_children(
+        &self,
+        folders: &[Folder],
+        requests: &[ApiRequest],
+        depth: f32,
+        ancestors: &[String],
+        query: &str,
+        cx: &mut Context<Self>,
+        out: &mut Vec<AnyElement>,
+    ) {
+        for folder in folders {
+            self.render_folder(folder, depth, ancestors, query, cx, out);
+        }
+        for req in requests {
+            if query.is_empty() || request_matches(req, query) {
+                self.render_request_link(req, depth, ancestors, cx, out);
+            }
+        }
+    }
+
     fn render_explorer_tree(&self, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
         let collections = &self.current().collections;
         if collections.len() <= 1 {
             if let Some(collection) = collections.first() {
-                for folder in &collection.folders {
-                    self.render_folder(folder, 0., &[], query, cx, &mut out);
-                }
-                for req in &collection.requests {
-                    if query.is_empty() || request_matches(req, query) {
-                        self.render_request_link(req, 0., &[], cx, &mut out);
-                    }
-                }
+                self.render_tree_children(
+                    &collection.folders,
+                    &collection.requests,
+                    0.,
+                    &[],
+                    query,
+                    cx,
+                    &mut out,
+                );
             }
             return out;
         }
@@ -407,7 +428,7 @@ impl WorkspaceView {
         for (coll_idx, collection) in collections.iter().enumerate() {
             let id = collection.id.clone();
             let open = !query.is_empty() || self.expanded.contains(&id);
-            let count = count_collection_requests(&collection.folders, &collection.requests);
+            let count = collection.request_count();
             let title = collection.name.clone();
             let can_move_up = coll_idx > 0;
             let can_move_down = coll_idx + 1 < coll_len;
@@ -573,14 +594,15 @@ impl WorkspaceView {
             );
 
             if open {
-                for folder in &collection.folders {
-                    self.render_folder(folder, 1., &[], query, cx, &mut out);
-                }
-                for req in &collection.requests {
-                    if query.is_empty() || request_matches(req, query) {
-                        self.render_request_link(req, 1., &[], cx, &mut out);
-                    }
-                }
+                self.render_tree_children(
+                    &collection.folders,
+                    &collection.requests,
+                    1.,
+                    &[],
+                    query,
+                    cx,
+                    &mut out,
+                );
             }
         }
         out
@@ -605,7 +627,7 @@ impl WorkspaceView {
         let open = !query.is_empty() || self.expanded.contains(&id);
         let is_target = self.target_folder.as_ref() == Some(&id);
         let label = folder.name.clone();
-        let count = count_collection_requests(&folder.folders, &folder.requests);
+        let count = folder.request_count();
         let (folder_idx, folder_len) = self.current().folder_order_bounds(&id).unwrap_or((0, 1));
         let can_move_up = folder_idx > 0;
         let can_move_down = folder_idx + 1 < folder_len;
@@ -826,53 +848,21 @@ impl WorkspaceView {
                                     "Move to",
                                     window,
                                     cx,
-                                    move |mut sub, _, _| {
-                                        let at_root = current_parent.is_none();
-                                        let v_root = v_sub.clone();
-                                        let folder_root = id_sub.clone();
-                                        sub = sub.scrollable(true).item(
-                                            PopupMenuItem::new("Root")
-                                                .icon(svg_icon("icons/folder-root.svg"))
-                                                .checked(at_root)
-                                                .disabled(at_root)
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = v_root.update(cx, |view, cx| {
-                                                        view.move_folder_to_folder(
-                                                            &folder_root,
-                                                            None,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        );
-                                        if !targets.is_empty() {
-                                            sub = sub.separator();
-                                        }
-                                        for (target_id, target_path) in &targets {
-                                            let is_current = current_parent.as_deref()
-                                                == Some(target_id.as_str());
-                                            let v_dest = v_sub.clone();
-                                            let folder_src = id_sub.clone();
-                                            let dest_id = target_id.clone();
-                                            sub = sub.item(
-                                                PopupMenuItem::new(target_path.clone())
-                                                    .icon(svg_icon("icons/folder-closed.svg"))
-                                                    .checked(is_current)
-                                                    .disabled(is_current)
-                                                    .on_click(move |_, window, cx| {
-                                                        let _ = v_dest.update(cx, |view, cx| {
-                                                            view.move_folder_to_folder(
-                                                                &folder_src,
-                                                                Some(&dest_id),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            );
-                                        }
-                                        sub
+                                    move |sub, _, _| {
+                                        let v_sub = v_sub.clone();
+                                        let id_sub = id_sub.clone();
+                                        populate_move_to_menu(
+                                            sub,
+                                            current_parent.as_deref(),
+                                            &targets,
+                                            move |dest, window, cx| {
+                                                let _ = v_sub.update(cx, |view, cx| {
+                                                    view.move_folder_to_folder(
+                                                        &id_sub, dest, window, cx,
+                                                    );
+                                                });
+                                            },
+                                        )
                                     },
                                 );
 
@@ -959,14 +949,15 @@ impl WorkspaceView {
         if open {
             let mut next_ancestors = ancestors.to_vec();
             next_ancestors.push(id);
-            for sub in &folder.folders {
-                self.render_folder(sub, depth + 1., &next_ancestors, query, cx, out);
-            }
-            for req in &folder.requests {
-                if query.is_empty() || request_matches(req, query) {
-                    self.render_request_link(req, depth + 1., &next_ancestors, cx, out);
-                }
-            }
+            self.render_tree_children(
+                &folder.folders,
+                &folder.requests,
+                depth + 1.,
+                &next_ancestors,
+                query,
+                cx,
+                out,
+            );
         }
     }
 
@@ -1208,50 +1199,21 @@ impl WorkspaceView {
                                     "Move to",
                                     window,
                                     cx,
-                                    move |mut sub, _, _| {
-                                        let at_root = current_parent.is_none();
-                                        let v_root = v_sub.clone();
-                                        let req_root = id_sub.clone();
-                                        sub = sub.scrollable(true).item(
-                                            PopupMenuItem::new("Root")
-                                                .icon(svg_icon("icons/folder-root.svg"))
-                                                .checked(at_root)
-                                                .disabled(at_root)
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = v_root.update(cx, |view, cx| {
-                                                        view.move_request_to_folder(
-                                                            &req_root, None, window, cx,
-                                                        );
-                                                    });
-                                                }),
-                                        );
-                                        if !targets.is_empty() {
-                                            sub = sub.separator();
-                                        }
-                                        for (folder_id, folder_path) in &targets {
-                                            let is_current = current_parent.as_deref()
-                                                == Some(folder_id.as_str());
-                                            let v_folder = v_sub.clone();
-                                            let req_folder = id_sub.clone();
-                                            let dest_id = folder_id.clone();
-                                            sub = sub.item(
-                                                PopupMenuItem::new(folder_path.clone())
-                                                    .icon(svg_icon("icons/folder-closed.svg"))
-                                                    .checked(is_current)
-                                                    .disabled(is_current)
-                                                    .on_click(move |_, window, cx| {
-                                                        let _ = v_folder.update(cx, |view, cx| {
-                                                            view.move_request_to_folder(
-                                                                &req_folder,
-                                                                Some(&dest_id),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            );
-                                        }
-                                        sub
+                                    move |sub, _, _| {
+                                        let v_sub = v_sub.clone();
+                                        let id_sub = id_sub.clone();
+                                        populate_move_to_menu(
+                                            sub,
+                                            current_parent.as_deref(),
+                                            &targets,
+                                            move |dest, window, cx| {
+                                                let _ = v_sub.update(cx, |view, cx| {
+                                                    view.move_request_to_folder(
+                                                        &id_sub, dest, window, cx,
+                                                    );
+                                                });
+                                            },
+                                        )
                                     },
                                 );
 
@@ -1318,6 +1280,43 @@ impl WorkspaceView {
     }
 }
 
+fn populate_move_to_menu(
+    mut sub: gpui_kit::component::menu::PopupMenu,
+    current_parent: Option<&str>,
+    targets: &[(String, String)],
+    on_move: impl Fn(Option<&str>, &mut Window, &mut App) + Clone + 'static,
+) -> gpui_kit::component::menu::PopupMenu {
+    let at_root = current_parent.is_none();
+    let on_root = on_move.clone();
+    sub = sub.scrollable(true).item(
+        PopupMenuItem::new("Root")
+            .icon(svg_icon("icons/folder-root.svg"))
+            .checked(at_root)
+            .disabled(at_root)
+            .on_click(move |_, window, cx| {
+                on_root(None, window, cx);
+            }),
+    );
+    if !targets.is_empty() {
+        sub = sub.separator();
+    }
+    for (target_id, target_path) in targets {
+        let is_current = current_parent == Some(target_id.as_str());
+        let dest_id = target_id.clone();
+        let on_dest = on_move.clone();
+        sub = sub.item(
+            PopupMenuItem::new(target_path.clone())
+                .icon(svg_icon("icons/folder-closed.svg"))
+                .checked(is_current)
+                .disabled(is_current)
+                .on_click(move |_, window, cx| {
+                    on_dest(Some(&dest_id), window, cx);
+                }),
+        );
+    }
+    sub
+}
+
 fn request_matches(request: &ApiRequest, query: &str) -> bool {
     request.name.to_ascii_lowercase().contains(query)
         || request.method.to_ascii_lowercase().contains(query)
@@ -1328,12 +1327,4 @@ fn folder_matches(folder: &Folder, query: &str) -> bool {
     folder.name.to_ascii_lowercase().contains(query)
         || folder.requests.iter().any(|r| request_matches(r, query))
         || folder.folders.iter().any(|f| folder_matches(f, query))
-}
-
-fn count_collection_requests(folders: &[Folder], requests: &[ApiRequest]) -> usize {
-    requests.len()
-        + folders
-            .iter()
-            .map(|f| count_collection_requests(&f.folders, &f.requests))
-            .sum::<usize>()
 }

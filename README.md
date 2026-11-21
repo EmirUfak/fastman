@@ -12,7 +12,7 @@
 - No required account, cloud sync, advertising, or developer telemetry.
 - Broad REST/HTTP request-builder coverage is the **long-term target**, not a claim of full feature parity today.
 
-## Implemented in v0.2.0
+## Current capabilities
 
 | Area | What exists |
 |---|---|
@@ -20,9 +20,10 @@
 | Project selector | GPUI Kit `Select`, create named projects, switch projects |
 | Explorer | Search, nested folders, context menus, and drag-and-drop organization |
 | Tabs | Multiple closable request tabs within the active project, inline request rename |
-| Request editor | Method, URL, editable parameter and header tables, auth, body editing with JSON validation and formatting, timeout, and project variables |
+| Navigation | Command palette for projects, collections, folders, requests, and common actions (`Ctrl+K` / `Cmd+K`) |
+| Request editor | Method, URL with resolved variable highlighting, editable parameter and header tables, auth, body editing with JSON validation and formatting, timeout, and project variables |
 | Request execution | Reqwest async, TLS verification, up to 10 same-origin redirects, 100–300,000 ms timeout, 2 MiB response cap, and cancellation |
-| Response viewer | Status, duration, size, final URL, searchable pretty or raw body, headers, and cookies |
+| Response viewer | Status, duration, size, final URL, searchable pretty or raw body, headers, cookies, and persistent panel placement |
 | Storage | Per-project JSON (`schema_version = 1`) in OS local data directory or `FASTMAN_HOME` |
 | Import and export | Collection v2.1 JSON subset through desktop or CLI; desktop cURL import and redacted-by-default Copy as cURL |
 | Tests | Core unit and feature tests (nested lookup, secret exclusion, local persistence, interpolation, importer, localhost HTTP) and CLI integration tests |
@@ -64,10 +65,10 @@ cargo run -p fastman-desktop
 ```text
 fastman/
   apps/
-    fastman-desktop/    # GPUI view and retained editor state
+    fastman-desktop/    # GPUI workspace, explorer, request and response views
     fastman-cli/        # Headless list, import, and send CLI
   crates/
-    fastman-core/       # Domain model, storage, HTTP engine, importer + tests
+    fastman-core/       # Domain model, storage, HTTP, templates, import, and cURL
   .github/              # CI workflow and issue/PR templates
 ```
 

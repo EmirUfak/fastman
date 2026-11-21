@@ -2,7 +2,7 @@ use crate::response_body_view::{
     CodeLines, HighlightedLine, MAX_HIGHLIGHTED_JSON_LINES, MAX_PRETTY_JSON_SOURCE_BYTES,
     precompute_json_lines, precompute_plain_lines, render_virtual_code_lines,
 };
-use crate::theme::{brand_accent, count_pill, status_badge, svg_icon};
+use crate::theme::{brand_accent, count_pill, status_badge, svg_icon, tab_icon};
 use fastman_core::HttpResponse;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
@@ -19,14 +19,21 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    path::Path,
+    sync::Arc,
+};
 
 use super::WorkspaceView;
 
 const UI_SETTINGS_FILE: &str = "ui-settings.json";
+const MAX_CACHED_RESPONSES: usize = 16;
+const MAX_TOTAL_CACHE_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ResponsePosition {
+pub(super) enum ResponsePosition {
     Bottom,
     Left,
     #[default]
@@ -34,9 +41,9 @@ pub enum ResponsePosition {
 }
 
 impl ResponsePosition {
-    pub const ALL: [Self; 3] = [Self::Bottom, Self::Left, Self::Right];
+    const ALL: [Self; 3] = [Self::Bottom, Self::Left, Self::Right];
 
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Bottom => "bottom",
             Self::Left => "left",
@@ -44,7 +51,7 @@ impl ResponsePosition {
         }
     }
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+    fn from_str(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "bottom" => Some(Self::Bottom),
             "left" => Some(Self::Left),
@@ -53,7 +60,7 @@ impl ResponsePosition {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Bottom => "Bottom",
             Self::Left => "Left",
@@ -61,14 +68,14 @@ impl ResponsePosition {
         }
     }
 
-    pub fn layout_hint(self) -> &'static str {
+    fn layout_hint(self) -> &'static str {
         match self {
             Self::Bottom => "Stacked",
             Self::Left | Self::Right => "Vertical split",
         }
     }
 
-    pub fn icon_path(self) -> &'static str {
+    fn icon_path(self) -> &'static str {
         match self {
             Self::Bottom => "icons/panel-bottom.svg",
             Self::Left => "icons/panel-left.svg",
@@ -78,14 +85,14 @@ impl ResponsePosition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UiSettings {
+pub(super) struct UiSettings {
     pub response_position: ResponsePosition,
     pub response_raw: bool,
     pub response_wrap: bool,
 }
 
 impl UiSettings {
-    pub fn load_from_root(root: &Path) -> Self {
+    pub(super) fn load_from_root(root: &Path) -> Self {
         let path = root.join(UI_SETTINGS_FILE);
         let Ok(bytes) = fs::read(path) else {
             return Self::default();
@@ -110,7 +117,7 @@ impl UiSettings {
         }
     }
 
-    pub fn save_to_root(self, root: &Path) {
+    pub(super) fn save_to_root(self, root: &Path) {
         if fs::create_dir_all(root).is_err() {
             return;
         }
@@ -125,12 +132,12 @@ impl UiSettings {
     }
 }
 
-pub struct ResponseSettingsDialogView {
+struct ResponseSettingsDialogView {
     workspace: WeakEntity<WorkspaceView>,
 }
 
 impl ResponseSettingsDialogView {
-    pub fn new(workspace: WeakEntity<WorkspaceView>) -> Self {
+    fn new(workspace: WeakEntity<WorkspaceView>) -> Self {
         Self { workspace }
     }
 }
@@ -358,39 +365,84 @@ pub(super) fn format_duration(ms: u128) -> String {
 }
 
 #[derive(Debug, Clone)]
-pub struct PrecomputedResponse {
-    pub status: u16,
-    pub reason: SharedString,
-    pub elapsed_label: SharedString,
-    pub size_label: SharedString,
-    pub truncated: bool,
-    pub final_url: SharedString,
-    pub raw_body: SharedString,
-    pub pretty_body: Option<SharedString>,
-    pub pretty_lines: Arc<Vec<HighlightedLine>>,
-    pub raw_lines: Arc<Vec<SharedString>>,
-    pub headers: Arc<Vec<(SharedString, SharedString)>>,
-    pub cookies: Arc<Vec<ParsedCookie>>,
+pub(super) struct PrecomputedResponse {
+    status: u16,
+    reason: SharedString,
+    elapsed_label: SharedString,
+    size_label: SharedString,
+    truncated: bool,
+    final_url: SharedString,
+    pub(super) raw_body: SharedString,
+    pub(super) pretty_body: Option<SharedString>,
+    pretty_lines: Arc<Vec<HighlightedLine>>,
+    raw_lines: Arc<Vec<SharedString>>,
+    headers: Arc<Vec<(SharedString, SharedString)>>,
+    cookies: Arc<Vec<ParsedCookie>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedCookie {
-    pub name: SharedString,
-    pub value: SharedString,
-    pub attributes: SharedString,
+struct ParsedCookie {
+    name: SharedString,
+    value: SharedString,
+    attributes: SharedString,
 }
 
 #[derive(Debug, Clone)]
-pub struct ResponseCacheEntry {
-    pub response: Option<PrecomputedResponse>,
-    pub error: Option<SharedString>,
-    pub sent_method: SharedString,
-    pub sent_url: SharedString,
-    pub approx_bytes: usize,
+pub(super) struct ResponseCacheEntry {
+    pub(super) response: Option<PrecomputedResponse>,
+    pub(super) error: Option<SharedString>,
+    pub(super) sent_method: SharedString,
+    pub(super) sent_url: SharedString,
+    approx_bytes: usize,
+}
+
+#[derive(Default)]
+pub(super) struct ResponseCache {
+    entries: HashMap<String, ResponseCacheEntry>,
+    order: VecDeque<String>,
+}
+
+impl ResponseCache {
+    pub(super) fn get(&self, request_id: &str) -> Option<&ResponseCacheEntry> {
+        self.entries.get(request_id)
+    }
+
+    pub(super) fn insert(&mut self, request_id: String, entry: ResponseCacheEntry) {
+        self.order.retain(|id| id != &request_id);
+        self.order.push_back(request_id.clone());
+        self.entries.insert(request_id, entry);
+
+        let mut total_bytes: usize = self.entries.values().map(|e| e.approx_bytes).sum();
+        while (self.entries.len() > MAX_CACHED_RESPONSES || total_bytes > MAX_TOTAL_CACHE_BYTES)
+            && self.entries.len() > 1
+        {
+            let Some(oldest_id) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest_id) {
+                total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
+            }
+        }
+    }
+
+    pub(super) fn remove(&mut self, request_id: &str) {
+        self.entries.remove(request_id);
+        self.order.retain(|id| id != request_id);
+    }
+
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries.retain(|id, _| keep(id));
+        self.order.retain(|id| self.entries.contains_key(id));
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
 }
 
 impl ResponseCacheEntry {
-    pub fn from_response(
+    pub(super) fn from_response(
         response: HttpResponse,
         sent_method: impl Into<SharedString>,
         sent_url: impl Into<SharedString>,
@@ -450,7 +502,7 @@ impl ResponseCacheEntry {
         }
     }
 
-    pub fn from_error(
+    pub(super) fn from_error(
         error: impl Into<SharedString>,
         sent_method: impl Into<SharedString>,
         sent_url: impl Into<SharedString>,
@@ -591,36 +643,18 @@ impl WorkspaceView {
                         }))
                         .child(
                             Tab::new()
-                                .prefix(
-                                    div()
-                                        .pr_1()
-                                        .flex()
-                                        .items_center()
-                                        .child(svg_icon("icons/braces.svg").xsmall()),
-                                )
+                                .prefix(tab_icon("icons/braces.svg"))
                                 .label("Body"),
                         )
                         .child(
                             Tab::new()
-                                .prefix(
-                                    div()
-                                        .pr_1()
-                                        .flex()
-                                        .items_center()
-                                        .child(svg_icon("icons/layers.svg").xsmall()),
-                                )
+                                .prefix(tab_icon("icons/layers.svg"))
                                 .label("Headers")
                                 .when(header_count > 0, |t| t.suffix(count_pill(header_count, cx))),
                         )
                         .child(
                             Tab::new()
-                                .prefix(
-                                    div()
-                                        .pr_1()
-                                        .flex()
-                                        .items_center()
-                                        .child(svg_icon("icons/cookie.svg").xsmall()),
-                                )
+                                .prefix(tab_icon("icons/cookie.svg"))
                                 .label("Cookies")
                                 .when(cookie_count > 0, |t| t.suffix(count_pill(cookie_count, cx))),
                         ),
@@ -1348,5 +1382,50 @@ fn classify_error(err: &str) -> &'static str {
         "Connection Failed"
     } else {
         "Request Failed"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error_entry(msg: &str) -> ResponseCacheEntry {
+        ResponseCacheEntry::from_error(
+            msg.to_owned(),
+            SharedString::new_static("GET"),
+            SharedString::new_static("https://api.example.com"),
+        )
+    }
+
+    #[::core::prelude::v1::test]
+    fn response_cache_evicts_oldest_entries_beyond_count_limit() {
+        let mut cache = ResponseCache::default();
+        for i in 0..(MAX_CACHED_RESPONSES + 2) {
+            cache.insert(format!("req-{i}"), error_entry("err"));
+        }
+        assert!(cache.get("req-0").is_none());
+        assert!(cache.get("req-1").is_none());
+        assert!(cache.get("req-2").is_some());
+        assert!(
+            cache
+                .get(&format!("req-{}", MAX_CACHED_RESPONSES + 1))
+                .is_some()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn response_cache_remove_and_retain_keep_order_consistent() {
+        let mut cache = ResponseCache::default();
+        cache.insert("a".into(), error_entry("1"));
+        cache.insert("b".into(), error_entry("2"));
+        cache.insert("c".into(), error_entry("3"));
+
+        cache.remove("b");
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+
+        cache.retain(|id| id == "c");
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("c").is_some());
     }
 }

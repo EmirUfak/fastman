@@ -59,24 +59,24 @@ async fn main() -> Result<()> {
             let json = read_collection_file(Path::new(&path))?;
             let mut report = collection_v21(&json)?;
             if !report.sensitive_fields.is_empty() {
-                let summary_text =
-                    sanitize_terminal_line(&summarize_sensitive_findings(&report.sensitive_fields));
                 if strip_secrets {
                     let removed = report.sanitize_credentials();
                     eprintln!(
                         "Notice: moved {} recognized auth field(s) to session-only memory (not saved) and stripped {} sensitive field(s) before saving.",
                         removed.moved_to_session_auth, removed.stripped_fields
                     );
-                } else if allow_plaintext {
-                    eprintln!(
-                        "Warning: persisting {} sensitive field(s) in plaintext project.json: {}",
-                        report.sensitive_fields.len(),
-                        summary_text
-                    );
                 } else {
-                    bail!(
-                        "Refusing to persist {} sensitive field(s) in plaintext ({summary_text}). Re-run with --strip-secrets or --allow-plaintext-secrets.",
-                        report.sensitive_fields.len()
+                    let summary_text = sanitize_terminal_line(&summarize_sensitive_findings(
+                        &report.sensitive_fields,
+                    ));
+                    let count = report.sensitive_fields.len();
+                    if !allow_plaintext {
+                        bail!(
+                            "Refusing to persist {count} sensitive field(s) in plaintext ({summary_text}). Re-run with --strip-secrets or --allow-plaintext-secrets."
+                        );
+                    }
+                    eprintln!(
+                        "Warning: persisting {count} sensitive field(s) in plaintext project.json: {summary_text}"
                     );
                 }
             }

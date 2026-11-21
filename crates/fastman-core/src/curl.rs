@@ -3,8 +3,8 @@
 
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::security::{
-    is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name, is_valid_header_name,
-    is_valid_http_method, percent_decode, percent_encode, redact_url_secrets,
+    has_non_port_scheme, is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name,
+    is_valid_header_name, is_valid_http_method, percent_decode, percent_encode, redact_url_secrets,
     try_extract_auth_from_header, validate_template_or_http_url,
 };
 use crate::template::{self, MAX_INTERPOLATED_BYTES};
@@ -267,14 +267,12 @@ pub fn to_curl_export(
     let mut full_url = resolver.resolve(&request.url)?;
     validate_template_or_http_url(&full_url)?;
 
-    if redact_secrets {
-        let redacted = redact_url_secrets(&full_url);
-        if redacted != full_url {
-            resolver.had_secrets = true;
+    let redacted = redact_url_secrets(&full_url);
+    if redacted != full_url {
+        resolver.had_secrets = true;
+        if redact_secrets {
             full_url = redacted;
         }
-    } else if contains_url_userinfo(&full_url) || url_has_sensitive_query(&full_url) {
-        resolver.had_secrets = true;
     }
 
     let mut query_pairs: Vec<(String, String)> = Vec::new();
@@ -507,23 +505,6 @@ fn expand_template_for_curl(
     )
 }
 
-fn contains_url_userinfo(raw: &str) -> bool {
-    raw.split_once("://")
-        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
-        .is_some_and(|authority| authority.contains('@'))
-}
-
-fn url_has_sensitive_query(raw: &str) -> bool {
-    let before_frag = raw.split('#').next().unwrap_or(raw);
-    let Some((_, query)) = before_frag.split_once('?') else {
-        return false;
-    };
-    query.split('&').filter(|s| !s.is_empty()).any(|part| {
-        let (k, v) = part.split_once('=').unwrap_or((part, ""));
-        is_sensitive_param_name(&percent_decode(k)) && !percent_decode(v).trim().is_empty()
-    })
-}
-
 /// Quote a string safely for POSIX shells. Uses ANSI-C `$'...'` quoting when control
 /// bytes (`< 0x20` or `0x7f`) are present so terminal escape sequences and newlines
 /// cannot break out of bracketed paste or execute extra commands.
@@ -553,20 +534,10 @@ fn shell_quote(value: &str) -> String {
 
 fn normalize_url(raw: &str) -> String {
     let trimmed = raw.trim();
-    let has_non_port_scheme = trimmed.split(['/', '?', '#']).next().is_some_and(|head| {
-        head.split_once(':').is_some_and(|(scheme, rest)| {
-            !scheme.is_empty()
-                && !scheme.starts_with('[')
-                && scheme
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-                && (rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()))
-        })
-    });
     if trimmed.is_empty()
         || trimmed.contains("://")
         || trimmed.starts_with("{{")
-        || has_non_port_scheme
+        || has_non_port_scheme(trimmed)
     {
         trimmed.to_owned()
     } else {
@@ -614,18 +585,20 @@ fn match_flag(
     short: &str,
     long: &str,
 ) -> Option<String> {
-    if tok == short || tok == long {
+    if tok == short {
         if *idx + 1 < tokens.len() {
             *idx += 1;
             return Some(tokens[*idx].clone());
         }
         return None;
     }
-    if let Some(rest) = tok.strip_prefix(&format!("{long}=")) {
-        return Some(rest.to_owned());
+    if let Some(val) = match_exact_flag(tok, tokens, idx, long) {
+        return Some(val);
     }
-    if tok.starts_with(short) && tok.len() > short.len() {
-        return Some(tok[short.len()..].to_owned());
+    if let Some(rest) = tok.strip_prefix(short)
+        && !rest.is_empty()
+    {
+        return Some(rest.to_owned());
     }
     None
 }
@@ -638,7 +611,9 @@ fn match_exact_flag(tok: &str, tokens: &[String], idx: &mut usize, long: &str) -
         }
         return None;
     }
-    tok.strip_prefix(&format!("{long}=")).map(str::to_owned)
+    tok.strip_prefix(long)
+        .and_then(|rest| rest.strip_prefix('='))
+        .map(str::to_owned)
 }
 
 fn match_data_flag(tok: &str, tokens: &[String], idx: &mut usize) -> Option<String> {
@@ -649,19 +624,14 @@ fn match_data_flag(tok: &str, tokens: &[String], idx: &mut usize) -> Option<Stri
         "--data-binary",
         "--data-ascii",
     ] {
-        if tok == flag {
-            if *idx + 1 < tokens.len() {
-                *idx += 1;
-                return Some(tokens[*idx].clone());
-            }
-            return None;
-        }
-        if let Some(rest) = tok.strip_prefix(&format!("{flag}=")) {
-            return Some(rest.to_owned());
+        if let Some(val) = match_exact_flag(tok, tokens, idx, flag) {
+            return Some(val);
         }
     }
-    if tok.starts_with("-d") && tok.len() > 2 {
-        return Some(tok[2..].to_owned());
+    if let Some(rest) = tok.strip_prefix("-d")
+        && !rest.is_empty()
+    {
+        return Some(rest.to_owned());
     }
     None
 }

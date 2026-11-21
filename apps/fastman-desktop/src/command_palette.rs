@@ -1,7 +1,7 @@
 use crate::response_view::ResponsePosition;
 use crate::theme::{method_badge, svg_icon};
 use crate::workspace::{NameDialogKind, WorkspaceView};
-use fastman_core::{Collection, Folder};
+use fastman_core::{ApiRequest, Collection, Folder};
 use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Sizable as _, WindowExt as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
@@ -258,6 +258,41 @@ fn is_word_boundary(prev: Option<char>, current: char) -> bool {
     }
 }
 
+fn push_request_entry(
+    req: &ApiRequest,
+    path_label: &str,
+    selected_id: Option<&str>,
+    open_tabs: &[String],
+    out: &mut Vec<PaletteEntry>,
+) {
+    let has_url = !req.url.trim().is_empty();
+    let subtitle = match (!path_label.is_empty(), has_url) {
+        (true, true) => Some(SharedString::from(format!("{path_label} · {}", req.url))),
+        (true, false) => Some(SharedString::from(path_label.to_owned())),
+        (false, true) => Some(SharedString::from(req.url.clone())),
+        (false, false) => None,
+    };
+    let active = selected_id == Some(req.id.as_str());
+    let open_hint = if open_tabs.contains(&req.id) {
+        "open"
+    } else {
+        ""
+    };
+    out.push(PaletteEntry {
+        section: PaletteSection::Requests,
+        title: req.name.clone().into(),
+        subtitle,
+        method: Some(req.method.clone().into()),
+        icon: "icons/globe.svg",
+        active,
+        search_text: format!(
+            "{} {} {} {} {} request",
+            req.method, req.name, req.url, path_label, open_hint
+        ),
+        target: PaletteTarget::Request { id: req.id.clone() },
+    });
+}
+
 fn collect_collection_entries(
     collection: &Collection,
     show_collection_prefix: bool,
@@ -270,41 +305,10 @@ fn collect_collection_entries(
     } else {
         Vec::new()
     };
+    let path_label = base_path.join(" / ");
 
     for req in &collection.requests {
-        let mut subtitle_parts = base_path.clone();
-        if !req.url.trim().is_empty() {
-            subtitle_parts.push(req.url.clone());
-        }
-        let subtitle = if subtitle_parts.is_empty() {
-            None
-        } else {
-            Some(SharedString::from(subtitle_parts.join(" · ")))
-        };
-        let active = selected_id == Some(req.id.as_str());
-        let open_hint = if open_tabs.contains(&req.id) {
-            "open"
-        } else {
-            ""
-        };
-        let search_text = format!(
-            "{} {} {} {} {} request",
-            req.method,
-            req.name,
-            req.url,
-            base_path.join(" / "),
-            open_hint
-        );
-        out.push(PaletteEntry {
-            section: PaletteSection::Requests,
-            title: req.name.clone().into(),
-            subtitle,
-            method: Some(req.method.clone().into()),
-            icon: "icons/globe.svg",
-            active,
-            search_text,
-            target: PaletteTarget::Request { id: req.id.clone() },
-        });
+        push_request_entry(req, &path_label, selected_id, open_tabs, out);
     }
 
     for folder in &collection.folders {
@@ -348,30 +352,7 @@ fn collect_folder_entries(
     let path_label = next_names.join(" / ");
 
     for req in &folder.requests {
-        let subtitle = if req.url.trim().is_empty() {
-            path_label.clone()
-        } else {
-            format!("{path_label} · {}", req.url)
-        };
-        let active = selected_id == Some(req.id.as_str());
-        let open_hint = if open_tabs.contains(&req.id) {
-            "open"
-        } else {
-            ""
-        };
-        out.push(PaletteEntry {
-            section: PaletteSection::Requests,
-            title: req.name.clone().into(),
-            subtitle: Some(subtitle.into()),
-            method: Some(req.method.clone().into()),
-            icon: "icons/globe.svg",
-            active,
-            search_text: format!(
-                "{} {} {} {} {} request",
-                req.method, req.name, req.url, path_label, open_hint
-            ),
-            target: PaletteTarget::Request { id: req.id.clone() },
-        });
+        push_request_entry(req, &path_label, selected_id, open_tabs, out);
     }
 
     let mut next_ids = ancestor_ids.to_vec();
@@ -516,7 +497,7 @@ pub(super) fn filter_catalog<'a>(
         .collect()
 }
 
-pub fn execute_palette_target(
+pub(super) fn execute_palette_target(
     target: PaletteTarget,
     workspace: &WeakEntity<WorkspaceView>,
     window: &mut Window,
@@ -583,9 +564,9 @@ pub fn execute_palette_target(
 }
 
 pub struct CommandPaletteView {
-    pub(super) command: Entity<CommandState>,
+    command: Entity<CommandState>,
     pub(super) catalog: Vec<PaletteEntry>,
-    pub(super) query: String,
+    query: String,
     visible_targets: Vec<Vec<PaletteTarget>>,
     workspace: WeakEntity<WorkspaceView>,
 }
@@ -608,7 +589,7 @@ impl CommandPaletteView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+    pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.command.focus_handle(cx).focus(window, cx);
     }
 

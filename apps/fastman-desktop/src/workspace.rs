@@ -1,6 +1,8 @@
 use crate::command_palette::CommandPaletteView;
+use crate::import_view::CurlImportConfirmView;
 use crate::kv_editor::{KvTable, render_kv_table};
-use crate::response_view::{ResponseCacheEntry, ResponsePosition, UiSettings};
+use crate::request_editor::{AuthKind, BodyKind, KvTableKind};
+use crate::response_view::{ResponseCache, ResponseCacheEntry, ResponsePosition, UiSettings};
 use crate::theme::{count_pill, svg_icon};
 use crate::{
     CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenCommandPalette, OpenImport,
@@ -8,50 +10,29 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use fastman_core::{
-    ApiRequest, Auth, Collection, Folder, HttpBody, HttpEngine, Project, ProjectStore, Workspace,
-    curl, import,
-    security::{
-        SensitiveFieldFinding, collect_sensitive_request_findings, sanitize_request_credentials,
-        summarize_sensitive_findings,
-    },
+    ApiRequest, Auth, Folder, HttpBody, HttpEngine, Project, ProjectStore, Workspace, curl,
 };
 use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Sizable as _, Theme, ThemeMode, WindowExt as _,
-    alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::{DialogButtonProps, DialogEntrance},
-    input::{
-        EditorState, InlineToken, Input, InputContent, InputEvent, InputState, Textarea,
-        TextareaState,
-    },
+    input::{EditorState, InlineToken, Input, InputContent, InputEvent, InputState},
     kbd::Kbd,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
     select::{SearchableVec, SelectEvent, SelectItem, SelectState},
-    tab::{Tab, TabBar},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
 
-const MAX_CACHED_RESPONSES: usize = 16;
-const MAX_TOTAL_CACHE_BYTES: usize = 24 * 1024 * 1024;
-
 pub(super) const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-pub(super) const AUTH_TYPES: &[&str] = &[
-    "No Auth",
-    "Basic Auth",
-    "Bearer Token",
-    "API Key (Header)",
-    "API Key (Query)",
-];
-pub(super) const BODY_TYPES: &[&str] = &["None", "JSON", "Text", "Form URL Encoded"];
 
 #[derive(Clone)]
 pub(super) struct ProjectChoice {
@@ -89,7 +70,7 @@ pub(super) enum NameDialogKind {
     RenameCollection(String),
 }
 
-pub struct VariablesSheetView {
+struct VariablesSheetView {
     table: KvTable,
 }
 
@@ -158,244 +139,6 @@ impl Render for VariablesSheetView {
     }
 }
 
-pub enum PendingSensitiveImport {
-    Collection(import::ImportReport),
-    Curl(curl::CurlParseReport, Vec<SensitiveFieldFinding>),
-}
-
-fn render_unsupported_curl_flags_alert(id: &'static str, flags: &[String]) -> Alert {
-    Alert::warning(
-        id,
-        format!(
-            "Ignored unsupported flag(s): {}. Fastman cannot emulate these options, so the imported HTTP method, headers, or body may differ from cURL.",
-            flags.join(", ")
-        ),
-    )
-    .title("Unsupported cURL Flags")
-}
-
-fn render_sensitive_choice_panel<V: 'static>(
-    id_prefix: &'static str,
-    source_label: &str,
-    count: usize,
-    summary: &str,
-    choice: usize,
-    on_select: impl Fn(&mut V, usize, &mut Context<V>) + 'static,
-    cx: &mut Context<V>,
-) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(
-            Alert::warning(
-                format!("{id_prefix}-warning"),
-                format!(
-                    "{source_label} contains {count} sensitive field(s): {summary}. Custom headers, query params, and URLs are persisted in plaintext project JSON, while Auth tab fields remain session-only."
-                ),
-            )
-            .title("Plaintext Credential Risk"),
-        )
-        .child(
-            TabBar::new(format!("{id_prefix}-choice"))
-                .segmented()
-                .small()
-                .selected_index(choice)
-                .on_click(cx.listener(move |view, idx, _, cx| {
-                    on_select(view, *idx, cx);
-                }))
-                .child(Tab::new().label("Move / Strip Secrets (Safe)"))
-                .child(Tab::new().label("Keep in Plaintext JSON")),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(cx.theme().muted_foreground)
-                .child(if choice == 0 {
-                    "Recognized Bearer, Basic, and API key fields move to session-only Auth (not saved to disk); remaining cookies/custom secrets are stripped."
-                } else {
-                    "All imported headers, query params, and URLs will be saved in plaintext to project.json."
-                }),
-        )
-}
-
-pub struct CurlImportConfirmView {
-    pub(super) report: curl::CurlParseReport,
-    pub(super) replace_summary: Option<String>,
-    pub(super) findings_count: usize,
-    pub(super) findings_summary: String,
-    pub(super) choice: usize,
-}
-
-impl Render for CurlImportConfirmView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div().flex().flex_col().gap_3();
-        if let Some(replace_summary) = &self.replace_summary {
-            root = root.child(
-                Alert::warning("curl-paste-replace-warning", replace_summary.clone())
-                    .title("Replace Current Request?"),
-            );
-        }
-        if !self.report.unsupported_flags.is_empty() {
-            root = root.child(render_unsupported_curl_flags_alert(
-                "curl-paste-unsupported-flags",
-                &self.report.unsupported_flags,
-            ));
-        }
-        if self.findings_count > 0 {
-            root = root.child(render_sensitive_choice_panel(
-                "curl-paste-sensitive",
-                "This cURL command",
-                self.findings_count,
-                &self.findings_summary,
-                self.choice,
-                |view, idx, cx| {
-                    view.choice = idx;
-                    cx.notify();
-                },
-                cx,
-            ));
-        }
-        root
-    }
-}
-
-pub struct ImportDialogView {
-    pub mode: usize,
-    pub input: Entity<TextareaState>,
-    pub error: Option<String>,
-    pub pending_sensitive: Option<PendingSensitiveImport>,
-    pub sensitive_choice: usize,
-}
-
-impl ImportDialogView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(10)
-                .placeholder("Paste Collection v2.1 JSON...")
-        });
-        Self {
-            mode: 0,
-            input,
-            error: None,
-            pending_sensitive: None,
-            sensitive_choice: 0,
-        }
-    }
-}
-
-impl Render for ImportDialogView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(pending) = &self.pending_sensitive {
-            match pending {
-                PendingSensitiveImport::Collection(report) => {
-                    return render_sensitive_choice_panel(
-                        "sensitive-import",
-                        "This collection",
-                        report.sensitive_fields.len(),
-                        &summarize_sensitive_findings(&report.sensitive_fields),
-                        self.sensitive_choice,
-                        |view, idx, cx| {
-                            view.sensitive_choice = idx;
-                            cx.notify();
-                        },
-                        cx,
-                    )
-                    .when_some(self.error.as_ref(), |el, err| {
-                        el.child(Alert::error("import-error", err.clone()).title("Import failed"))
-                    });
-                }
-                PendingSensitiveImport::Curl(report, findings) => {
-                    return div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .when(!report.unsupported_flags.is_empty(), |el| {
-                            el.child(render_unsupported_curl_flags_alert(
-                                "import-curl-unsupported-flags",
-                                &report.unsupported_flags,
-                            ))
-                        })
-                        .when(!findings.is_empty(), |el| {
-                            el.child(render_sensitive_choice_panel(
-                                "sensitive-import",
-                                "This cURL command",
-                                findings.len(),
-                                &summarize_sensitive_findings(findings),
-                                self.sensitive_choice,
-                                |view, idx, cx| {
-                                    view.sensitive_choice = idx;
-                                    cx.notify();
-                                },
-                                cx,
-                            ))
-                        })
-                        .when_some(self.error.as_ref(), |el, err| {
-                            el.child(
-                                Alert::error("import-error", err.clone()).title("Import failed"),
-                            )
-                        });
-                }
-            }
-        }
-
-        let placeholder = if self.mode == 0 {
-            "Paste Collection v2.1 JSON..."
-        } else {
-            "Paste a cURL command..."
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                TabBar::new("import-mode")
-                    .segmented()
-                    .small()
-                    .selected_index(self.mode)
-                    .on_click(cx.listener(|view, idx, window, cx| {
-                        view.mode = *idx;
-                        view.error = None;
-                        view.input.update(cx, |state, cx| {
-                            state.set_placeholder(
-                                if *idx == 0 {
-                                    "Paste Collection v2.1 JSON..."
-                                } else {
-                                    "Paste a cURL command..."
-                                },
-                                window,
-                                cx,
-                            );
-                        });
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label("Collection v2.1 JSON"))
-                    .child(Tab::new().label("cURL Command")),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if self.mode == 0 {
-                        "Creates a new local project from the collection. Scripts stay inert; sensitive headers prompt before saving."
-                    } else {
-                        "Imports method, URL, query params, headers, auth, and body. Sensitive headers prompt before saving."
-                    }),
-            )
-            .child(
-                Textarea::new(&self.input)
-                    .h(px(210.))
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(px(12.))
-                    .aria_label(placeholder),
-            )
-            .when_some(self.error.as_ref(), |el, err| {
-                el.child(Alert::error("import-error", err.clone()).title("Import failed"))
-            })
-    }
-}
-
 /// Retained window state: project model + editor entities + request lifecycle.
 pub struct WorkspaceView {
     pub(super) focus_handle: FocusHandle,
@@ -413,10 +156,10 @@ pub struct WorkspaceView {
     pub(super) expanded: HashSet<String>,
     pub(super) target_folder: Option<String>,
     pub(super) dirty: bool,
-    suppress_dirty: bool,
+    pub(super) suppress_dirty: bool,
     pub(super) method: String,
-    pub(super) body_kind: usize,
-    pub(super) auth_kind: usize,
+    pub(super) body_kind: BodyKind,
+    pub(super) auth_kind: AuthKind,
     pub(super) section: usize,
     pub(super) url: Entity<InputState>,
     pub(super) request_name: Entity<InputState>,
@@ -436,8 +179,7 @@ pub struct WorkspaceView {
     pub(super) in_flight_request_id: Option<String>,
     pub(super) pending_abort: Option<AbortHandle>,
     pub(super) pending: Option<Task<()>>,
-    pub(super) responses: HashMap<String, ResponseCacheEntry>,
-    pub(super) response_order: VecDeque<String>,
+    pub(super) responses: ResponseCache,
     pub(super) cached_request_count: usize,
     pub(super) params_active_count: usize,
     pub(super) headers_active_count: usize,
@@ -634,8 +376,8 @@ impl WorkspaceView {
             dirty: false,
             suppress_dirty: false,
             method: "GET".into(),
-            body_kind: 0,
-            auth_kind: 0,
+            body_kind: BodyKind::None,
+            auth_kind: AuthKind::None,
             section: 0,
             url,
             request_name,
@@ -655,8 +397,7 @@ impl WorkspaceView {
             in_flight_request_id: None,
             pending_abort: None,
             pending: None,
-            responses: HashMap::new(),
-            response_order: VecDeque::new(),
+            responses: ResponseCache::default(),
             cached_request_count: 0,
             params_active_count: 0,
             headers_active_count: 0,
@@ -755,7 +496,7 @@ impl WorkspaceView {
     }
 
     pub(super) fn refresh_body_json_valid(&mut self, cx: &App) {
-        if self.body_kind != 1 {
+        if self.body_kind != BodyKind::Json {
             self.body_json_valid = true;
             return;
         }
@@ -799,26 +540,26 @@ impl WorkspaceView {
         self.cookies_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
+    fn kv_table_mut(&mut self, table_kind: KvTableKind) -> &mut KvTable {
+        match table_kind {
+            KvTableKind::Params => &mut self.params_table,
+            KvTableKind::Headers => &mut self.headers_table,
+            KvTableKind::Form => &mut self.form_table,
+        }
+    }
+
     fn kv_change_handler(
-        table_kind: usize,
+        table_kind: KvTableKind,
     ) -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
         move |view, window, cx| {
             if view.suppress_dirty {
                 return;
             }
-            match table_kind {
-                0 => {
-                    view.params_table
-                        .ensure_trailing_blank(window, cx, Self::kv_change_handler(0))
-                }
-                1 => {
-                    view.headers_table
-                        .ensure_trailing_blank(window, cx, Self::kv_change_handler(1))
-                }
-                _ => view
-                    .form_table
-                    .ensure_trailing_blank(window, cx, Self::kv_change_handler(2)),
-            }
+            view.kv_table_mut(table_kind).ensure_trailing_blank(
+                window,
+                cx,
+                Self::kv_change_handler(table_kind),
+            );
             view.refresh_kv_counts(cx);
             view.mark_dirty(cx);
         }
@@ -826,43 +567,29 @@ impl WorkspaceView {
 
     pub(super) fn add_kv_row(
         &mut self,
-        table_kind: usize,
+        table_kind: KvTableKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match table_kind {
-            0 => self
-                .params_table
-                .add_row(window, cx, Self::kv_change_handler(0)),
-            1 => self
-                .headers_table
-                .add_row(window, cx, Self::kv_change_handler(1)),
-            _ => self
-                .form_table
-                .add_row(window, cx, Self::kv_change_handler(2)),
-        }
+        self.kv_table_mut(table_kind)
+            .add_row(window, cx, Self::kv_change_handler(table_kind));
         self.refresh_kv_counts(cx);
         cx.notify();
     }
 
     pub(super) fn remove_kv_row(
         &mut self,
-        table_kind: usize,
+        table_kind: KvTableKind,
         idx: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match table_kind {
-            0 => self
-                .params_table
-                .remove_row(idx, window, cx, Self::kv_change_handler(0)),
-            1 => self
-                .headers_table
-                .remove_row(idx, window, cx, Self::kv_change_handler(1)),
-            _ => self
-                .form_table
-                .remove_row(idx, window, cx, Self::kv_change_handler(2)),
-        }
+        self.kv_table_mut(table_kind).remove_row(
+            idx,
+            window,
+            cx,
+            Self::kv_change_handler(table_kind),
+        );
         self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
     }
@@ -874,8 +601,13 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.headers_table
-            .append_pair(key, value, window, cx, Self::kv_change_handler(1));
+        self.headers_table.append_pair(
+            key,
+            value,
+            window,
+            cx,
+            Self::kv_change_handler(KvTableKind::Headers),
+        );
         self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
     }
@@ -888,8 +620,13 @@ impl WorkspaceView {
         let query = query.split('#').next().unwrap_or(query);
         for part in query.split('&').filter(|s| !s.is_empty()) {
             let (k, v) = part.split_once('=').unwrap_or((part, ""));
-            self.params_table
-                .append_pair(k, v, window, cx, Self::kv_change_handler(0));
+            self.params_table.append_pair(
+                k,
+                v,
+                window,
+                cx,
+                Self::kv_change_handler(KvTableKind::Params),
+            );
         }
         self.suppress_dirty = true;
         self.last_url = base.to_owned();
@@ -928,14 +665,13 @@ impl WorkspaceView {
             }
         }
         self.expanded.clear();
-        let collections = self.current().collections.clone();
-        for collection in &collections {
+        for collection in &self.projects[self.active_project].collections {
             self.expanded.insert(collection.id.clone());
             expand_folders(&collection.folders, &mut self.expanded);
         }
     }
 
-    fn set_input(
+    pub(super) fn set_input(
         state: &Entity<InputState>,
         value: impl Into<String>,
         window: &mut Window,
@@ -966,7 +702,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn populate_editor_from_request(
+    pub(super) fn populate_editor_from_request(
         &mut self,
         request: ApiRequest,
         preserve_existing_name: bool,
@@ -983,44 +719,50 @@ impl WorkspaceView {
         }
         self.last_url = request.url.clone();
         Self::set_input(&self.url, request.url, window, cx);
-        self.params_table
-            .load(&request.params, window, cx, Self::kv_change_handler(0));
-        self.headers_table
-            .load(&request.headers, window, cx, Self::kv_change_handler(1));
+        self.params_table.load(
+            &request.params,
+            window,
+            cx,
+            Self::kv_change_handler(KvTableKind::Params),
+        );
+        self.headers_table.load(
+            &request.headers,
+            window,
+            cx,
+            Self::kv_change_handler(KvTableKind::Headers),
+        );
         match request.body {
             HttpBody::None => {
-                self.body_kind = 0;
+                self.body_kind = BodyKind::None;
                 Self::set_editor(&self.body_editor, "", window, cx);
                 self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(2));
+                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
             }
             HttpBody::Json(text) => {
-                self.body_kind = 1;
+                self.body_kind = BodyKind::Json;
                 Self::set_editor(&self.body_editor, text, window, cx);
                 self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(2));
+                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
             }
             HttpBody::Text(text) => {
-                self.body_kind = 2;
+                self.body_kind = BodyKind::Text;
                 Self::set_editor(&self.body_editor, text, window, cx);
                 self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(2));
+                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
             }
             HttpBody::FormUrlEncoded(pairs) => {
-                self.body_kind = 3;
+                self.body_kind = BodyKind::FormUrlEncoded;
                 Self::set_editor(&self.body_editor, "", window, cx);
-                self.form_table
-                    .load(&pairs, window, cx, Self::kv_change_handler(2));
+                self.form_table.load(
+                    &pairs,
+                    window,
+                    cx,
+                    Self::kv_change_handler(KvTableKind::Form),
+                );
             }
         };
         Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
-        self.auth_kind = match &request.auth {
-            Auth::None => 0,
-            Auth::Basic { .. } => 1,
-            Auth::Bearer { .. } => 2,
-            Auth::ApiKeyHeader { .. } => 3,
-            Auth::ApiKeyQuery { .. } => 4,
-        };
+        self.auth_kind = AuthKind::from_auth(&request.auth);
         for field in [
             &self.auth_user,
             &self.auth_password,
@@ -1044,261 +786,6 @@ impl WorkspaceView {
         }
     }
 
-    pub(super) fn parse_url_bar_curl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let raw = self.url.read(cx).value().to_string();
-        let saved = self.current_request().cloned();
-        let prior_url = saved.as_ref().map(|r| r.url.clone()).unwrap_or_default();
-        let non_url_dirty = saved.as_ref().map_or_else(
-            || {
-                self.method != "GET"
-                    || !self.params_table.to_key_values(cx).is_empty()
-                    || !self.headers_table.to_key_values(cx).is_empty()
-                    || self.body_kind != 0
-                    || self.auth_kind != 0
-                    || self.timeout.read(cx).value().trim() != "30000"
-            },
-            |req| self.non_url_draft_differs_from_saved(req, cx),
-        );
-        self.try_apply_curl_from_url_bar(&raw, prior_url, non_url_dirty, window, cx);
-    }
-
-    fn non_url_draft_differs_from_saved(&self, saved: &ApiRequest, cx: &App) -> bool {
-        let snap = self.snapshot_draft_request(cx);
-        snap.name != saved.name.trim()
-            || snap.method != saved.method
-            || snap.params != saved.params
-            || snap.headers != saved.headers
-            || snap.body != saved.body
-            || snap.auth != saved.auth
-            || self.timeout.read(cx).value().trim() != saved.timeout_ms.to_string()
-    }
-
-    fn restore_url_state(
-        &mut self,
-        prior_url: String,
-        prior_dirty: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.suppress_dirty = true;
-        self.last_url = prior_url.clone();
-        Self::set_input(&self.url, prior_url, window, cx);
-        self.suppress_dirty = false;
-        self.dirty = prior_dirty;
-        self.refresh_template_inspection(cx);
-        cx.notify();
-    }
-
-    fn describe_draft_replacement(
-        &self,
-        prior_url: &str,
-        prior_dirty: bool,
-        cx: &App,
-    ) -> Option<String> {
-        let mut items = Vec::new();
-        if prior_dirty {
-            items.push("unsaved edits");
-        }
-        if !prior_url.trim().is_empty() {
-            items.push("URL");
-        }
-        if self.method != "GET" {
-            items.push("method");
-        }
-        if !self.params_table.to_key_values(cx).is_empty() {
-            items.push("query params");
-        }
-        if !self.headers_table.to_key_values(cx).is_empty() {
-            items.push("headers");
-        }
-        if self.body_kind != 0 {
-            items.push("body");
-        }
-        if self.auth_kind != 0 {
-            items.push("auth");
-        }
-        if self.timeout.read(cx).value().trim() != "30000" {
-            items.push("timeout");
-        }
-        (!items.is_empty()).then(|| {
-            format!(
-                "Applying this cURL command will overwrite your current request ({}).",
-                items.join(", ")
-            )
-        })
-    }
-
-    fn apply_curl_request_to_editor(
-        &mut self,
-        parsed: ApiRequest,
-        notice: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_curl_confirm = None;
-        let method = parsed.method.clone();
-        let url = parsed.url.clone();
-        let has_session_auth = !matches!(parsed.auth, Auth::None);
-        self.editing_request_name = false;
-        self.suppress_dirty = true;
-        self.populate_editor_from_request(parsed, true, window, cx);
-        self.suppress_dirty = false;
-        self.refresh_kv_counts(cx);
-        self.refresh_body_json_valid(cx);
-        self.mark_dirty(cx);
-
-        let msg = notice.unwrap_or_else(|| {
-            if has_session_auth {
-                format!("Parsed cURL into request: {method} {url} (Auth kept session-only)")
-            } else {
-                format!("Parsed cURL into request: {method} {url}")
-            }
-        });
-        self.set_status(msg.clone(), false, cx);
-        window.push_notification(Notification::success(msg), cx);
-    }
-
-    fn apply_confirmed_curl_view(
-        &mut self,
-        confirm_view: &Entity<CurlImportConfirmView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (mut req, has_findings, choice, unsupported) = {
-            let state = confirm_view.read(cx);
-            (
-                state.report.request.clone(),
-                state.findings_count > 0,
-                state.choice,
-                state.report.unsupported_flags.clone(),
-            )
-        };
-        let summary = (has_findings && choice == 0).then(|| sanitize_request_credentials(&mut req));
-        let notice = Self::format_curl_apply_notice(&req, summary, &unsupported);
-        self.apply_curl_request_to_editor(req, Some(notice), window, cx);
-    }
-
-    fn format_curl_apply_notice(
-        req: &ApiRequest,
-        summary: Option<fastman_core::security::SanitizeSummary>,
-        unsupported: &[String],
-    ) -> String {
-        let mut msg = match summary {
-            Some(s) => format!(
-                "Parsed cURL into request (moved {} to session Auth, stripped {})",
-                s.moved_to_session_auth, s.stripped_fields
-            ),
-            None if !matches!(req.auth, Auth::None) => format!(
-                "Parsed cURL into request: {} {} (Auth kept session-only)",
-                req.method, req.url
-            ),
-            None => format!("Parsed cURL into request: {} {}", req.method, req.url),
-        };
-        if !unsupported.is_empty() {
-            msg.push_str(&format!(" · ignored flags: {}", unsupported.join(", ")));
-        }
-        msg
-    }
-
-    fn open_curl_import_confirm_dialog(
-        &mut self,
-        report: curl::CurlParseReport,
-        replace_summary: Option<String>,
-        findings: Vec<SensitiveFieldFinding>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let title = if !findings.is_empty() {
-            "Confirm Sensitive Credential Handling"
-        } else if replace_summary.is_some() {
-            "Replace Current Request?"
-        } else {
-            "Confirm cURL Import"
-        };
-        let ok_text = if replace_summary.is_some() {
-            "Replace Request"
-        } else {
-            "Apply cURL"
-        };
-        let confirm_view = cx.new(|_| CurlImportConfirmView {
-            report,
-            replace_summary,
-            findings_count: findings.len(),
-            findings_summary: summarize_sensitive_findings(&findings),
-            choice: 0,
-        });
-        self.active_curl_confirm = Some(confirm_view.downgrade());
-        let weak_workspace = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let confirm_ok = confirm_view.clone();
-            let weak_ok = weak_workspace.clone();
-            dialog
-                .w(px(580.))
-                .title(title)
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(ok_text)
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let _ = weak_ok.update(cx, |view, cx| {
-                        view.apply_confirmed_curl_view(&confirm_ok, window, cx);
-                    });
-                    true
-                })
-                .child(confirm_view.clone())
-        });
-    }
-
-    fn try_apply_curl_from_url_bar(
-        &mut self,
-        raw: &str,
-        prior_url: String,
-        prior_dirty: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if raw.len() > curl::MAX_CURL_IMPORT_BYTES {
-            self.restore_url_state(prior_url, prior_dirty, window, cx);
-            let msg = format!(
-                "cURL command exceeds maximum size ({} bytes).",
-                curl::MAX_CURL_IMPORT_BYTES
-            );
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
-            return;
-        }
-        let replace_summary = self.describe_draft_replacement(&prior_url, prior_dirty, cx);
-        match curl::parse_curl_report(raw) {
-            Ok(report) => {
-                let mut findings = Vec::new();
-                collect_sensitive_request_findings(&report.request, &mut findings);
-                if replace_summary.is_some()
-                    || !findings.is_empty()
-                    || !report.unsupported_flags.is_empty()
-                {
-                    // Never stage raw pasted cURL commands/secrets inside the editable draft.
-                    self.restore_url_state(prior_url, prior_dirty, window, cx);
-                    self.open_curl_import_confirm_dialog(
-                        report,
-                        replace_summary,
-                        findings,
-                        window,
-                        cx,
-                    );
-                } else {
-                    self.apply_curl_request_to_editor(report.request, None, window, cx);
-                }
-            }
-            Err(err) => {
-                self.restore_url_state(prior_url, prior_dirty, window, cx);
-                let msg = format!("cURL parse failed: {err:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
-        }
-    }
-
     fn load_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_curl_confirm = None;
         self.editing_request_name = false;
@@ -1308,8 +795,8 @@ impl WorkspaceView {
             self.populate_editor_from_request(request, false, window, cx);
         } else {
             self.method = "GET".into();
-            self.auth_kind = 0;
-            self.body_kind = 0;
+            self.auth_kind = AuthKind::None;
+            self.body_kind = BodyKind::None;
             self.last_url.clear();
             for field in [
                 &self.url,
@@ -1323,12 +810,20 @@ impl WorkspaceView {
                 Self::set_input(field, "", window, cx);
             }
             Self::set_editor(&self.body_editor, "", window, cx);
-            self.params_table
-                .load(&[], window, cx, Self::kv_change_handler(0));
-            self.headers_table
-                .load(&[], window, cx, Self::kv_change_handler(1));
+            self.params_table.load(
+                &[],
+                window,
+                cx,
+                Self::kv_change_handler(KvTableKind::Params),
+            );
+            self.headers_table.load(
+                &[],
+                window,
+                cx,
+                Self::kv_change_handler(KvTableKind::Headers),
+            );
             self.form_table
-                .load(&[], window, cx, Self::kv_change_handler(2));
+                .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
             Self::set_input(&self.timeout, "30000", window, cx);
         }
         self.suppress_dirty = false;
@@ -1341,7 +836,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn apply_editor(&mut self, cx: &mut Context<Self>) -> Result<()> {
+    pub(super) fn apply_editor(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let Some(id) = self.selected_id.as_deref() else {
             return Ok(());
         };
@@ -1367,30 +862,10 @@ impl WorkspaceView {
         self.save(cx)
     }
 
-    fn cache_response(&mut self, request_id: String, entry: ResponseCacheEntry) {
-        self.response_order.retain(|id| id != &request_id);
-        self.response_order.push_back(request_id.clone());
-        self.responses.insert(request_id, entry);
-
-        let mut total_bytes: usize = self.responses.values().map(|e| e.approx_bytes).sum();
-        while (self.responses.len() > MAX_CACHED_RESPONSES || total_bytes > MAX_TOTAL_CACHE_BYTES)
-            && self.responses.len() > 1
-        {
-            let Some(oldest_id) = self.response_order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = self.responses.remove(&oldest_id) {
-                total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
-            }
-        }
-    }
-
     fn prune_responses_to_current_project(&mut self) {
-        let current = self.current().clone();
+        let current = &self.projects[self.active_project];
         self.responses
-            .retain(|id, _| current.find_request(id).is_some());
-        self.response_order
-            .retain(|id| self.responses.contains_key(id));
+            .retain(|id| current.find_request(id).is_some());
     }
 
     pub(super) fn save_with_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1538,7 +1013,6 @@ impl WorkspaceView {
             Ok((store, projects, warnings)) => {
                 self.cancel(cx);
                 self.responses.clear();
-                self.response_order.clear();
                 self.store = store;
                 self.projects = projects;
                 self.active_workspace = index;
@@ -1575,45 +1049,23 @@ impl WorkspaceView {
     }
 
     pub(super) fn add_folder(&mut self, cx: &mut Context<Self>) {
-        let folder = Folder::new("New Folder");
-        let id = folder.id.clone();
-        if let Some(target) = self.target_folder.clone()
-            && self.projects[self.active_project].add_subfolder(&target, folder.clone())
-        {
-            self.expanded.insert(target);
-            self.expanded.insert(id.clone());
-            self.target_folder = Some(id);
-            if let Err(err) = self.save(cx) {
-                self.set_status(format!("Save failed: {err:#}"), true, cx);
-            }
-            return;
-        }
-        if self.projects[self.active_project].collections.is_empty() {
-            self.projects[self.active_project]
-                .collections
-                .push(Collection::new("Default Collection"));
-        }
-        if let Some(collection) = self.projects[self.active_project].collections.first_mut() {
-            collection.folders.push(folder);
-            self.expanded.insert(collection.id.clone());
-            self.expanded.insert(id.clone());
-            self.target_folder = Some(id);
-            if let Err(err) = self.save(cx) {
-                self.set_status(format!("Save failed: {err:#}"), true, cx);
-            }
-        }
+        let parent = self.target_folder.clone();
+        self.insert_folder_at(parent.as_deref(), cx);
     }
 
     pub(super) fn add_subfolder(&mut self, parent_id: &str, cx: &mut Context<Self>) {
+        self.insert_folder_at(Some(parent_id), cx);
+    }
+
+    fn insert_folder_at(&mut self, parent_id: Option<&str>, cx: &mut Context<Self>) {
         let folder = Folder::new("New Folder");
         let id = folder.id.clone();
-        if self.projects[self.active_project].add_subfolder(parent_id, folder) {
-            self.expanded.insert(parent_id.to_owned());
-            self.expanded.insert(id.clone());
-            self.target_folder = Some(id);
-            if let Err(err) = self.save(cx) {
-                self.set_status(format!("Save failed: {err:#}"), true, cx);
-            }
+        let container_id = self.projects[self.active_project].insert_folder(parent_id, folder);
+        self.expanded.insert(container_id);
+        self.expanded.insert(id.clone());
+        self.target_folder = Some(id);
+        if let Err(err) = self.save(cx) {
+            self.set_status(format!("Save failed: {err:#}"), true, cx);
         }
     }
 
@@ -1622,7 +1074,7 @@ impl WorkspaceView {
         self.insert_and_open_request(request, window, cx);
     }
 
-    fn insert_and_open_request(
+    pub(super) fn insert_and_open_request(
         &mut self,
         request: ApiRequest,
         window: &mut Window,
@@ -1635,28 +1087,9 @@ impl WorkspaceView {
             return;
         }
         let id = request.id.clone();
-        let mut pending = Some(request);
-        if let Some(target) = self.target_folder.as_deref() {
-            for collection in &mut self.projects[self.active_project].collections {
-                if let Some(folder) = collection.find_folder_mut(target)
-                    && let Some(req) = pending.take()
-                {
-                    folder.requests.push(req);
-                    self.expanded.insert(target.to_owned());
-                    break;
-                }
-            }
-        }
-        if let Some(req) = pending {
-            if self.projects[self.active_project].collections.is_empty() {
-                self.projects[self.active_project]
-                    .collections
-                    .push(Collection::new("Default Collection"));
-            }
-            let coll = &mut self.projects[self.active_project].collections[0];
-            self.expanded.insert(coll.id.clone());
-            coll.requests.push(req);
-        }
+        let container_id = self.projects[self.active_project]
+            .insert_request(self.target_folder.as_deref(), request);
+        self.expanded.insert(container_id);
         self.refresh_request_count();
         match self.store.save(self.current()) {
             Ok(()) => self.open_request(id, window, cx),
@@ -1802,26 +1235,6 @@ impl WorkspaceView {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn move_request_to_target(
-        &mut self,
-        request_id: &str,
-        target_request_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.apply_editor_for_tree_move(window, cx) {
-            return;
-        }
-        if self.projects[self.active_project].move_request_to_target(request_id, target_request_id)
-        {
-            if let Some(folder_id) = self.current().request_parent_folder(target_request_id) {
-                self.expanded.insert(folder_id);
-            }
-            self.persist_tree_change("Request moved", window, cx);
-        }
-    }
-
     pub(super) fn move_folder_offset(
         &mut self,
         folder_id: &str,
@@ -1914,93 +1327,6 @@ impl WorkspaceView {
             }
             self.persist_tree_change("Folder moved", window, cx);
         }
-    }
-
-    pub(super) fn copy_request_as_curl(
-        &mut self,
-        target_id: Option<&str>,
-        force_full: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if (target_id.is_none() || target_id == self.selected_id.as_deref())
-            && let Err(error) = self.apply_editor(cx)
-        {
-            let msg = format!("Cannot export cURL: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
-            return;
-        }
-        let lookup_id = target_id.or(self.selected_id.as_deref());
-        let Some(req) = lookup_id.and_then(|id| self.current().find_request(id)) else {
-            return;
-        };
-        let export = match curl::to_curl_export(req, &self.current().variables, !force_full) {
-            Ok(export) => export,
-            Err(error) => {
-                let msg = format!("Cannot export cURL: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-                return;
-            }
-        };
-        if !force_full {
-            cx.write_to_clipboard(ClipboardItem::new_string(export.command));
-            if export.had_secrets || export.had_variables {
-                self.set_status("Copied redacted cURL to clipboard", false, cx);
-                window.push_notification(
-                    Notification::warning(
-                        "Copied redacted cURL (secrets & variables hidden). Use 'Copy Full cURL' to include credentials.",
-                    ),
-                    cx,
-                );
-            } else {
-                self.set_status("Copied cURL command to clipboard", false, cx);
-                window.push_notification(Notification::success("Copied as cURL command"), cx);
-            }
-            return;
-        }
-
-        if !export.had_secrets && !export.had_variables {
-            cx.write_to_clipboard(ClipboardItem::new_string(export.command));
-            self.set_status("Copied cURL command to clipboard", false, cx);
-            window.push_notification(Notification::success("Copied as cURL command"), cx);
-            return;
-        }
-
-        let full_cmd = export.command;
-        let weak_view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let cmd = full_cmd.clone();
-            let weak_ok = weak_view.clone();
-            dialog
-                .w(px(460.))
-                .title("Clipboard Security Warning")
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Copy Full cURL")
-                        .ok_variant(ButtonVariant::Danger)
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
-                    let _ = weak_ok.update(cx, |view, cx| {
-                        view.set_status("Copied full cURL (with credentials) to clipboard", false, cx);
-                    });
-                    window.push_notification(
-                        Notification::warning("Full cURL with credentials copied to clipboard"),
-                        cx,
-                    );
-                    true
-                })
-                .child(
-                    Alert::warning(
-                        "curl-clipboard-warning",
-                        "This command includes plaintext authentication headers, keys, or expanded project variables. Clipboard managers and other local apps may retain or read it.",
-                    )
-                    .title("Copy unredacted credentials to clipboard?"),
-                )
-        });
     }
 
     pub(super) fn open_name_dialog(
@@ -2107,18 +1433,7 @@ impl WorkspaceView {
                             }
                             match view.store.create(&value) {
                                 Ok(project) => {
-                                    view.projects.push(project);
-                                    let last = view.projects.len() - 1;
-                                    let choices = project_choices(&view.projects);
-                                    view.project_selector.update(cx, |sel, cx| {
-                                        sel.set_items(choices, window, cx);
-                                        sel.set_selected_index(
-                                            Some(IndexPath::default().row(last)),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    view.switch_project(last, window, cx);
+                                    view.push_and_select_project(project, window, cx);
                                     window.push_notification(
                                         Notification::success(format!("Project '{value}' created")),
                                         cx,
@@ -2220,7 +1535,6 @@ impl WorkspaceView {
         }
         if self.projects[self.active_project].delete_request(id) {
             self.responses.remove(id);
-            self.response_order.retain(|item| item != id);
             self.open_tabs.retain(|tab| tab != id);
             self.refresh_request_count();
             if self.selected_id.as_deref() == Some(id) {
@@ -2301,20 +1615,21 @@ impl WorkspaceView {
             self.target_folder = None;
         }
         self.prune_responses_to_current_project();
-        let current = self.current().clone();
-        self.open_tabs
-            .retain(|tab| current.find_request(tab).is_some());
-        if self
-            .selected_id
-            .as_deref()
-            .is_some_and(|sel| current.find_request(sel).is_none())
-        {
+        let selected_removed = {
+            let current = &self.projects[self.active_project];
+            self.open_tabs
+                .retain(|tab| current.find_request(tab).is_some());
+            self.selected_id
+                .as_deref()
+                .is_some_and(|sel| current.find_request(sel).is_none())
+        };
+        if selected_removed {
             self.cancel(cx);
             self.selected_id = self
                 .open_tabs
                 .last()
                 .cloned()
-                .or_else(|| current.first_request_id());
+                .or_else(|| self.current().first_request_id());
             if let Some(next_id) = &self.selected_id
                 && !self.open_tabs.contains(next_id)
             {
@@ -2447,18 +1762,13 @@ impl WorkspaceView {
         });
     }
 
-    fn finalize_collection_import(
+    pub(super) fn push_and_select_project(
         &mut self,
-        report: import::ImportReport,
-        sanitized_summary: Option<fastman_core::security::SanitizeSummary>,
+        project: Project,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<()> {
-        let count = report.requests_imported;
-        let warnings = report.warnings.len();
-        let project_name = report.project.name.clone();
-        self.store.save(&report.project)?;
-        self.projects.push(report.project);
+    ) {
+        self.projects.push(project);
         let last = self.projects.len() - 1;
         let choices = project_choices(&self.projects);
         self.project_selector.update(cx, |sel, cx| {
@@ -2466,215 +1776,6 @@ impl WorkspaceView {
             sel.set_selected_index(Some(IndexPath::default().row(last)), window, cx);
         });
         self.switch_project(last, window, cx);
-        let note = match sanitized_summary {
-            Some(s) => format!(
-                "Imported {count} requests into '{project_name}' (moved {} auth field(s) to session-only, stripped {})",
-                s.moved_to_session_auth, s.stripped_fields
-            ),
-            None if warnings > 0 => {
-                format!("Imported {count} requests into '{project_name}' ({warnings} warning(s))")
-            }
-            None => format!("Imported {count} requests into '{project_name}'"),
-        };
-        self.set_status(note.clone(), false, cx);
-        window.push_notification(Notification::success(note), cx);
-        Ok(())
-    }
-
-    pub(super) fn open_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let modal_view = cx.new(|cx| ImportDialogView::new(window, cx));
-        let initial_focus = Cell::new(true);
-        let weak_workspace = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if initial_focus.replace(false) {
-                modal_view
-                    .read(cx)
-                    .input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .focus(window, cx);
-            }
-            let modal_ok = modal_view.clone();
-            let weak_ok = weak_workspace.clone();
-            let is_confirm_step = modal_view.read(cx).pending_sensitive.is_some();
-            dialog
-                .w(px(580.))
-                .title(if is_confirm_step {
-                    "Confirm cURL / Collection Import"
-                } else {
-                    "Import Collection or cURL"
-                })
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(if is_confirm_step {
-                            "Continue Import"
-                        } else {
-                            "Import"
-                        })
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let pending_step = modal_ok.update(cx, |m, _| {
-                        m.error = None;
-                        m.pending_sensitive.take().map(|p| (p, m.sensitive_choice))
-                    });
-                    if let Some((pending, choice)) = pending_step {
-                        match pending {
-                            PendingSensitiveImport::Collection(mut report) => {
-                                let sanitized = if choice == 0 {
-                                    Some(report.sanitize_credentials())
-                                } else {
-                                    None
-                                };
-                                let mut saved_ok = true;
-                                let _ = weak_ok.update(cx, |view, cx| {
-                                    if let Err(err) =
-                                        view.finalize_collection_import(report, sanitized, window, cx)
-                                    {
-                                        saved_ok = false;
-                                        modal_ok.update(cx, |m, cx| {
-                                            m.error = Some(format!("Failed to save project: {err:#}"));
-                                            cx.notify();
-                                        });
-                                    }
-                                });
-                                return saved_ok;
-                            }
-                            PendingSensitiveImport::Curl(report, findings) => {
-                                let mut req = report.request;
-                                let summary = (!findings.is_empty() && choice == 0)
-                                    .then(|| sanitize_request_credentials(&mut req));
-                                let label = format!("{} {}", req.method, req.name);
-                                let unsupported = report.unsupported_flags;
-                                let _ = weak_ok.update(cx, |view, cx| {
-                                    view.insert_and_open_request(req, window, cx);
-                                    let mut note = match summary {
-                                        Some(s) => format!(
-                                            "Imported cURL: {label} (moved {} to session Auth, stripped {})",
-                                            s.moved_to_session_auth, s.stripped_fields
-                                        ),
-                                        None => format!("Imported cURL: {label}"),
-                                    };
-                                    if !unsupported.is_empty() {
-                                        note.push_str(&format!(
-                                            " · ignored flags: {}",
-                                            unsupported.join(", ")
-                                        ));
-                                    }
-                                    view.set_status(note.clone(), false, cx);
-                                    window.push_notification(Notification::success(note), cx);
-                                });
-                                return true;
-                            }
-                        }
-                    }
-
-                    let (mode, raw_text) = {
-                        let modal = modal_ok.read(cx);
-                        (modal.mode, modal.input.read(cx).value().to_string())
-                    };
-                    if raw_text.trim().is_empty() {
-                        modal_ok.update(cx, |m, cx| {
-                            m.error = Some("Paste Collection JSON or a cURL command first.".into());
-                            cx.notify();
-                        });
-                        return false;
-                    }
-                    if mode == 0 {
-                        if raw_text.len() > import::MAX_IMPORT_BYTES {
-                            modal_ok.update(cx, |m, cx| {
-                                m.error = Some(format!(
-                                    "Collection exceeds maximum size ({} bytes).",
-                                    import::MAX_IMPORT_BYTES
-                                ));
-                                cx.notify();
-                            });
-                            return false;
-                        }
-                        match import::collection_v21(&raw_text) {
-                            Ok(report) if !report.sensitive_fields.is_empty() => {
-                                modal_ok.update(cx, |m, cx| {
-                                    m.sensitive_choice = 0;
-                                    m.pending_sensitive =
-                                        Some(PendingSensitiveImport::Collection(report));
-                                    cx.notify();
-                                });
-                                false
-                            }
-                            Ok(report) => {
-                                let mut saved_ok = true;
-                                let _ = weak_ok.update(cx, |view, cx| {
-                                    if let Err(err) =
-                                        view.finalize_collection_import(report, None, window, cx)
-                                    {
-                                        saved_ok = false;
-                                        modal_ok.update(cx, |m, cx| {
-                                            m.error = Some(format!("Failed to save project: {err:#}"));
-                                            cx.notify();
-                                        });
-                                    }
-                                });
-                                saved_ok
-                            }
-                            Err(err) => {
-                                modal_ok.update(cx, |m, cx| {
-                                    m.error = Some(format!("{err:#}"));
-                                    cx.notify();
-                                });
-                                false
-                            }
-                        }
-                    } else {
-                        if raw_text.len() > curl::MAX_CURL_IMPORT_BYTES {
-                            modal_ok.update(cx, |m, cx| {
-                                m.error = Some(format!(
-                                    "cURL command exceeds maximum size ({} bytes).",
-                                    curl::MAX_CURL_IMPORT_BYTES
-                                ));
-                                cx.notify();
-                            });
-                            return false;
-                        }
-                        match curl::parse_curl_report(&raw_text) {
-                            Ok(report) => {
-                                let mut findings = Vec::new();
-                                collect_sensitive_request_findings(&report.request, &mut findings);
-                                if !findings.is_empty() || !report.unsupported_flags.is_empty() {
-                                    modal_ok.update(cx, |m, cx| {
-                                        m.sensitive_choice = 0;
-                                        m.pending_sensitive =
-                                            Some(PendingSensitiveImport::Curl(report, findings));
-                                        cx.notify();
-                                    });
-                                    return false;
-                                }
-                                let req = report.request;
-                                let label = format!("{} {}", req.method, req.name);
-                                let has_session_auth = !matches!(req.auth, Auth::None);
-                                let _ = weak_ok.update(cx, |view, cx| {
-                                    view.insert_and_open_request(req, window, cx);
-                                    let note = if has_session_auth {
-                                        format!("Imported cURL: {label} (Auth kept session-only)")
-                                    } else {
-                                        format!("Imported cURL: {label}")
-                                    };
-                                    view.set_status(note.clone(), false, cx);
-                                    window.push_notification(Notification::success(note), cx);
-                                });
-                                true
-                            }
-                            Err(err) => {
-                                modal_ok.update(cx, |m, cx| {
-                                    m.error = Some(format!("{err:#}"));
-                                    cx.notify();
-                                });
-                                false
-                            }
-                        }
-                    }
-                })
-                .child(modal_view.clone())
-        });
     }
 
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -2750,18 +1851,18 @@ impl WorkspaceView {
                 view.in_flight_request_id = None;
                 match result {
                     Ok(Ok((entry, status_line))) => {
-                        view.cache_response(request_id, entry);
+                        view.responses.insert(request_id, entry);
                         view.refresh_response_search_matches(cx);
                         view.reset_response_scroll();
                         view.set_status(status_line, false, cx);
                     }
                     Ok(Err(entry)) => {
-                        view.cache_response(request_id, entry);
+                        view.responses.insert(request_id, entry);
                         view.refresh_response_search_matches(cx);
                         view.set_status("Request failed", true, cx);
                     }
                     Err(error) => {
-                        view.cache_response(
+                        view.responses.insert(
                             request_id,
                             ResponseCacheEntry::from_error(
                                 error.to_string(),
@@ -3344,9 +2445,9 @@ mod tests {
                 v.url.read(cx).value().as_ref(),
                 "https://api.example.com/v1/orders"
             );
-            assert_eq!(v.auth_kind, 2);
+            assert_eq!(v.auth_kind, super::AuthKind::Bearer);
             assert_eq!(v.auth_token.read(cx).value().as_ref(), "tok_123");
-            assert_eq!(v.body_kind, 1);
+            assert_eq!(v.body_kind, super::BodyKind::Json);
             assert_eq!(
                 v.body_editor.read(cx).value().as_ref(),
                 r#"{"item":"book"}"#
@@ -3469,7 +2570,7 @@ mod tests {
                 );
                 assert!(!view.dirty);
                 assert_eq!(view.method, "POST");
-                assert_eq!(view.body_kind, 1);
+                assert_eq!(view.body_kind, super::BodyKind::Json);
                 assert_eq!(view.headers_active_count, 1);
                 let confirm = view
                     .active_curl_confirm
@@ -3516,7 +2617,7 @@ mod tests {
 
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| {
-                view.body_kind = 1;
+                view.body_kind = super::BodyKind::Json;
                 view.body_editor
                     .update(cx, |ed, cx| ed.set_value(r#"{"draft":1}"#, window, cx));
                 view.append_header_preset("X-Draft", "yes", window, cx);
@@ -3536,7 +2637,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 assert_eq!(view.url.read(cx).value().as_ref(), "");
                 assert!(view.dirty);
-                assert_eq!(view.body_kind, 1);
+                assert_eq!(view.body_kind, super::BodyKind::Json);
                 assert_eq!(view.body_editor.read(cx).value().as_ref(), r#"{"draft":1}"#);
                 assert_eq!(view.headers_active_count, 1);
                 assert_eq!(view.timeout.read(cx).value().as_ref(), "4500");
@@ -3554,7 +2655,7 @@ mod tests {
                     view.url.read(cx).value().as_ref(),
                     "https://example.com/plain"
                 );
-                assert_eq!(view.body_kind, 0);
+                assert_eq!(view.body_kind, super::BodyKind::None);
                 assert_eq!(view.headers_active_count, 0);
                 assert_eq!(view.timeout.read(cx).value().as_ref(), "30000");
             });

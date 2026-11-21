@@ -118,26 +118,29 @@ fn find_request_in<'a>(
         .or_else(|| folders.iter().find_map(|f| f.find_request(request_id)))
 }
 
-fn find_request_mut_in<'a>(
-    requests: &'a mut [ApiRequest],
-    folders: &'a mut [Folder],
-    request_id: &str,
-) -> Option<&'a mut ApiRequest> {
-    if let Some(index) = requests.iter().position(|r| r.id == request_id) {
-        return requests.get_mut(index);
+fn move_item_offset<T>(items: &mut Vec<T>, index: usize, delta: isize) -> bool {
+    let target = index as isize + delta;
+    if target < 0 || target as usize >= items.len() || target as usize == index {
+        return false;
     }
-    folders
-        .iter_mut()
-        .find_map(|f| f.find_request_mut(request_id))
+    let item = items.remove(index);
+    items.insert(target as usize, item);
+    true
 }
 
-fn delete_folder_in(folders: &mut Vec<Folder>, folder_id: &str) -> bool {
-    take_folder_in(folders, folder_id).is_some()
-}
-
-fn take_folder_in(folders: &mut Vec<Folder>, folder_id: &str) -> Option<Folder> {
-    let (folders, index) = find_folder_vec_mut_in(folders, folder_id)?;
-    Some(folders.remove(index))
+fn move_item_relative<T>(items: &mut Vec<T>, src_idx: usize, dst_idx: usize, after: bool) -> bool {
+    let raw_target = if after { dst_idx + 1 } else { dst_idx };
+    let insert_idx = if src_idx < raw_target {
+        raw_target - 1
+    } else {
+        raw_target
+    };
+    if insert_idx == src_idx {
+        return false;
+    }
+    let item = items.remove(src_idx);
+    items.insert(insert_idx, item);
+    true
 }
 
 fn find_folder_location_in<'a>(
@@ -151,23 +154,6 @@ fn find_folder_location_in<'a>(
     folders
         .iter()
         .find_map(|f| find_folder_location_in(Some(f.id.as_str()), &f.folders, folder_id))
-}
-
-fn delete_request_in(
-    requests: &mut Vec<ApiRequest>,
-    folders: &mut [Folder],
-    request_id: &str,
-) -> bool {
-    take_request_in(requests, folders, request_id).is_some()
-}
-
-fn take_request_in(
-    requests: &mut Vec<ApiRequest>,
-    folders: &mut [Folder],
-    request_id: &str,
-) -> Option<ApiRequest> {
-    let (requests, index) = find_request_vec_mut_in(requests, folders, request_id)?;
-    Some(requests.remove(index))
 }
 
 fn find_request_vec_mut_in<'a>(
@@ -209,20 +195,6 @@ fn find_folder_vec_mut_in<'a>(
         .find_map(|f| find_folder_vec_mut_in(&mut f.folders, folder_id))
 }
 
-fn duplicate_request_in(
-    requests: &mut Vec<ApiRequest>,
-    folders: &mut [Folder],
-    request_id: &str,
-) -> Option<String> {
-    let (requests, index) = find_request_vec_mut_in(requests, folders, request_id)?;
-    let mut copy = requests[index].clone();
-    copy.id = new_id();
-    copy.name = format!("{} (copy)", copy.name);
-    let new_request_id = copy.id.clone();
-    requests.insert(index + 1, copy);
-    Some(new_request_id)
-}
-
 impl Folder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -235,10 +207,6 @@ impl Folder {
 
     pub fn find_request(&self, request_id: &str) -> Option<&ApiRequest> {
         find_request_in(&self.requests, &self.folders, request_id)
-    }
-
-    pub fn find_request_mut(&mut self, request_id: &str) -> Option<&mut ApiRequest> {
-        find_request_mut_in(&mut self.requests, &mut self.folders, request_id)
     }
 
     pub fn find_folder(&self, folder_id: &str) -> Option<&Folder> {
@@ -257,20 +225,8 @@ impl Folder {
             .find_map(|f| f.find_folder_mut(folder_id))
     }
 
-    pub fn delete_folder(&mut self, folder_id: &str) -> bool {
-        delete_folder_in(&mut self.folders, folder_id)
-    }
-
-    pub fn delete_request(&mut self, request_id: &str) -> bool {
-        delete_request_in(&mut self.requests, &mut self.folders, request_id)
-    }
-
-    pub fn take_request(&mut self, request_id: &str) -> Option<ApiRequest> {
-        take_request_in(&mut self.requests, &mut self.folders, request_id)
-    }
-
-    pub fn duplicate_request(&mut self, request_id: &str) -> Option<String> {
-        duplicate_request_in(&mut self.requests, &mut self.folders, request_id)
+    pub fn request_count(&self) -> usize {
+        self.requests.len() + self.folders.iter().map(Self::request_count).sum::<usize>()
     }
 }
 
@@ -298,10 +254,6 @@ impl Collection {
         find_request_in(&self.requests, &self.folders, request_id)
     }
 
-    pub fn find_request_mut(&mut self, request_id: &str) -> Option<&mut ApiRequest> {
-        find_request_mut_in(&mut self.requests, &mut self.folders, request_id)
-    }
-
     pub fn find_folder(&self, folder_id: &str) -> Option<&Folder> {
         self.folders.iter().find_map(|f| f.find_folder(folder_id))
     }
@@ -312,20 +264,13 @@ impl Collection {
             .find_map(|f| f.find_folder_mut(folder_id))
     }
 
-    pub fn delete_folder(&mut self, folder_id: &str) -> bool {
-        delete_folder_in(&mut self.folders, folder_id)
-    }
-
-    pub fn delete_request(&mut self, request_id: &str) -> bool {
-        delete_request_in(&mut self.requests, &mut self.folders, request_id)
-    }
-
-    pub fn take_request(&mut self, request_id: &str) -> Option<ApiRequest> {
-        take_request_in(&mut self.requests, &mut self.folders, request_id)
-    }
-
-    pub fn duplicate_request(&mut self, request_id: &str) -> Option<String> {
-        duplicate_request_in(&mut self.requests, &mut self.folders, request_id)
+    pub fn request_count(&self) -> usize {
+        self.requests.len()
+            + self
+                .folders
+                .iter()
+                .map(Folder::request_count)
+                .sum::<usize>()
     }
 }
 
@@ -375,9 +320,8 @@ impl Project {
     }
 
     pub fn find_request_mut(&mut self, request_id: &str) -> Option<&mut ApiRequest> {
-        self.collections
-            .iter_mut()
-            .find_map(|c| c.find_request_mut(request_id))
+        self.find_request_vec_mut(request_id)
+            .map(|(requests, index)| &mut requests[index])
     }
 
     pub fn find_folder(&self, folder_id: &str) -> Option<&Folder> {
@@ -386,8 +330,25 @@ impl Project {
             .find_map(|c| c.find_folder(folder_id))
     }
 
+    pub fn find_folder_mut(&mut self, folder_id: &str) -> Option<&mut Folder> {
+        self.collections
+            .iter_mut()
+            .find_map(|c| c.find_folder_mut(folder_id))
+    }
+
     pub fn find_collection(&self, collection_id: &str) -> Option<&Collection> {
         self.collections.iter().find(|c| c.id == collection_id)
+    }
+
+    pub fn find_collection_mut(&mut self, collection_id: &str) -> Option<&mut Collection> {
+        self.collections.iter_mut().find(|c| c.id == collection_id)
+    }
+
+    fn ensure_default_collection_mut(&mut self) -> &mut Collection {
+        if self.collections.is_empty() {
+            self.collections.push(Collection::new("Default Collection"));
+        }
+        &mut self.collections[0]
     }
 
     pub fn rename_collection(&mut self, collection_id: &str, name: String) -> bool {
@@ -395,7 +356,7 @@ impl Project {
         if trimmed.is_empty() {
             return false;
         }
-        if let Some(collection) = self.collections.iter_mut().find(|c| c.id == collection_id) {
+        if let Some(collection) = self.find_collection_mut(collection_id) {
             collection.name = trimmed.to_owned();
             return true;
         }
@@ -406,13 +367,7 @@ impl Project {
         let Some(idx) = self.collections.iter().position(|c| c.id == collection_id) else {
             return false;
         };
-        let target = idx as isize + delta;
-        if target < 0 || target as usize >= self.collections.len() || target as usize == idx {
-            return false;
-        }
-        let coll = self.collections.remove(idx);
-        self.collections.insert(target as usize, coll);
-        true
+        move_item_offset(&mut self.collections, idx, delta)
     }
 
     pub fn delete_collection(&mut self, collection_id: &str) -> bool {
@@ -424,14 +379,38 @@ impl Project {
         self.collections.len() != before
     }
 
-    pub fn add_subfolder(&mut self, parent_folder_id: &str, folder: Folder) -> bool {
-        for collection in &mut self.collections {
-            if let Some(parent) = collection.find_folder_mut(parent_folder_id) {
-                parent.folders.push(folder);
-                return true;
-            }
+    /// Inserts `folder` inside `parent_folder_id` if provided and found; otherwise inserts at the
+    /// root of the first collection (creating a default collection if needed). Returns the ID of
+    /// the container (`parent_folder_id` or collection ID) that received the folder.
+    pub fn insert_folder(&mut self, parent_folder_id: Option<&str>, folder: Folder) -> String {
+        if let Some(parent_id) = parent_folder_id
+            && let Some(parent) = self.find_folder_mut(parent_id)
+        {
+            parent.folders.push(folder);
+            return parent_id.to_owned();
         }
-        false
+        let collection = self.ensure_default_collection_mut();
+        collection.folders.push(folder);
+        collection.id.clone()
+    }
+
+    /// Inserts `request` inside `target_folder_id` if provided and found; otherwise inserts at the
+    /// root of the first collection (creating a default collection if needed). Returns the ID of
+    /// the container (`target_folder_id` or collection ID) that received the request.
+    pub fn insert_request(
+        &mut self,
+        target_folder_id: Option<&str>,
+        request: ApiRequest,
+    ) -> String {
+        if let Some(folder_id) = target_folder_id
+            && let Some(folder) = self.find_folder_mut(folder_id)
+        {
+            folder.requests.push(request);
+            return folder_id.to_owned();
+        }
+        let collection = self.ensure_default_collection_mut();
+        collection.requests.push(request);
+        collection.id.clone()
     }
 
     pub fn rename_folder(&mut self, folder_id: &str, name: String) -> bool {
@@ -439,43 +418,39 @@ impl Project {
         if trimmed.is_empty() {
             return false;
         }
-        for collection in &mut self.collections {
-            if let Some(folder) = collection.find_folder_mut(folder_id) {
-                folder.name = trimmed.to_owned();
-                return true;
-            }
+        if let Some(folder) = self.find_folder_mut(folder_id) {
+            folder.name = trimmed.to_owned();
+            return true;
         }
         false
     }
 
     pub fn delete_folder(&mut self, folder_id: &str) -> bool {
-        self.collections
-            .iter_mut()
-            .any(|c| c.delete_folder(folder_id))
+        self.take_folder(folder_id).is_some()
     }
 
-    pub fn take_folder(&mut self, folder_id: &str) -> Option<Folder> {
-        self.collections
-            .iter_mut()
-            .find_map(|c| take_folder_in(&mut c.folders, folder_id))
+    fn take_folder(&mut self, folder_id: &str) -> Option<Folder> {
+        let (folders, index) = self.find_folder_vec_mut(folder_id)?;
+        Some(folders.remove(index))
     }
 
     pub fn delete_request(&mut self, request_id: &str) -> bool {
-        self.collections
-            .iter_mut()
-            .any(|c| c.delete_request(request_id))
+        self.take_request(request_id).is_some()
     }
 
-    pub fn take_request(&mut self, request_id: &str) -> Option<ApiRequest> {
-        self.collections
-            .iter_mut()
-            .find_map(|c| c.take_request(request_id))
+    fn take_request(&mut self, request_id: &str) -> Option<ApiRequest> {
+        let (requests, index) = self.find_request_vec_mut(request_id)?;
+        Some(requests.remove(index))
     }
 
     pub fn duplicate_request(&mut self, request_id: &str) -> Option<String> {
-        self.collections
-            .iter_mut()
-            .find_map(|c| c.duplicate_request(request_id))
+        let (requests, index) = self.find_request_vec_mut(request_id)?;
+        let mut copy = requests[index].clone();
+        copy.id = new_id();
+        copy.name = format!("{} (copy)", copy.name);
+        let new_request_id = copy.id.clone();
+        requests.insert(index + 1, copy);
+        Some(new_request_id)
     }
 
     /// Returns `(collection_id, parent_folder_id, index_in_container, container_len)`.
@@ -561,13 +536,7 @@ impl Project {
         let Some((requests, index)) = self.find_request_vec_mut(request_id) else {
             return false;
         };
-        let target = index as isize + delta;
-        if target < 0 || target as usize >= requests.len() || target as usize == index {
-            return false;
-        }
-        let req = requests.remove(index);
-        requests.insert(target as usize, req);
-        true
+        move_item_offset(requests, index, delta)
     }
 
     /// Moves a request into `target_folder_id` (`Some(id)`) or out to its collection root (`None`).
@@ -592,14 +561,12 @@ impl Project {
             return false;
         };
         if let Some(folder_id) = target_folder_id {
-            for collection in &mut self.collections {
-                if let Some(folder) = collection.find_folder_mut(folder_id) {
-                    folder.requests.push(request);
-                    return true;
-                }
+            if let Some(folder) = self.find_folder_mut(folder_id) {
+                folder.requests.push(request);
+                return true;
             }
             false
-        } else if let Some(collection) = self.collections.iter_mut().find(|c| c.id == coll_id) {
+        } else if let Some(collection) = self.find_collection_mut(&coll_id) {
             collection.requests.push(request);
             true
         } else if let Some(collection) = self.collections.first_mut() {
@@ -622,21 +589,13 @@ impl Project {
         if coll_id == target_collection_id && current_folder.is_none() {
             return false;
         }
-        if !self
-            .collections
-            .iter()
-            .any(|c| c.id == target_collection_id)
-        {
+        if self.find_collection(target_collection_id).is_none() {
             return false;
         }
         let Some(request) = self.take_request(request_id) else {
             return false;
         };
-        if let Some(collection) = self
-            .collections
-            .iter_mut()
-            .find(|c| c.id == target_collection_id)
-        {
+        if let Some(collection) = self.find_collection_mut(target_collection_id) {
             collection.requests.push(request);
             true
         } else {
@@ -666,21 +625,10 @@ impl Project {
         };
         let same_container = src_coll == dst_coll && src_folder == dst_folder;
         if same_container {
-            let raw_target = if after { dst_idx + 1 } else { dst_idx };
-            let insert_idx = if src_idx < raw_target {
-                raw_target - 1
-            } else {
-                raw_target
-            };
-            if insert_idx == src_idx {
-                return false;
-            }
             let Some((requests, _)) = self.find_request_vec_mut(request_id) else {
                 return false;
             };
-            let req = requests.remove(src_idx);
-            requests.insert(insert_idx, req);
-            true
+            move_item_relative(requests, src_idx, dst_idx, after)
         } else {
             let Some(req) = self.take_request(request_id) else {
                 return false;
@@ -690,40 +638,6 @@ impl Project {
             };
             let insert_idx = if after { target_idx + 1 } else { target_idx };
             requests.insert(insert_idx, req);
-            true
-        }
-    }
-
-    /// Reorders/moves `request_id` to the position of `target_request_id` (moving across folders if needed).
-    pub fn move_request_to_target(&mut self, request_id: &str, target_request_id: &str) -> bool {
-        if request_id == target_request_id {
-            return false;
-        }
-        let Some((src_coll, src_folder, src_idx, _)) = self.find_request_location(request_id)
-        else {
-            return false;
-        };
-        let Some((dst_coll, dst_folder, dst_idx, _)) =
-            self.find_request_location(target_request_id)
-        else {
-            return false;
-        };
-        let same_container = src_coll == dst_coll && src_folder == dst_folder;
-        if same_container {
-            let Some((requests, _)) = self.find_request_vec_mut(request_id) else {
-                return false;
-            };
-            let req = requests.remove(src_idx);
-            requests.insert(dst_idx, req);
-            true
-        } else {
-            let Some(req) = self.take_request(request_id) else {
-                return false;
-            };
-            let Some((requests, target_idx)) = self.find_request_vec_mut(target_request_id) else {
-                return false;
-            };
-            requests.insert(target_idx, req);
             true
         }
     }
@@ -739,13 +653,7 @@ impl Project {
         let Some((folders, index)) = self.find_folder_vec_mut(folder_id) else {
             return false;
         };
-        let target = index as isize + delta;
-        if target < 0 || target as usize >= folders.len() || target as usize == index {
-            return false;
-        }
-        let folder = folders.remove(index);
-        folders.insert(target as usize, folder);
-        true
+        move_item_offset(folders, index, delta)
     }
 
     /// Moves a folder inside `target_folder_id` (`Some(id)`) or out to its collection root (`None`).
@@ -771,14 +679,12 @@ impl Project {
             return false;
         };
         if let Some(target_id) = target_folder_id {
-            for collection in &mut self.collections {
-                if let Some(parent) = collection.find_folder_mut(target_id) {
-                    parent.folders.push(folder);
-                    return true;
-                }
+            if let Some(parent) = self.find_folder_mut(target_id) {
+                parent.folders.push(folder);
+                return true;
             }
             false
-        } else if let Some(collection) = self.collections.iter_mut().find(|c| c.id == coll_id) {
+        } else if let Some(collection) = self.find_collection_mut(&coll_id) {
             collection.folders.push(folder);
             true
         } else if let Some(collection) = self.collections.first_mut() {
@@ -801,21 +707,13 @@ impl Project {
         if coll_id == target_collection_id && current_parent.is_none() {
             return false;
         }
-        if !self
-            .collections
-            .iter()
-            .any(|c| c.id == target_collection_id)
-        {
+        if self.find_collection(target_collection_id).is_none() {
             return false;
         }
         let Some(folder) = self.take_folder(folder_id) else {
             return false;
         };
-        if let Some(collection) = self
-            .collections
-            .iter_mut()
-            .find(|c| c.id == target_collection_id)
-        {
+        if let Some(collection) = self.find_collection_mut(target_collection_id) {
             collection.folders.push(folder);
             true
         } else {
@@ -843,21 +741,10 @@ impl Project {
         };
         let same_parent = src_coll == dst_coll && src_parent == dst_parent;
         if same_parent {
-            let raw_target = if after { dst_idx + 1 } else { dst_idx };
-            let insert_idx = if src_idx < raw_target {
-                raw_target - 1
-            } else {
-                raw_target
-            };
-            if insert_idx == src_idx {
-                return false;
-            }
             let Some((folders, _)) = self.find_folder_vec_mut(folder_id) else {
                 return false;
             };
-            let folder = folders.remove(src_idx);
-            folders.insert(insert_idx, folder);
-            true
+            move_item_relative(folders, src_idx, dst_idx, after)
         } else {
             let Some(folder) = self.take_folder(folder_id) else {
                 return false;
@@ -872,13 +759,7 @@ impl Project {
     }
 
     pub fn request_count(&self) -> usize {
-        fn count_folder(folder: &Folder) -> usize {
-            folder.requests.len() + folder.folders.iter().map(count_folder).sum::<usize>()
-        }
-        self.collections
-            .iter()
-            .map(|c| c.requests.len() + c.folders.iter().map(count_folder).sum::<usize>())
-            .sum()
+        self.collections.iter().map(Collection::request_count).sum()
     }
 }
 
@@ -918,23 +799,23 @@ mod tests {
     #[test]
     fn tree_crud_operations() {
         let mut project = Project::new("CRUD");
+        let coll_id = project.collections[0].id.clone();
         let root_folder = Folder::new("Auth");
         let root_folder_id = root_folder.id.clone();
-        project.collections[0].folders.push(root_folder);
+        assert_eq!(project.insert_folder(None, root_folder), coll_id);
 
         let sub = Folder::new("OAuth");
         let sub_id = sub.id.clone();
-        assert!(project.add_subfolder(&root_folder_id, sub));
+        assert_eq!(
+            project.insert_folder(Some(&root_folder_id), sub),
+            root_folder_id
+        );
         assert!(project.rename_folder(&sub_id, "Tokens".into()));
         assert_eq!(project.find_folder(&sub_id).unwrap().name, "Tokens");
 
         let req = ApiRequest::new("POST", "Login", "https://example.com/login");
         let req_id = req.id.clone();
-        project.collections[0]
-            .find_folder_mut(&sub_id)
-            .unwrap()
-            .requests
-            .push(req);
+        assert_eq!(project.insert_request(Some(&sub_id), req), sub_id);
         assert_eq!(project.request_count(), 1);
 
         let dup_id = project.duplicate_request(&req_id).unwrap();
@@ -1001,15 +882,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![r2_id.as_str(), r3_id.as_str(), r1_id.as_str()]
         );
-        assert!(project.move_request_to_target(&r3_id, &r2_id));
-        assert_eq!(
-            project.collections[0]
-                .requests
-                .iter()
-                .map(|r| r.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![r3_id.as_str(), r2_id.as_str(), r1_id.as_str()]
-        );
 
         // Move into folder Alpha
         assert!(project.move_request_to_folder(&r1_id, Some(&folder_a_id)));
@@ -1020,8 +892,8 @@ mod tests {
         assert_eq!(project.collections[0].requests.len(), 2);
         assert_eq!(project.find_folder(&folder_a_id).unwrap().requests.len(), 1);
 
-        // Drag/move r2 onto r1 inside folder Alpha
-        assert!(project.move_request_to_target(&r2_id, &r1_id));
+        // Drag/move r2 before r1 inside folder Alpha
+        assert!(project.move_request_relative(&r2_id, &r1_id, false));
         assert_eq!(
             project.request_parent_folder(&r2_id).as_deref(),
             Some(folder_a_id.as_str())

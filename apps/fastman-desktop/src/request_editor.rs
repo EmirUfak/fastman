@@ -1,6 +1,6 @@
 use crate::kv_editor::render_kv_table;
 use crate::theme::{
-    brand_accent, count_pill, dot_indicator, method_badge, method_mini_label, svg_icon,
+    brand_accent, count_pill, dot_indicator, method_badge, method_mini_label, svg_icon, tab_icon,
 };
 use anyhow::{Context as _, Result};
 use fastman_core::{ApiRequest, Auth, HttpBody, KeyValue};
@@ -19,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::workspace::{AUTH_TYPES, BODY_TYPES, METHODS, WorkspaceView};
+use crate::workspace::{METHODS, WorkspaceView};
 
 const COMMON_HEADERS: &[(&str, &str)] = &[
     ("Accept", "application/json"),
@@ -27,6 +27,92 @@ const COMMON_HEADERS: &[(&str, &str)] = &[
     ("Cache-Control", "no-cache"),
     ("User-Agent", "Fastman/0.1"),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum AuthKind {
+    #[default]
+    None,
+    Basic,
+    Bearer,
+    ApiKeyHeader,
+    ApiKeyQuery,
+}
+
+impl AuthKind {
+    const ALL: [Self; 5] = [
+        Self::None,
+        Self::Basic,
+        Self::Bearer,
+        Self::ApiKeyHeader,
+        Self::ApiKeyQuery,
+    ];
+
+    pub(super) fn from_auth(auth: &Auth) -> Self {
+        match auth {
+            Auth::None => Self::None,
+            Auth::Basic { .. } => Self::Basic,
+            Auth::Bearer { .. } => Self::Bearer,
+            Auth::ApiKeyHeader { .. } => Self::ApiKeyHeader,
+            Auth::ApiKeyQuery { .. } => Self::ApiKeyQuery,
+        }
+    }
+
+    pub(super) fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::None => "No Auth",
+            Self::Basic => "Basic Auth",
+            Self::Bearer => "Bearer Token",
+            Self::ApiKeyHeader => "API Key (Header)",
+            Self::ApiKeyQuery => "API Key (Query)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum BodyKind {
+    #[default]
+    None,
+    Json,
+    Text,
+    FormUrlEncoded,
+}
+
+impl BodyKind {
+    const ALL: [Self; 4] = [Self::None, Self::Json, Self::Text, Self::FormUrlEncoded];
+
+    pub(super) fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Json => "JSON",
+            Self::Text => "Text",
+            Self::FormUrlEncoded => "Form URL Encoded",
+        }
+    }
+
+    pub(super) fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Json => Some("JSON"),
+            Self::Text => Some("Text"),
+            Self::FormUrlEncoded => Some("Form"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KvTableKind {
+    Params,
+    Headers,
+    Form,
+}
 
 pub(super) struct RequestDraft {
     name: String,
@@ -59,28 +145,28 @@ impl WorkspaceView {
         let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
         let timeout_ms = text(&self.timeout).trim().parse().unwrap_or(30_000);
         let body = match self.body_kind {
-            1 => HttpBody::Json(self.body_editor.read(cx).value().to_string()),
-            2 => HttpBody::Text(self.body_editor.read(cx).value().to_string()),
-            3 => HttpBody::FormUrlEncoded(self.form_table.to_key_values(cx)),
-            _ => HttpBody::None,
+            BodyKind::Json => HttpBody::Json(self.body_editor.read(cx).value().to_string()),
+            BodyKind::Text => HttpBody::Text(self.body_editor.read(cx).value().to_string()),
+            BodyKind::FormUrlEncoded => HttpBody::FormUrlEncoded(self.form_table.to_key_values(cx)),
+            BodyKind::None => HttpBody::None,
         };
         let auth = match self.auth_kind {
-            1 => Auth::Basic {
+            AuthKind::Basic => Auth::Basic {
                 username: text(&self.auth_user),
                 password: text(&self.auth_password),
             },
-            2 => Auth::Bearer {
+            AuthKind::Bearer => Auth::Bearer {
                 token: text(&self.auth_token),
             },
-            3 => Auth::ApiKeyHeader {
+            AuthKind::ApiKeyHeader => Auth::ApiKeyHeader {
                 name: text(&self.api_key_name),
                 value: text(&self.api_key_value),
             },
-            4 => Auth::ApiKeyQuery {
+            AuthKind::ApiKeyQuery => Auth::ApiKeyQuery {
                 name: text(&self.api_key_name),
                 value: text(&self.api_key_value),
             },
-            _ => Auth::None,
+            AuthKind::None => Auth::None,
         };
         let mut req = ApiRequest::new(
             self.method.clone(),
@@ -494,7 +580,7 @@ impl WorkspaceView {
             .child({
                 let curl_view = cx.weak_entity();
                 let has_sensitive = self.dirty
-                    || self.auth_kind != 0
+                    || !self.auth_kind.is_none()
                     || self.current_request().is_some_and(|req| {
                         fastman_core::curl::to_curl_export(req, &self.current().variables, true)
                             .is_ok_and(|res| res.had_secrets || res.had_variables)
@@ -539,12 +625,7 @@ impl WorkspaceView {
                     })
             });
 
-        let body_tag = match self.body_kind {
-            1 => Some("JSON"),
-            2 => Some("Text"),
-            3 => Some("Form"),
-            _ => None,
-        };
+        let body_tag = self.body_kind.badge();
         let section_tabs = div()
             .px_3()
             .border_b_1()
@@ -569,7 +650,7 @@ impl WorkspaceView {
                         Tab::new()
                             .prefix(tab_icon("icons/lock.svg"))
                             .label("Auth")
-                            .when(self.auth_kind != 0, |t| {
+                            .when(!self.auth_kind.is_none(), |t| {
                                 t.suffix(dot_indicator(cx.theme().success))
                             }),
                     )
@@ -772,17 +853,16 @@ impl WorkspaceView {
                                     view.mark_dirty(cx);
                                 },
                                 |view, idx, window, cx| {
-                                    view.remove_kv_row(0, idx, window, cx);
+                                    view.remove_kv_row(KvTableKind::Params, idx, window, cx);
                                 },
                                 |view, window, cx| {
-                                    view.add_kv_row(0, window, cx);
+                                    view.add_kv_row(KvTableKind::Params, window, cx);
                                 },
                             )),
                     )
                     .into_any_element()
             }
             1 => {
-                let kind_label = AUTH_TYPES[self.auth_kind];
                 let current_auth = self.auth_kind;
                 let view = cx.weak_entity();
                 div()
@@ -813,16 +893,16 @@ impl WorkspaceView {
                                         .w_full()
                                         .dropdown_caret(true)
                                         .icon(svg_icon("icons/key-round.svg").small())
-                                        .label(kind_label)
+                                        .label(current_auth.label())
                                         .dropdown_menu(move |mut menu, _, _| {
-                                            for (i, label) in AUTH_TYPES.iter().enumerate() {
+                                            for kind in AuthKind::ALL {
                                                 let view = view.clone();
                                                 menu = menu.item(
-                                                    PopupMenuItem::new(*label)
-                                                        .checked(current_auth == i)
+                                                    PopupMenuItem::new(kind.label())
+                                                        .checked(current_auth == kind)
                                                         .on_click(move |_, _, cx| {
                                                             let _ = view.update(cx, |view, cx| {
-                                                                view.auth_kind = i;
+                                                                view.auth_kind = kind;
                                                                 view.mark_dirty(cx);
                                                             });
                                                         }),
@@ -845,7 +925,7 @@ impl WorkspaceView {
                             .flex_col()
                             .gap_2p5()
                             .child(match self.auth_kind {
-                                1 => div()
+                                AuthKind::Basic => div()
                                     .flex()
                                     .flex_col()
                                     .gap_2()
@@ -865,7 +945,7 @@ impl WorkspaceView {
                                         muted_fg,
                                     ))
                                     .into_any_element(),
-                                2 => labeled_field(
+                                AuthKind::Bearer => labeled_field(
                                     "Bearer Token",
                                     Input::new(&self.auth_token)
                                         .small()
@@ -873,12 +953,12 @@ impl WorkspaceView {
                                         .font_family(mono),
                                     muted_fg,
                                 ),
-                                3 | 4 => div()
+                                AuthKind::ApiKeyHeader | AuthKind::ApiKeyQuery => div()
                                     .flex()
                                     .flex_col()
                                     .gap_2()
                                     .child(labeled_field(
-                                        if self.auth_kind == 3 {
+                                        if self.auth_kind == AuthKind::ApiKeyHeader {
                                             "Header Name"
                                         } else {
                                             "Query Param"
@@ -897,7 +977,7 @@ impl WorkspaceView {
                                         muted_fg,
                                     ))
                                     .into_any_element(),
-                                _ => div()
+                                AuthKind::None => div()
                                     .text_size(px(12.5))
                                     .text_color(muted_fg)
                                     .child("No authentication headers or query credentials will be attached.")
@@ -981,28 +1061,28 @@ impl WorkspaceView {
                                     view.mark_dirty(cx);
                                 },
                                 |view, idx, window, cx| {
-                                    view.remove_kv_row(1, idx, window, cx);
+                                    view.remove_kv_row(KvTableKind::Headers, idx, window, cx);
                                 },
                                 |view, window, cx| {
-                                    view.add_kv_row(1, window, cx);
+                                    view.add_kv_row(KvTableKind::Headers, window, cx);
                                 },
                             )),
                     )
                     .into_any_element()
             }
             3 => {
-                let json_valid = self.body_kind != 1 || self.body_json_valid;
+                let json_valid = self.body_kind != BodyKind::Json || self.body_json_valid;
 
-                let body_pills: Vec<AnyElement> = BODY_TYPES
-                    .iter()
+                let body_pills: Vec<AnyElement> = BodyKind::ALL
+                    .into_iter()
                     .enumerate()
-                    .map(|(i, label)| {
-                        let active = self.body_kind == i;
+                    .map(|(i, kind)| {
+                        let active = self.body_kind == kind;
                         let mut btn = Button::new(format!("body-kind-{i}"))
                             .xsmall()
-                            .label(*label)
+                            .label(kind.label())
                             .on_click(cx.listener(move |view, _, _, cx| {
-                                view.body_kind = i;
+                                view.body_kind = kind;
                                 view.refresh_body_json_valid(cx);
                                 view.mark_dirty(cx);
                             }));
@@ -1032,7 +1112,7 @@ impl WorkspaceView {
                                     .gap_0p5()
                                     .children(body_pills),
                             )
-                            .when(self.body_kind == 1, |el| {
+                            .when(self.body_kind == BodyKind::Json, |el| {
                                 el.child(
                                     div()
                                         .flex()
@@ -1077,7 +1157,7 @@ impl WorkspaceView {
                             }),
                     )
                     .child(match self.body_kind {
-                        0 => div()
+                        BodyKind::None => div()
                             .flex_1()
                             .min_h_0()
                             .flex()
@@ -1101,7 +1181,7 @@ impl WorkspaceView {
                                 ),
                             )
                             .into_any_element(),
-                        3 => div()
+                        BodyKind::FormUrlEncoded => div()
                             .id("form-table-scroll")
                             .flex_1()
                             .min_h_0()
@@ -1115,14 +1195,14 @@ impl WorkspaceView {
                                     view.mark_dirty(cx);
                                 },
                                 |view, idx, window, cx| {
-                                    view.remove_kv_row(2, idx, window, cx);
+                                    view.remove_kv_row(KvTableKind::Form, idx, window, cx);
                                 },
                                 |view, window, cx| {
-                                    view.add_kv_row(2, window, cx);
+                                    view.add_kv_row(KvTableKind::Form, window, cx);
                                 },
                             ))
                             .into_any_element(),
-                        _ => div()
+                        BodyKind::Json | BodyKind::Text => div()
                             .flex_1()
                             .min_h(px(120.))
                             .child(Editor::new(&self.body_editor).small().h(relative(1.)))
@@ -1269,15 +1349,6 @@ fn format_missing_vars_summary(missing: &[String], unclosed: bool) -> String {
         parts.push("Unclosed {{variable}}".to_owned());
     }
     parts.join(" · ")
-}
-
-fn tab_icon(path: &'static str) -> AnyElement {
-    div()
-        .pr_1()
-        .flex()
-        .items_center()
-        .child(svg_icon(path).xsmall())
-        .into_any_element()
 }
 
 fn labeled_field(label: &'static str, control: impl IntoElement, label_color: Hsla) -> AnyElement {

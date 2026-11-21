@@ -1,4 +1,4 @@
-use crate::model::{Folder, MAX_FOLDER_DEPTH, Project, SCHEMA_VERSION};
+use crate::model::{ApiRequest, Folder, MAX_FOLDER_DEPTH, Project, SCHEMA_VERSION};
 use crate::security::{is_valid_http_method, sha256};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -212,15 +212,6 @@ impl ProjectStore {
     }
 
     pub fn save(&self, project: &Project) -> Result<()> {
-        self.save_inner(project, false)
-    }
-
-    /// Force-saves a project even if an external modification conflict is detected.
-    pub fn save_overwrite(&self, project: &Project) -> Result<()> {
-        self.save_inner(project, true)
-    }
-
-    fn save_inner(&self, project: &Project, force: bool) -> Result<()> {
         validate_project(project)?;
         let id = Uuid::parse_str(&project.id).context("Invalid project ID")?;
         let id_str = id.to_string();
@@ -232,7 +223,7 @@ impl ProjectStore {
         recover_project_files(&dir, &id_str)?;
 
         let dest = dir.join("project.json");
-        if !force && dest.exists() {
+        if dest.exists() {
             let disk_bytes = read_bounded(&dest, MAX_PROJECT_BYTES)?;
             let disk_digest = sha256(&disk_bytes);
             let known = self
@@ -294,7 +285,7 @@ impl ProjectStore {
     }
 }
 
-fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("Read {}", path.display()))?;
     if let Ok(meta) = file.metadata()
         && meta.len() > max_bytes as u64
@@ -518,16 +509,7 @@ fn validate_project(project: &Project) -> Result<()> {
     let mut seen_ids = HashSet::new();
     for coll in &project.collections {
         register_id(&mut seen_ids, &coll.id, "collection")?;
-        for req in &coll.requests {
-            register_id(&mut seen_ids, &req.id, "request")?;
-            if !is_valid_http_method(&req.method) {
-                bail!(
-                    "Invalid HTTP method '{}' in request '{}'",
-                    req.method,
-                    req.name
-                );
-            }
-        }
+        validate_requests(&coll.requests, &mut seen_ids)?;
         for folder in &coll.folders {
             validate_folder(folder, 1, &mut seen_ids)?;
         }
@@ -544,7 +526,18 @@ fn validate_folder<'a>(
         bail!("Project folder nesting exceeds maximum depth ({MAX_FOLDER_DEPTH})");
     }
     register_id(seen_ids, &folder.id, "folder")?;
-    for req in &folder.requests {
+    validate_requests(&folder.requests, seen_ids)?;
+    for sub in &folder.folders {
+        validate_folder(sub, depth + 1, seen_ids)?;
+    }
+    Ok(())
+}
+
+fn validate_requests<'a>(
+    requests: &'a [ApiRequest],
+    seen_ids: &mut HashSet<&'a str>,
+) -> Result<()> {
+    for req in requests {
         register_id(seen_ids, &req.id, "request")?;
         if !is_valid_http_method(&req.method) {
             bail!(
@@ -553,9 +546,6 @@ fn validate_folder<'a>(
                 req.name
             );
         }
-    }
-    for sub in &folder.folders {
-        validate_folder(sub, depth + 1, seen_ids)?;
     }
     Ok(())
 }
@@ -573,7 +563,6 @@ fn register_id<'a>(seen: &mut HashSet<&'a str>, id: &'a str, kind: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ApiRequest;
 
     #[test]
     fn roundtrip_and_path_validation() {

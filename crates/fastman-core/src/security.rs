@@ -4,7 +4,7 @@ use crate::model::{ApiRequest, Auth};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
-pub const MAX_HTTP_METHOD_LEN: usize = 32;
+const MAX_HTTP_METHOD_LEN: usize = 32;
 
 /// Returns `true` if `method` is a valid, length-bounded RFC 9110 HTTP token.
 pub fn is_valid_http_method(method: &str) -> bool {
@@ -62,9 +62,18 @@ pub fn validate_template_or_http_url(raw: &str) -> Result<()> {
         return Ok(());
     }
     // Reject scheme-without-slashes forms such as `file:/etc/passwd`, `javascript:...`, `data:...`.
+    if has_non_port_scheme(trimmed) {
+        bail!("Only HTTP and HTTPS URLs are supported");
+    }
+    Ok(())
+}
+
+pub(crate) fn has_non_port_scheme(trimmed: &str) -> bool {
     let before_delim = trimmed.split(['/', '?', '#']).next().unwrap_or(trimmed);
-    if let Some((prefix, rest)) = before_delim.split_once(':')
-        && !prefix.is_empty()
+    let Some((prefix, rest)) = before_delim.split_once(':') else {
+        return false;
+    };
+    !prefix.is_empty()
         && !prefix.starts_with('[')
         && prefix.bytes().enumerate().all(|(idx, b)| {
             if idx == 0 {
@@ -73,13 +82,7 @@ pub fn validate_template_or_http_url(raw: &str) -> Result<()> {
                 b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
             }
         })
-    {
-        let is_port = !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
-        if !is_port {
-            bail!("Only HTTP and HTTPS URLs are supported");
-        }
-    }
-    Ok(())
+        && (rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn is_sensitive_header_name(name: &str) -> bool {
@@ -247,7 +250,7 @@ pub fn collect_sensitive_request_findings(
             });
         }
     }
-    if let Some((username, _)) = parse_url_userinfo(&request.url)
+    if let Some((_, username, _)) = strip_url_userinfo(&request.url)
         && !username.is_empty()
     {
         out.push(SensitiveFieldFinding {
@@ -256,7 +259,7 @@ pub fn collect_sensitive_request_findings(
             field_name: username,
         });
     }
-    if let Some((_, query)) = split_url_query(&request.url) {
+    if let Some((_, query, _)) = split_url_parts(&request.url) {
         for part in query.split('&').filter(|s| !s.is_empty()) {
             let (raw_k, raw_v) = part.split_once('=').unwrap_or((part, ""));
             let key = percent_decode(raw_k);
@@ -400,7 +403,7 @@ pub fn redact_url_secrets(raw_url: &str) -> String {
             .map(|part| {
                 let (raw_k, raw_v) = part.split_once('=').unwrap_or((part, ""));
                 let key = percent_decode(raw_k);
-                if is_sensitive_param_name(&key) && !raw_v.is_empty() {
+                if is_sensitive_param_name(&key) && !percent_decode(raw_v).trim().is_empty() {
                     modified = true;
                     format!("{raw_k}=<REDACTED>")
                 } else {
@@ -561,22 +564,6 @@ fn split_url_parts(raw: &str) -> Option<(&str, &str, Option<&str>)> {
         .map_or((raw, None), |(a, b)| (a, Some(b)));
     let (base, query) = before_frag.split_once('?')?;
     Some((base, query, frag))
-}
-
-fn split_url_query(raw: &str) -> Option<(&str, &str)> {
-    let (base, query, _) = split_url_parts(raw)?;
-    Some((base, query))
-}
-
-fn parse_url_userinfo(raw: &str) -> Option<(String, String)> {
-    let (_, after_scheme) = raw.split_once("://")?;
-    let auth_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..auth_end];
-    let (userinfo, _) = authority.rsplit_once('@')?;
-    let (u, p) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    Some((percent_decode(u), percent_decode(p)))
 }
 
 fn strip_url_userinfo(raw: &str) -> Option<(String, String, String)> {

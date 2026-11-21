@@ -11,7 +11,7 @@ use std::{
 use thiserror::Error;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-pub use crate::template::MAX_INTERPOLATED_BYTES;
+use crate::template::MAX_INTERPOLATED_BYTES;
 const MAX_REDIRECT_HOPS: usize = 10;
 
 #[derive(Debug, Error)]
@@ -23,7 +23,7 @@ pub enum HttpError {
     #[error("Interpolated value exceeds maximum size ({0} bytes)")]
     InterpolatedTooLarge(usize),
     #[error("Invalid URL: {0}")]
-    InvalidUrl(#[from] url_error::UrlError),
+    InvalidUrl(String),
     #[error("Invalid HTTP method: {0}")]
     Method(String),
     #[error("Invalid header name: {0}")]
@@ -34,13 +34,6 @@ pub enum HttpError {
     EmptyApiKeyParam,
     #[error("HTTP request failed: {0}")]
     Transport(#[from] reqwest::Error),
-}
-
-// A private wrapper avoids a separate direct `url` dependency.
-mod url_error {
-    #[derive(Debug, thiserror::Error)]
-    #[error("{0}")]
-    pub struct UrlError(pub String);
 }
 
 #[derive(Debug, Clone)]
@@ -156,12 +149,11 @@ impl HttpEngine {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| HttpError::Method(request.method.clone()))?;
         let url_text = interpolate(&request.url, variables)?;
-        let mut url = Url::parse(&url_text)
-            .map_err(|e| HttpError::InvalidUrl(url_error::UrlError(e.to_string())))?;
+        let mut url = Url::parse(&url_text).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
         if url.scheme() != "https" && url.scheme() != "http" {
-            return Err(HttpError::InvalidUrl(url_error::UrlError(
+            return Err(HttpError::InvalidUrl(
                 "Only HTTP and HTTPS are supported".into(),
-            )));
+            ));
         }
 
         {

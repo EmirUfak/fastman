@@ -2,15 +2,15 @@
 //! Scripts, auth inheritance, file uploads and complex protocol requests are
 //! not executed and are reported as unsupported rather than silently emulated.
 
-pub use crate::model::MAX_FOLDER_DEPTH;
-use crate::model::{ApiRequest, Collection, Folder, HttpBody, KeyValue, Project};
+use crate::model::{ApiRequest, Collection, Folder, HttpBody, KeyValue, MAX_FOLDER_DEPTH, Project};
 use crate::security::{
     SanitizeSummary, SensitiveFieldFinding, collect_sensitive_request_findings,
     is_valid_http_method, sanitize_request_credentials, validate_template_or_http_url,
 };
+use crate::storage::read_bounded;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::{fs::File, io::Read, path::Path};
+use std::path::Path;
 
 pub const MAX_IMPORT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMPORTED_ITEMS: usize = 10_000;
@@ -28,27 +28,24 @@ impl ImportReport {
     /// into session-only [`crate::model::Auth`] and strips any remaining sensitive headers
     /// and query credentials so they are not persisted in plaintext `project.json`.
     pub fn sanitize_credentials(&mut self) -> SanitizeSummary {
-        fn visit_folder(folder: &mut Folder, total: &mut SanitizeSummary) {
-            for req in &mut folder.requests {
+        fn sanitize_items(
+            requests: &mut [ApiRequest],
+            folders: &mut [Folder],
+            total: &mut SanitizeSummary,
+        ) {
+            for req in requests {
                 let s = sanitize_request_credentials(req);
                 total.moved_to_session_auth += s.moved_to_session_auth;
                 total.stripped_fields += s.stripped_fields;
             }
-            for sub in &mut folder.folders {
-                visit_folder(sub, total);
+            for sub in folders {
+                sanitize_items(&mut sub.requests, &mut sub.folders, total);
             }
         }
 
         let mut total = SanitizeSummary::default();
         for coll in &mut self.project.collections {
-            for req in &mut coll.requests {
-                let s = sanitize_request_credentials(req);
-                total.moved_to_session_auth += s.moved_to_session_auth;
-                total.stripped_fields += s.stripped_fields;
-            }
-            for sub in &mut coll.folders {
-                visit_folder(sub, &mut total);
-            }
+            sanitize_items(&mut coll.requests, &mut coll.folders, &mut total);
         }
         self.sensitive_fields.clear();
         total
@@ -57,25 +54,7 @@ impl ImportReport {
 
 /// Read a Collection v2.1 JSON file with a strict upper size bound before allocation.
 pub fn read_collection_file(path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("Open {}", path.display()))?;
-    if let Ok(meta) = file.metadata()
-        && meta.len() > MAX_IMPORT_BYTES as u64
-    {
-        bail!(
-            "Import file {} exceeds maximum allowed size ({MAX_IMPORT_BYTES} bytes)",
-            path.display()
-        );
-    }
-    let mut buf = Vec::new();
-    file.take((MAX_IMPORT_BYTES + 1) as u64)
-        .read_to_end(&mut buf)
-        .with_context(|| format!("Read {}", path.display()))?;
-    if buf.len() > MAX_IMPORT_BYTES {
-        bail!(
-            "Import file {} exceeds maximum allowed size ({MAX_IMPORT_BYTES} bytes)",
-            path.display()
-        );
-    }
+    let buf = read_bounded(path, MAX_IMPORT_BYTES)?;
     String::from_utf8(buf).with_context(|| format!("Decode {} as UTF-8", path.display()))
 }
 
@@ -120,24 +99,15 @@ pub fn collection_v21(input: &str) -> Result<ImportReport> {
         requests: 0,
         items: 0,
     };
-    if let Some(items) = root.get("item").and_then(Value::as_array) {
-        for item in items {
-            counters.bump_item()?;
-            if item.get("item").is_some() {
-                collection.folders.push(folder(
-                    item,
-                    1,
-                    &mut warnings,
-                    &mut sensitive_fields,
-                    &mut counters,
-                )?);
-            } else if let Some(req) = request(item, &mut warnings)? {
-                collect_sensitive_request_findings(&req, &mut sensitive_fields);
-                collection.requests.push(req);
-                counters.requests += 1;
-            }
-        }
-    }
+    import_items(
+        &root,
+        1,
+        &mut collection.folders,
+        &mut collection.requests,
+        &mut warnings,
+        &mut sensitive_fields,
+        &mut counters,
+    )?;
     project.collections = vec![collection];
     if root.get("event").is_some() {
         warnings.push("Collection scripts not imported".into());
@@ -151,6 +121,37 @@ pub fn collection_v21(input: &str) -> Result<ImportReport> {
         requests_imported: counters.requests,
         sensitive_fields,
     })
+}
+
+fn import_items(
+    parent: &Value,
+    folder_depth: usize,
+    folders: &mut Vec<Folder>,
+    requests: &mut Vec<ApiRequest>,
+    warnings: &mut Vec<String>,
+    sensitive_fields: &mut Vec<SensitiveFieldFinding>,
+    counters: &mut ImportCounters,
+) -> Result<()> {
+    let Some(items) = parent.get("item").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for item in items {
+        counters.bump_item()?;
+        if item.get("item").is_some() {
+            folders.push(folder(
+                item,
+                folder_depth,
+                warnings,
+                sensitive_fields,
+                counters,
+            )?);
+        } else if let Some(req) = request(item, warnings)? {
+            collect_sensitive_request_findings(&req, sensitive_fields);
+            requests.push(req);
+            counters.requests += 1;
+        }
+    }
+    Ok(())
 }
 
 fn folder(
@@ -170,24 +171,15 @@ fn folder(
         .filter(|s| !s.is_empty())
         .unwrap_or("Folder");
     let mut folder = Folder::new(name);
-    if let Some(children) = item.get("item").and_then(Value::as_array) {
-        for child in children {
-            counters.bump_item()?;
-            if child.get("item").is_some() {
-                folder.folders.push(self::folder(
-                    child,
-                    depth + 1,
-                    warnings,
-                    sensitive_fields,
-                    counters,
-                )?);
-            } else if let Some(req) = self::request(child, warnings)? {
-                collect_sensitive_request_findings(&req, sensitive_fields);
-                folder.requests.push(req);
-                counters.requests += 1;
-            }
-        }
-    }
+    import_items(
+        item,
+        depth + 1,
+        &mut folder.folders,
+        &mut folder.requests,
+        warnings,
+        sensitive_fields,
+        counters,
+    )?;
     Ok(folder)
 }
 

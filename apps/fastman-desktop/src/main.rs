@@ -2,6 +2,7 @@
 
 mod command_palette;
 mod explorer;
+mod import_view;
 mod kv_editor;
 mod request_editor;
 mod response_body_view;

@@ -35,12 +35,10 @@ pub fn find_resolved_spans(input: &str, variables: &BTreeMap<String, String>) ->
     let mut offset = 0;
     while let Some(rel_start) = input[offset..].find("{{") {
         let start = offset + rel_start;
-        let after_open = &input[start + 2..];
-        let Some(rel_end) = after_open.find("}}") else {
+        let Some((name, token, _)) = split_placeholder(&input[start..]) else {
             break;
         };
-        let end = start + 2 + rel_end + 2;
-        let name = after_open[..rel_end].trim();
+        let end = start + token.len();
         if variables.contains_key(name) {
             spans.push(TemplateSpan {
                 range: start..end,
@@ -50,6 +48,14 @@ pub fn find_resolved_spans(input: &str, variables: &BTreeMap<String, String>) ->
         offset = end;
     }
     spans
+}
+
+/// Split a string starting with `{{` into a trimmed name, token, and remainder.
+fn split_placeholder(raw: &str) -> Option<(&str, &str, &str)> {
+    let after_open = &raw[2..];
+    let end = after_open.find("}}")?;
+    let (token, rest) = raw.split_at(end + 4);
+    Some((after_open[..end].trim(), token, rest))
 }
 
 /// Resolve each token once. `name` is absent for an unclosed token.
@@ -70,13 +76,11 @@ pub(crate) fn expand<'a, E>(
     while let Some(start) = remainder.find("{{") {
         push(&remainder[..start])?;
         let raw = &remainder[start..];
-        let after_open = &raw[2..];
-        let Some(end) = after_open.find("}}") else {
+        let Some((name, token, rest)) = split_placeholder(raw) else {
             push(resolve(None, raw)?)?;
             return Ok(output);
         };
-        let (token, rest) = raw.split_at(end + 4);
-        push(resolve(Some(after_open[..end].trim()), token)?)?;
+        push(resolve(Some(name), token)?)?;
         remainder = rest;
     }
     push(remainder)?;
@@ -245,7 +249,7 @@ mod tests {
             ("prod".into(), "api.example.com".into()),
             ("v".into(), "v2".into()),
         ]);
-        let input = "https://{{ prod }}/{{missing}}/{{v}}/{{unclosed";
+        let input = "https://{{ prod }}/café/{{missing}}/{{v}}/{{unclosed";
         let spans = find_resolved_spans(input, &vars);
         assert_eq!(spans.len(), 2);
         assert_eq!(&input[spans[0].range.clone()], "{{ prod }}");

@@ -12,16 +12,21 @@ use gpui_kit::*;
 use std::collections::BTreeMap;
 
 /// A single editable key-value row backed by retained GPUI input states.
-#[derive(Clone)]
-pub struct KvRow {
-    pub enabled: bool,
-    pub key: Entity<InputState>,
-    pub value: Entity<InputState>,
+struct KvRow {
+    enabled: bool,
+    key: Entity<InputState>,
+    value: Entity<InputState>,
+}
+
+impl KvRow {
+    fn is_blank(&self, cx: &App) -> bool {
+        self.key.read(cx).value().is_empty() && self.value.read(cx).value().is_empty()
+    }
 }
 
 /// Editable checkable key-value table with a trailing blank entry row.
 pub struct KvTable {
-    pub rows: Vec<KvRow>,
+    rows: Vec<KvRow>,
     key_placeholder: &'static str,
     value_placeholder: &'static str,
     show_enabled: bool,
@@ -108,9 +113,7 @@ impl KvTable {
             self.rows.push(row);
             self.subscriptions.extend(subs);
         }
-        let (blank, subs) = self.make_row(true, "", "", window, cx, on_change);
-        self.rows.push(blank);
-        self.subscriptions.extend(subs);
+        self.add_row(window, cx, on_change);
     }
 
     pub fn load_map<V: 'static>(
@@ -144,9 +147,7 @@ impl KvTable {
         on_change: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
     ) {
         let insert_idx = self.rows.len().saturating_sub(1);
-        let trailing_blank = self.rows.last().is_some_and(|r| {
-            r.key.read(cx).value().is_empty() && r.value.read(cx).value().is_empty()
-        });
+        let trailing_blank = self.rows.last().is_some_and(|row| row.is_blank(cx));
         let (row, subs) = self.make_row(true, key, value, window, cx, on_change);
         self.subscriptions.extend(subs);
         if trailing_blank {
@@ -162,10 +163,7 @@ impl KvTable {
         cx: &mut Context<V>,
         on_change: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
     ) {
-        let needs_blank = self.rows.last().is_none_or(|last| {
-            !last.key.read(cx).value().is_empty() || !last.value.read(cx).value().is_empty()
-        });
-        if needs_blank {
+        if !self.rows.last().is_some_and(|row| row.is_blank(cx)) {
             self.add_row(window, cx, on_change);
         }
     }
@@ -253,9 +251,7 @@ pub fn render_kv_table<V: 'static>(
 
     let mut rows_ui = Vec::with_capacity(row_count);
     for (idx, row) in table.rows.iter().enumerate() {
-        let is_empty_trailing = idx + 1 == row_count
-            && row.key.read(cx).value().is_empty()
-            && row.value.read(cx).value().is_empty();
+        let is_empty_trailing = idx + 1 == row_count && row.is_blank(cx);
         let view_toggle = cx.weak_entity();
         let on_toggle_cb = on_toggle.clone();
         let on_remove_cb = on_remove.clone();

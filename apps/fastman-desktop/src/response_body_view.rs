@@ -12,7 +12,7 @@ pub const MAX_PRETTY_JSON_SOURCE_BYTES: usize = 512 * 1024;
 pub const MAX_HIGHLIGHTED_JSON_LINES: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JsonTokenKind {
+enum JsonTokenKind {
     Key,
     String,
     Number,
@@ -22,15 +22,15 @@ pub enum JsonTokenKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenSpan<'a> {
-    pub text: &'a str,
-    pub kind: JsonTokenKind,
+struct TokenSpan<'a> {
+    text: &'a str,
+    kind: JsonTokenKind,
 }
 
 #[derive(Debug, Clone)]
 pub struct HighlightedLine {
-    pub text: SharedString,
-    pub tokens: Vec<(Range<usize>, JsonTokenKind)>,
+    text: SharedString,
+    tokens: Vec<(Range<usize>, JsonTokenKind)>,
 }
 
 #[derive(Clone)]
@@ -46,10 +46,17 @@ impl CodeLines {
             Self::Plain(lines) => lines.len(),
         }
     }
+
+    fn line_and_tokens(&self, idx: usize) -> (&SharedString, &[(Range<usize>, JsonTokenKind)]) {
+        match self {
+            Self::Json(items) => (&items[idx].text, &items[idx].tokens),
+            Self::Plain(items) => (&items[idx], &[]),
+        }
+    }
 }
 
 /// Tokenize a single line of JSON into syntax spans.
-pub fn tokenize_json_line(line: &str) -> Vec<TokenSpan<'_>> {
+fn tokenize_json_line(line: &str) -> Vec<TokenSpan<'_>> {
     let mut spans = Vec::new();
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -314,34 +321,25 @@ fn build_line_segments(
     if line.is_empty() {
         return Vec::new();
     }
-    if search_lower.is_empty() {
-        return tokens
-            .iter()
-            .filter(|(r, _)| {
-                r.start < r.end
-                    && r.end <= line.len()
-                    && line.is_char_boundary(r.start)
-                    && line.is_char_boundary(r.end)
-            })
-            .map(|(r, kind)| (r.clone(), Some(*kind), false))
-            .collect();
-    }
-
-    let lower = line.to_ascii_lowercase();
-    let matches: Vec<Range<usize>> = if lower.len() == line.len() {
-        lower
-            .match_indices(search_lower)
-            .filter_map(|(start, matched)| {
-                let end = start + matched.len();
-                (start < end
-                    && end <= line.len()
-                    && line.is_char_boundary(start)
-                    && line.is_char_boundary(end))
-                .then_some(start..end)
-            })
-            .collect()
-    } else {
+    let matches: Vec<Range<usize>> = if search_lower.is_empty() {
         Vec::new()
+    } else {
+        let lower = line.to_ascii_lowercase();
+        if lower.len() == line.len() {
+            lower
+                .match_indices(search_lower)
+                .filter_map(|(start, matched)| {
+                    let end = start + matched.len();
+                    (start < end
+                        && end <= line.len()
+                        && line.is_char_boundary(start)
+                        && line.is_char_boundary(end))
+                    .then_some(start..end)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     };
 
     if matches.is_empty() {
@@ -413,7 +411,7 @@ fn build_line_segments(
     out
 }
 
-pub fn build_line_highlights(
+fn build_line_highlights(
     line: &str,
     tokens: &[(Range<usize>, JsonTokenKind)],
     search_lower: &str,
@@ -463,36 +461,24 @@ pub fn render_virtual_code_lines(
     if wrap && line_count <= MAX_WRAP_LINES {
         let mut rows = Vec::with_capacity(line_count);
         for idx in 0..line_count {
-            let (text, runs) = match &lines {
-                CodeLines::Json(items) => {
-                    let item = &items[idx];
-                    let runs = build_line_highlights(
-                        &item.text,
-                        &item.tokens,
-                        search_lower,
-                        is_dark,
-                        muted_fg,
-                        foreground,
-                        highlight_bg,
-                    );
-                    (item.text.clone(), runs)
-                }
-                CodeLines::Plain(items) => {
-                    let item = &items[idx];
-                    let runs = build_line_highlights(
-                        item,
-                        &[],
-                        search_lower,
-                        is_dark,
-                        muted_fg,
-                        foreground,
-                        highlight_bg,
-                    );
-                    (item.clone(), runs)
-                }
-            };
+            let (text, tokens) = lines.line_and_tokens(idx);
+            let runs = build_line_highlights(
+                text,
+                tokens,
+                search_lower,
+                is_dark,
+                muted_fg,
+                foreground,
+                highlight_bg,
+            );
             rows.push(render_code_row(
-                idx, text, runs, true, gutter_fg, border, row_hover,
+                idx,
+                text.clone(),
+                runs,
+                true,
+                gutter_fg,
+                border,
+                row_hover,
             ));
         }
         return div()
@@ -515,36 +501,24 @@ pub fn render_virtual_code_lines(
         move |range, _, _| -> Vec<AnyElement> {
             let mut items = Vec::with_capacity(range.len());
             for idx in range {
-                let (text, runs) = match &lines {
-                    CodeLines::Json(vec) => {
-                        let item = &vec[idx];
-                        let runs = build_line_highlights(
-                            &item.text,
-                            &item.tokens,
-                            &search_owned,
-                            is_dark,
-                            muted_fg,
-                            foreground,
-                            highlight_bg,
-                        );
-                        (item.text.clone(), runs)
-                    }
-                    CodeLines::Plain(vec) => {
-                        let item = &vec[idx];
-                        let runs = build_line_highlights(
-                            item,
-                            &[],
-                            &search_owned,
-                            is_dark,
-                            muted_fg,
-                            foreground,
-                            highlight_bg,
-                        );
-                        (item.clone(), runs)
-                    }
-                };
+                let (text, tokens) = lines.line_and_tokens(idx);
+                let runs = build_line_highlights(
+                    text,
+                    tokens,
+                    &search_owned,
+                    is_dark,
+                    muted_fg,
+                    foreground,
+                    highlight_bg,
+                );
                 items.push(render_code_row(
-                    idx, text, runs, false, gutter_fg, border, row_hover,
+                    idx,
+                    text.clone(),
+                    runs,
+                    false,
+                    gutter_fg,
+                    border,
+                    row_hover,
                 ));
             }
             items
