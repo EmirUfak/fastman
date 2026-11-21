@@ -13,6 +13,17 @@ use std::collections::BTreeMap;
 
 pub const MAX_CURL_IMPORT_BYTES: usize = 1024 * 1024;
 
+/// Returns `true` when `input` looks like a pasted `curl ...` or `curl.exe ...` command.
+pub fn looks_like_curl_command(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let rest = &trimmed[first.len()..];
+    !rest.trim_start().is_empty()
+        && (first.eq_ignore_ascii_case("curl") || first.eq_ignore_ascii_case("curl.exe"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurlExport {
     pub command: String,
@@ -20,8 +31,20 @@ pub struct CurlExport {
     pub had_variables: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CurlParseReport {
+    pub request: ApiRequest,
+    pub unsupported_flags: Vec<String>,
+}
+
 /// Parse a POSIX-style `curl ...` command string into an [`ApiRequest`].
 pub fn parse_curl(input: &str) -> Result<ApiRequest> {
+    Ok(parse_curl_report(input)?.request)
+}
+
+/// Parse a POSIX-style `curl ...` command string and report any unmapped flags
+/// whose behavior cannot be represented in [`ApiRequest`].
+pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
     if input.len() > MAX_CURL_IMPORT_BYTES {
         bail!("cURL command exceeds maximum size ({MAX_CURL_IMPORT_BYTES} bytes)");
     }
@@ -46,6 +69,7 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
     let mut body_parts: Vec<String> = Vec::new();
     let mut urlencoded_parts: Vec<KeyValue> = Vec::new();
     let mut auth = Auth::None;
+    let mut unsupported_flags: Vec<String> = Vec::new();
 
     while idx < tokens.len() {
         let tok = &tokens[idx];
@@ -107,7 +131,16 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
             force_get = true;
         } else if tok == "-I" || tok == "--head" {
             explicit_method = Some("HEAD".to_owned());
+        } else if tok == "-g" || tok == "--globoff" {
+            // Fastman never interprets cURL URL globbing syntax (`{a,b}`, `[1-9]`).
         } else if tok.starts_with('-') {
+            if let Some(flag_name) = sanitize_unsupported_flag(tok)
+                && !unsupported_flags
+                    .iter()
+                    .any(|existing| existing == flag_name)
+            {
+                unsupported_flags.push(flag_name.to_owned());
+            }
             // Skip known value-taking flags that aren't mapped yet so their args don't become the URL.
             if takes_separate_value(tok) && idx + 1 < tokens.len() {
                 idx += 1;
@@ -182,7 +215,10 @@ pub fn parse_curl(input: &str) -> Result<ApiRequest> {
     request.headers = headers;
     request.body = body;
     request.auth = auth;
-    Ok(request)
+    Ok(CurlParseReport {
+        request,
+        unsupported_flags,
+    })
 }
 
 /// Format an [`ApiRequest`] as a POSIX shell `curl` command with all variables resolved.
@@ -630,61 +666,71 @@ fn match_data_flag(tok: &str, tokens: &[String], idx: &mut usize) -> Option<Stri
     None
 }
 
-fn takes_separate_value(tok: &str) -> bool {
+fn is_short_value_flag(short: &str) -> bool {
     matches!(
-        tok,
-        "-b" | "--cookie"
-            | "-c"
-            | "--cookie-jar"
-            | "-e"
-            | "--referer"
-            | "-o"
-            | "--output"
-            | "-x"
-            | "--proxy"
-            | "-m"
-            | "--max-time"
-            | "--connect-timeout"
-            | "--resolve"
-            | "--oauth2-bearer"
-            | "-E"
-            | "--cert"
-            | "--cert-type"
-            | "--key"
-            | "--key-type"
-            | "--pass"
-            | "-U"
-            | "--proxy-user"
-            | "-F"
-            | "--form"
-            | "--form-string"
-            | "-T"
-            | "--upload-file"
-            | "-K"
-            | "--config"
-            | "--cacert"
-            | "--capath"
-            | "-D"
-            | "--dump-header"
-            | "-w"
-            | "--write-out"
-            | "--interface"
-            | "--max-redirs"
-            | "--retry"
-            | "--retry-delay"
-            | "--retry-max-time"
-            | "--proto"
-            | "--proto-redir"
-            | "--connect-to"
-            | "--dns-servers"
-            | "--unix-socket"
-            | "--abstract-unix-socket"
-            | "--aws-sigv4"
-            | "--pinnedpubkey"
-            | "--crlfile"
-            | "--etag-save"
-            | "--etag-compare"
+        short,
+        "-b" | "-c" | "-e" | "-o" | "-x" | "-m" | "-E" | "-U" | "-F" | "-T" | "-K" | "-D" | "-w"
     )
+}
+
+fn sanitize_unsupported_flag(tok: &str) -> Option<&str> {
+    if tok == "-" {
+        return None;
+    }
+    if !tok.starts_with("--") && tok.len() > 2 && is_short_value_flag(&tok[..2]) {
+        return Some(&tok[..2]);
+    }
+    if let Some((flag, _)) = tok.split_once('=') {
+        return (!flag.is_empty()).then_some(flag);
+    }
+    Some(tok)
+}
+
+fn takes_separate_value(tok: &str) -> bool {
+    is_short_value_flag(tok)
+        || matches!(
+            tok,
+            "--cookie"
+                | "--cookie-jar"
+                | "--referer"
+                | "--output"
+                | "--proxy"
+                | "--max-time"
+                | "--connect-timeout"
+                | "--resolve"
+                | "--oauth2-bearer"
+                | "--cert"
+                | "--cert-type"
+                | "--key"
+                | "--key-type"
+                | "--pass"
+                | "--proxy-user"
+                | "--form"
+                | "--form-string"
+                | "--upload-file"
+                | "--config"
+                | "--cacert"
+                | "--capath"
+                | "--dump-header"
+                | "--write-out"
+                | "--interface"
+                | "--max-redirs"
+                | "--retry"
+                | "--retry-delay"
+                | "--retry-max-time"
+                | "--proto"
+                | "--proto-redir"
+                | "--connect-to"
+                | "--dns-servers"
+                | "--unix-socket"
+                | "--abstract-unix-socket"
+                | "--aws-sigv4"
+                | "--pinnedpubkey"
+                | "--crlfile"
+                | "--etag-save"
+                | "--etag-compare"
+                | "--json"
+        )
 }
 
 fn tokenize_shell(input: &str) -> Result<Vec<String>> {
@@ -964,5 +1010,36 @@ mod tests {
                 .contains("Authorization: Bearer <REDACTED>")
         );
         assert!(redacted.command.contains("Authorization: <REDACTED>"));
+    }
+
+    #[test]
+    fn looks_like_curl_command_detects_curl_prefixes_only() {
+        assert!(looks_like_curl_command("curl https://example.com"));
+        assert!(looks_like_curl_command(
+            "  CURL.EXE -X POST https://example.com"
+        ));
+        assert!(looks_like_curl_command("curl\n  --url https://example.com"));
+        assert!(!looks_like_curl_command("curl"));
+        assert!(!looks_like_curl_command("https://example.com/curl"));
+        assert!(!looks_like_curl_command("curlify https://example.com"));
+    }
+
+    #[test]
+    fn parse_curl_report_surfaces_unsupported_flags_without_leaking_values() {
+        let cmd = "curl -g -k --form file=@secret.txt -Fpart=secret_part --cookie=sid=canary_cookie --json '{\"a\":1}' https://api.example.com/upload";
+        let report = parse_curl_report(cmd).unwrap();
+        assert_eq!(report.request.url, "https://api.example.com/upload");
+        assert_eq!(
+            report.unsupported_flags,
+            vec!["-k", "--form", "-F", "--cookie", "--json"]
+        );
+        let joined = report.unsupported_flags.join(" ");
+        assert!(!joined.contains("canary_cookie"));
+        assert!(!joined.contains("secret_part"));
+        assert!(!joined.contains("secret.txt"));
+
+        // Supported `-g` alone emits no unsupported warnings.
+        let clean = parse_curl_report("curl -g --url 'https://{{host}}/items'").unwrap();
+        assert!(clean.unsupported_flags.is_empty());
     }
 }

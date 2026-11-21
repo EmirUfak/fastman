@@ -7,7 +7,7 @@ pub mod import;
 pub mod model;
 pub mod security;
 pub mod storage;
-mod template;
+pub mod template;
 
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{ApiRequest, Auth, Collection, Folder, HttpBody, KeyValue, Project};

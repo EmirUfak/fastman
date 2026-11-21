@@ -12,7 +12,7 @@ use gpui_kit::component::{
         Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant,
         EmptyTitle,
     },
-    input::{Editor, Input, InputState},
+    input::{Editor, Input, InputState, InputToken},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
 };
@@ -55,12 +55,9 @@ impl RequestDraft {
 }
 
 impl WorkspaceView {
-    pub(super) fn read_request_draft(&self, cx: &App) -> Result<RequestDraft> {
+    pub(super) fn snapshot_draft_request(&self, cx: &App) -> ApiRequest {
         let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
-        let timeout_ms = text(&self.timeout)
-            .trim()
-            .parse()
-            .context("Timeout must be an integer number of milliseconds")?;
+        let timeout_ms = text(&self.timeout).trim().parse().unwrap_or(30_000);
         let body = match self.body_kind {
             1 => HttpBody::Json(self.body_editor.read(cx).value().to_string()),
             2 => HttpBody::Text(self.body_editor.read(cx).value().to_string()),
@@ -85,14 +82,36 @@ impl WorkspaceView {
             },
             _ => Auth::None,
         };
+        let mut req = ApiRequest::new(
+            self.method.clone(),
+            text(&self.request_name).trim(),
+            text(&self.url),
+        );
+        req.params = self.params_table.to_key_values(cx);
+        req.headers = self.headers_table.to_key_values(cx);
+        req.body = body;
+        req.auth = auth;
+        req.timeout_ms = timeout_ms;
+        req
+    }
+
+    pub(super) fn read_request_draft(&self, cx: &App) -> Result<RequestDraft> {
+        let timeout_ms = self
+            .timeout
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .context("Timeout must be an integer number of milliseconds")?;
+        let snap = self.snapshot_draft_request(cx);
         Ok(RequestDraft {
-            name: text(&self.request_name).trim().to_owned(),
-            method: self.method.clone(),
-            url: text(&self.url),
-            params: self.params_table.to_key_values(cx),
-            headers: self.headers_table.to_key_values(cx),
-            body,
-            auth,
+            name: snap.name,
+            method: snap.method,
+            url: snap.url,
+            params: snap.params,
+            headers: snap.headers,
+            body: snap.body,
+            auth: snap.auth,
             timeout_ms,
         })
     }
@@ -316,6 +335,13 @@ impl WorkspaceView {
         let params_count = self.params_active_count;
         let headers_count = self.headers_active_count;
         let mono = cx.theme().mono_font_family.clone();
+        let url_val = self.url.read(cx).value().to_string();
+        let curl_in_url = fastman_core::curl::looks_like_curl_command(&url_val);
+        let tmpl = &self.template_inspection;
+        let has_missing_vars = !tmpl.missing_variables.is_empty() || tmpl.unclosed;
+        let show_resolved_url =
+            !curl_in_url && tmpl.url_has_templates && tmpl.url_preview != url_val;
+        let orange_accent = brand_accent(is_dark);
 
         let url_bar = div()
             .flex()
@@ -372,8 +398,74 @@ impl WorkspaceView {
                                 .small()
                                 .appearance(false)
                                 .font_family(mono)
-                                .text_size(px(12.5)),
+                                .text_size(px(12.5))
+                                .token(move |token_ctx, _, _| {
+                                    let bg = if token_ctx.is_selected() {
+                                        orange_accent.opacity(0.28)
+                                    } else {
+                                        orange_accent.opacity(0.16)
+                                    };
+                                    let border_color = if token_ctx.is_selected() {
+                                        orange_accent
+                                    } else {
+                                        orange_accent.opacity(0.45)
+                                    };
+                                    InputToken::new(token_ctx)
+                                        .bg(bg)
+                                        .border_color(border_color)
+                                        .text_color(orange_accent)
+                                        .font_weight(FontWeight::MEDIUM)
+                                })
+                                .on_token_click(cx.listener(|view, _, window, cx| {
+                                    view.open_variables_sheet(window, cx);
+                                })),
                         ),
+                    )
+                    .when(
+                        !curl_in_url && (has_missing_vars || tmpl.url_resolved_count > 0),
+                        |el| {
+                            let (pill_bg, pill_border, pill_fg, pill_label) = if has_missing_vars {
+                                let count = tmpl.missing_variables.len();
+                                let label = if tmpl.unclosed && count == 0 {
+                                    "Unclosed".to_owned()
+                                } else {
+                                    format!("{count} missing")
+                                };
+                                (
+                                    cx.theme().warning.opacity(0.16),
+                                    cx.theme().warning.opacity(0.45),
+                                    cx.theme().warning,
+                                    label,
+                                )
+                            } else {
+                                let count = tmpl.url_resolved_count;
+                                (
+                                    orange_accent.opacity(0.16),
+                                    orange_accent.opacity(0.45),
+                                    orange_accent,
+                                    if count == 1 {
+                                        "1 var".to_owned()
+                                    } else {
+                                        format!("{count} vars")
+                                    },
+                                )
+                            };
+                            el.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .mr_1()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(pill_border)
+                                    .bg(pill_bg)
+                                    .text_color(pill_fg)
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(pill_label),
+                            )
+                        },
                     ),
             )
             .child(if in_flight {
@@ -519,6 +611,91 @@ impl WorkspaceView {
                     ),
             );
 
+        let show_url_assist = curl_in_url || show_resolved_url || has_missing_vars;
+        let url_assist_bar = show_url_assist.then(|| {
+            let missing_summary =
+                format_missing_vars_summary(&tmpl.missing_variables, tmpl.unclosed);
+            let mono_font = cx.theme().mono_font_family.clone();
+            div()
+                .px_3()
+                .pb_2()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(11.5))
+                .when(curl_in_url, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .bg(cx.theme().info.opacity(0.14))
+                            .text_color(cx.theme().info)
+                            .child(svg_icon("icons/terminal.svg").xsmall())
+                            .child("cURL command detected in URL bar"),
+                    )
+                    .child(
+                        Button::new("parse-url-curl")
+                            .xsmall()
+                            .primary()
+                            .label("Parse cURL")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.parse_url_bar_curl(window, cx);
+                            })),
+                    )
+                })
+                .when(show_resolved_url, |el| {
+                    el.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_color(muted_fg)
+                            .child(svg_icon("icons/globe.svg").xsmall())
+                            .child("Resolved:")
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(mono_font)
+                                    .child(tmpl.url_preview.clone()),
+                            ),
+                    )
+                })
+                .when(has_missing_vars, |el| {
+                    el.when(curl_in_url || !show_resolved_url, |inner| {
+                        inner.child(div().flex_1())
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().warning)
+                            .child(svg_icon("icons/triangle-alert.svg").xsmall())
+                            .child(missing_summary),
+                    )
+                    .child(
+                        Button::new("define-missing-vars")
+                            .ghost()
+                            .xsmall()
+                            .icon(svg_icon("icons/variable.svg").xsmall())
+                            .label("Variables")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_variables_sheet(window, cx);
+                            })),
+                    )
+                })
+        });
+
         div()
             .size_full()
             .flex()
@@ -526,6 +703,7 @@ impl WorkspaceView {
             .bg(bg)
             .child(tab_strip)
             .child(url_bar)
+            .when_some(url_assist_bar, |el, bar| el.child(bar))
             .child(section_tabs)
             .child(
                 div()
@@ -1069,6 +1247,28 @@ impl WorkspaceView {
                 .into_any_element(),
         }
     }
+}
+
+fn format_missing_vars_summary(missing: &[String], unclosed: bool) -> String {
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        let shown: Vec<String> = missing
+            .iter()
+            .take(3)
+            .map(|name| format!("{{{{{name}}}}}"))
+            .collect();
+        let extra = missing.len().saturating_sub(3);
+        let list = if extra > 0 {
+            format!("{} (+{extra} more)", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        parts.push(format!("Unresolved: {list}"));
+    }
+    if unclosed {
+        parts.push("Unclosed {{variable}}".to_owned());
+    }
+    parts.join(" · ")
 }
 
 fn tab_icon(path: &'static str) -> AnyElement {
