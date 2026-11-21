@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-21
+
+### Changed
+- Raised the minimum build toolchain to Rust 1.100 and configured the workspace to use stable Rust.
+- Updated dependencies to their latest compatible stable releases and removed unused dependency features.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

@@ -2,7 +2,7 @@
 
 **A native, local-first API development client written in Rust and GPUI Kit.**
 
-> Status: **v0.2.0** (early open-source preview). See the [changelog](CHANGELOG.md) for release details.
+> Status: **v0.2.1** (early open-source preview). See the [changelog](CHANGELOG.md) for release details.
 
 ## Product contract
 
@@ -49,7 +49,7 @@ Importing a collection file creates a new project. Import does **not** execute r
 
 ## Build and test
 
-Install Rust stable (`>= 1.88`) and GPUI Kit's native prerequisites for your target OS.
+Install Rust stable (`>= 1.100`) and GPUI Kit's native prerequisites for your target OS.
 
 ```sh
 cargo fmt --all -- --check

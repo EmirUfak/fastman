@@ -4,19 +4,21 @@ default-members = ["apps/fastman-desktop"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.100"
 keywords = ["api-client", "http", "rest", "local-first"]
 categories = ["development-tools", "web-programming::http-client"]
 
 [workspace.dependencies]
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "2.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+uuid = { version = "1.29.3", features = ["v4"] }
+tokio = "1.54.1"
+tempfile = "3.27.0"
 
 [profile.dev.package."*"]
 opt-level = 2
