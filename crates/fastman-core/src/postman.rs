@@ -2,6 +2,7 @@
 //! Scripts, auth inheritance, file uploads and complex protocol requests are
 //! not executed and are reported as unsupported rather than silently emulated.
 
+pub use crate::model::MAX_FOLDER_DEPTH;
 use crate::model::{ApiRequest, Collection, Folder, HttpBody, KeyValue, Project};
 use crate::security::{
     SanitizeSummary, SensitiveFieldFinding, collect_sensitive_request_findings,
@@ -12,7 +13,6 @@ use serde_json::Value;
 use std::{fs::File, io::Read, path::Path};
 
 pub const MAX_IMPORT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_FOLDER_DEPTH: usize = 32;
 pub const MAX_IMPORTED_ITEMS: usize = 10_000;
 
 #[derive(Debug)]

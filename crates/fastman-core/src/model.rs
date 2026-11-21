@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const MAX_FOLDER_DEPTH: usize = 32;
 
 fn new_id() -> String {
     Uuid::new_v4().to_string()

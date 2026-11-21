@@ -1,5 +1,4 @@
-use crate::import::MAX_FOLDER_DEPTH;
-use crate::model::{Folder, Project, SCHEMA_VERSION};
+use crate::model::{Folder, MAX_FOLDER_DEPTH, Project, SCHEMA_VERSION};
 use crate::security::{is_valid_http_method, sha256};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

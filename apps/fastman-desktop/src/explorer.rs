@@ -595,7 +595,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
         out: &mut Vec<AnyElement>,
     ) {
-        if depth as usize > fastman_core::import::MAX_FOLDER_DEPTH {
+        if depth as usize > fastman_core::model::MAX_FOLDER_DEPTH {
             return;
         }
         if !query.is_empty() && !folder_matches(folder, query) {

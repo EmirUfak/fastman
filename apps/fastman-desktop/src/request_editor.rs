@@ -2,6 +2,8 @@ use crate::kv_editor::render_kv_table;
 use crate::theme::{
     brand_accent, count_pill, dot_indicator, method_badge, method_mini_label, svg_icon,
 };
+use anyhow::{Context as _, Result};
+use fastman_core::{ApiRequest, Auth, HttpBody, KeyValue};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     alert::Alert,
@@ -10,7 +12,7 @@ use gpui_kit::component::{
         Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant,
         EmptyTitle,
     },
-    input::{Editor, Input},
+    input::{Editor, Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
 };
@@ -26,7 +28,75 @@ const COMMON_HEADERS: &[(&str, &str)] = &[
     ("User-Agent", "Fastman/0.1"),
 ];
 
+pub(super) struct RequestDraft {
+    name: String,
+    method: String,
+    url: String,
+    params: Vec<KeyValue>,
+    headers: Vec<KeyValue>,
+    body: HttpBody,
+    auth: Auth,
+    timeout_ms: u64,
+}
+
+impl RequestDraft {
+    pub(super) fn apply_to(self, request: &mut ApiRequest) {
+        if !self.name.is_empty() {
+            request.name = self.name;
+        }
+        request.method = self.method;
+        request.url = self.url;
+        request.params = self.params;
+        request.headers = self.headers;
+        request.body = self.body;
+        request.auth = self.auth;
+        request.timeout_ms = self.timeout_ms;
+    }
+}
+
 impl WorkspaceView {
+    pub(super) fn read_request_draft(&self, cx: &App) -> Result<RequestDraft> {
+        let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        let timeout_ms = text(&self.timeout)
+            .trim()
+            .parse()
+            .context("Timeout must be an integer number of milliseconds")?;
+        let body = match self.body_kind {
+            1 => HttpBody::Json(self.body_editor.read(cx).value().to_string()),
+            2 => HttpBody::Text(self.body_editor.read(cx).value().to_string()),
+            3 => HttpBody::FormUrlEncoded(self.form_table.to_key_values(cx)),
+            _ => HttpBody::None,
+        };
+        let auth = match self.auth_kind {
+            1 => Auth::Basic {
+                username: text(&self.auth_user),
+                password: text(&self.auth_password),
+            },
+            2 => Auth::Bearer {
+                token: text(&self.auth_token),
+            },
+            3 => Auth::ApiKeyHeader {
+                name: text(&self.api_key_name),
+                value: text(&self.api_key_value),
+            },
+            4 => Auth::ApiKeyQuery {
+                name: text(&self.api_key_name),
+                value: text(&self.api_key_value),
+            },
+            _ => Auth::None,
+        };
+        Ok(RequestDraft {
+            name: text(&self.request_name).trim().to_owned(),
+            method: self.method.clone(),
+            url: text(&self.url),
+            params: self.params_table.to_key_values(cx),
+            headers: self.headers_table.to_key_values(cx),
+            body,
+            auth,
+            timeout_ms,
+        })
+    }
+
     pub(super) fn render_request_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let bg = cx.theme().background;
         let tab_bar_bg = cx.theme().tab_bar;

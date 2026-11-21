@@ -11,7 +11,7 @@ use std::{
 use thiserror::Error;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_INTERPOLATED_BYTES: usize = 4 * 1024 * 1024;
+pub use crate::template::MAX_INTERPOLATED_BYTES;
 const MAX_REDIRECT_HOPS: usize = 10;
 
 #[derive(Debug, Error)]
@@ -349,34 +349,17 @@ fn expand_pairs(
 /// Single-pass substitution; values are not recursively interpreted and total
 /// output length is bounded to prevent memory exhaustion bombs.
 pub fn interpolate(input: &str, variables: &BTreeMap<String, String>) -> Result<String, HttpError> {
-    let mut output = String::with_capacity(input.len().min(MAX_INTERPOLATED_BYTES));
-    let mut remainder = input;
-    while let Some(start) = remainder.find("{{") {
-        let prefix = &remainder[..start];
-        push_bounded(&mut output, prefix)?;
-        let after_open = &remainder[start + 2..];
-        let end = after_open.find("}}").ok_or(HttpError::UnclosedVariable)?;
-        let name = after_open[..end].trim();
-        let value = variables
-            .get(name)
-            .ok_or_else(|| HttpError::MissingVariable(name.to_owned()))?;
-        push_bounded(&mut output, value)?;
-        remainder = &after_open[end + 2..];
-    }
-    push_bounded(&mut output, remainder)?;
-    Ok(output)
-}
-
-fn push_bounded(output: &mut String, piece: &str) -> Result<(), HttpError> {
-    let next_len = output
-        .len()
-        .checked_add(piece.len())
-        .ok_or(HttpError::InterpolatedTooLarge(MAX_INTERPOLATED_BYTES))?;
-    if next_len > MAX_INTERPOLATED_BYTES {
-        return Err(HttpError::InterpolatedTooLarge(MAX_INTERPOLATED_BYTES));
-    }
-    output.push_str(piece);
-    Ok(())
+    crate::template::expand(
+        input,
+        |name, _| {
+            let name = name.ok_or(HttpError::UnclosedVariable)?;
+            variables
+                .get(name)
+                .map(String::as_str)
+                .ok_or_else(|| HttpError::MissingVariable(name.to_owned()))
+        },
+        || HttpError::InterpolatedTooLarge(MAX_INTERPOLATED_BYTES),
+    )
 }
 
 #[cfg(test)]

@@ -647,7 +647,10 @@ impl WorkspaceView {
                 }
             });
         self.response_search_matches = body.map_or(0, |text| {
-            crate::json_highlight::count_search_matches(text.as_ref(), &self.response_search_lower)
+            crate::response_body_view::count_search_matches(
+                text.as_ref(),
+                &self.response_search_lower,
+            )
         });
     }
 
@@ -927,55 +930,9 @@ impl WorkspaceView {
         let Some(id) = self.selected_id.as_deref() else {
             return Ok(());
         };
-        let url = self.url.read(cx).value().to_string();
-        let name = self.request_name.read(cx).value().trim().to_string();
-        let params = self.params_table.to_key_values(cx);
-        let headers = self.headers_table.to_key_values(cx);
-        let body_text = self.body_editor.read(cx).value().to_string();
-        let form_rows = self.form_table.to_key_values(cx);
-        let timeout = self
-            .timeout
-            .read(cx)
-            .value()
-            .trim()
-            .parse::<u64>()
-            .context("Timeout must be an integer number of milliseconds")?;
-        let body = match self.body_kind {
-            1 => HttpBody::Json(body_text),
-            2 => HttpBody::Text(body_text),
-            3 => HttpBody::FormUrlEncoded(form_rows),
-            _ => HttpBody::None,
-        };
-        let auth = match self.auth_kind {
-            1 => Auth::Basic {
-                username: self.auth_user.read(cx).value().to_string(),
-                password: self.auth_password.read(cx).value().to_string(),
-            },
-            2 => Auth::Bearer {
-                token: self.auth_token.read(cx).value().to_string(),
-            },
-            3 => Auth::ApiKeyHeader {
-                name: self.api_key_name.read(cx).value().to_string(),
-                value: self.api_key_value.read(cx).value().to_string(),
-            },
-            4 => Auth::ApiKeyQuery {
-                name: self.api_key_name.read(cx).value().to_string(),
-                value: self.api_key_value.read(cx).value().to_string(),
-            },
-            _ => Auth::None,
-        };
-        let method = self.method.clone();
+        let draft = self.read_request_draft(cx)?;
         if let Some(request) = self.projects[self.active_project].find_request_mut(id) {
-            if !name.is_empty() {
-                request.name = name;
-            }
-            request.method = method;
-            request.url = url;
-            request.params = params;
-            request.headers = headers;
-            request.body = body;
-            request.auth = auth;
-            request.timeout_ms = timeout;
+            draft.apply_to(request);
         }
         Ok(())
     }
@@ -1306,6 +1263,7 @@ impl WorkspaceView {
                 self.set_status(status, false, cx);
             }
             Err(error) => {
+                self.dirty = true;
                 let msg = format!("Save failed: {error:#}");
                 self.set_status(msg.clone(), true, cx);
                 window.push_notification(Notification::error(msg), cx);
@@ -2311,8 +2269,8 @@ impl WorkspaceView {
                         "{} {} · {} · {}",
                         response.status,
                         response.reason,
-                        crate::theme::format_duration(response.elapsed_ms),
-                        crate::theme::format_bytes(response.bytes_received),
+                        crate::response_view::format_duration(response.elapsed_ms),
+                        crate::response_view::format_bytes(response.bytes_received),
                     ));
                     let entry = ResponseCacheEntry::from_response(response, sent_method, sent_url);
                     Ok((entry, status_line))
@@ -2384,15 +2342,70 @@ mod tests {
 
     #[test]
     fn project_switch_saves_draft_but_keeps_it_open_on_conflict() {
+        run_view_test(check_project_switch);
+    }
+
+    #[test]
+    fn failed_tree_move_stays_dirty_and_blocks_project_switch() {
+        run_view_test(check_failed_tree_move);
+    }
+
+    fn run_view_test(test: fn()) {
         // Building the full view in debug mode exceeds the default test stack on Windows.
         let result = std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
-            .spawn(check_project_switch)
+            .spawn(test)
             .unwrap()
             .join();
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    fn check_failed_tree_move() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let project_id = view.current().id.clone();
+                let request_id = view.selected_id.clone().unwrap();
+                let original_folder = view.current().request_parent_folder(&request_id).unwrap();
+                let collection_id = view.current().collections[0].id.clone();
+                view.projects.push(store.create("Second project").unwrap());
+                assert!(!view.dirty);
+
+                let other_instance = ProjectStore::at(root.path());
+                let mut external = other_instance.load(&project_id).unwrap();
+                external.name = "Externally renamed".into();
+                other_instance.save(&external).unwrap();
+
+                view.move_request_to_collection(&request_id, &collection_id, window, cx);
+                assert!(view.current().request_parent_folder(&request_id).is_none());
+                assert!(view.status.contains("modified on disk"));
+                assert!(view.dirty, "The in-memory move still needs to be saved");
+
+                view.switch_project(1, window, cx);
+                assert_eq!(view.active_project, 0);
+                assert!(view.dirty);
+                let disk = other_instance.load(&project_id).unwrap();
+                assert_eq!(disk.name, "Externally renamed");
+                assert_eq!(
+                    disk.request_parent_folder(&request_id),
+                    Some(original_folder)
+                );
+            });
+        })
+        .unwrap();
     }
 
     fn check_project_switch() {

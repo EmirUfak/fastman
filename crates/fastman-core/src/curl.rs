@@ -1,13 +1,13 @@
 //! Best-effort cURL command parser and generator with shell/argument injection guards
 //! and optional credential redaction.
 
-use crate::http::MAX_INTERPOLATED_BYTES;
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::security::{
     is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name, is_valid_header_name,
     is_valid_http_method, percent_decode, percent_encode, redact_url_secrets,
     try_extract_auth_from_header, validate_template_or_http_url,
 };
+use crate::template::{self, MAX_INTERPOLATED_BYTES};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -450,46 +450,25 @@ fn expand_template_for_curl(
     had_variables: &mut bool,
     had_secrets: &mut bool,
 ) -> Result<String> {
-    let mut output = String::with_capacity(input.len().min(MAX_INTERPOLATED_BYTES));
-    let mut remainder = input;
-    while let Some(start) = remainder.find("{{") {
-        push_bounded_curl(&mut output, &remainder[..start])?;
-        let after_open = &remainder[start + 2..];
-        let Some(end) = after_open.find("}}") else {
-            push_bounded_curl(&mut output, &remainder[start..])?;
-            return Ok(output);
-        };
-        let raw_token = &remainder[start..start + 2 + end + 2];
-        let name = after_open[..end].trim();
-        if let Some(value) = variables.get(name) {
+    template::expand(
+        input,
+        |name, raw_token| {
+            let Some((name, value)) = name.and_then(|name| Some((name, variables.get(name)?)))
+            else {
+                return Ok(raw_token);
+            };
             *had_variables = true;
             if is_sensitive_var_name(name) && !value.trim().is_empty() {
                 *had_secrets = true;
             }
-            if redact_secrets {
-                push_bounded_curl(&mut output, raw_token)?;
-            } else {
-                push_bounded_curl(&mut output, value)?;
-            }
-        } else {
-            push_bounded_curl(&mut output, raw_token)?;
-        }
-        remainder = &after_open[end + 2..];
-    }
-    push_bounded_curl(&mut output, remainder)?;
-    Ok(output)
-}
-
-fn push_bounded_curl(output: &mut String, piece: &str) -> Result<()> {
-    let next = output
-        .len()
-        .checked_add(piece.len())
-        .filter(|&n| n <= MAX_INTERPOLATED_BYTES);
-    if next.is_none() {
-        bail!("Interpolated value exceeds maximum size ({MAX_INTERPOLATED_BYTES} bytes)");
-    }
-    output.push_str(piece);
-    Ok(())
+            Ok(if redact_secrets { raw_token } else { value })
+        },
+        || {
+            anyhow::anyhow!(
+                "Interpolated value exceeds maximum size ({MAX_INTERPOLATED_BYTES} bytes)"
+            )
+        },
+    )
 }
 
 fn contains_url_userinfo(raw: &str) -> bool {

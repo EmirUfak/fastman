@@ -1,7 +1,7 @@
 mod explorer;
-mod json_highlight;
 mod kv_editor;
 mod request_editor;
+mod response_body_view;
 mod response_view;
 mod theme;
 mod workspace;

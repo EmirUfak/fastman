@@ -176,24 +176,6 @@ pub fn dot_indicator(color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
-pub fn format_bytes(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
-pub fn format_duration(ms: u128) -> String {
-    if ms < 1000 {
-        format!("{ms} ms")
-    } else {
-        format!("{:.2} s", ms as f64 / 1000.0)
-    }
-}
-
 /// Apply crisp, responsive animation timing tokens across interactive controls.
 pub fn apply_crisp_motion(cx: &mut App) {
     gpui_kit::component::Theme::update(cx, |theme| {

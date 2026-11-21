@@ -1,8 +1,8 @@
-use crate::json_highlight::{
+use crate::response_body_view::{
     CodeLines, HighlightedLine, MAX_HIGHLIGHTED_JSON_LINES, MAX_PRETTY_JSON_SOURCE_BYTES,
     precompute_json_lines, precompute_plain_lines, render_virtual_code_lines,
 };
-use crate::theme::{count_pill, format_bytes, format_duration, status_badge, svg_icon};
+use crate::theme::{count_pill, status_badge, svg_icon};
 use fastman_core::HttpResponse;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
@@ -20,6 +20,24 @@ use gpui_kit::*;
 use std::sync::Arc;
 
 use super::WorkspaceView;
+
+pub(super) fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+pub(super) fn format_duration(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.2} s", ms as f64 / 1000.0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PrecomputedResponse {
