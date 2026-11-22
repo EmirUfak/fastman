@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn persists_chain_definitions_and_validates_references() {
-        use crate::{ChainStep, RequestChain};
+        use crate::{AssertionRule, ChainStep, RequestChain};
 
         let dir = tempfile::tempdir().unwrap();
         let store = ProjectStore::at(dir.path());
@@ -1117,9 +1117,28 @@ mod tests {
         }))
         .unwrap();
         assert!(step.enabled);
+        assert!(step.assertions.is_empty());
+        assert!(
+            serde_json::to_value(&step)
+                .unwrap()
+                .get("assertions")
+                .is_none()
+        );
         let second = ChainStep {
             id: "second".into(),
             enabled: false,
+            assertions: vec![
+                AssertionRule::Status { expected: 200 },
+                AssertionRule::Header {
+                    name: "content-type".into(),
+                    expected: "application/json".into(),
+                },
+                AssertionRule::JsonField {
+                    pointer: "/id".into(),
+                    expected: serde_json::json!(42),
+                },
+                AssertionRule::Latency { max_ms: 500 },
+            ],
             ..step.clone()
         };
         project.chains.push(RequestChain {

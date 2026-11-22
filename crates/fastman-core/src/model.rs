@@ -325,6 +325,31 @@ pub struct ChainStep {
     pub request_id: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<AssertionRule>,
+}
+
+/// Declarative checks against a completed HTTP response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssertionRule {
+    Status {
+        expected: u16,
+    },
+    /// Header names are case-insensitive; any matching value satisfies the rule.
+    Header {
+        name: String,
+        expected: String,
+    },
+    /// RFC 6901 JSON Pointer. An empty pointer selects the root.
+    JsonField {
+        pointer: String,
+        expected: serde_json::Value,
+    },
+    /// Inclusive bound on total elapsed time.
+    Latency {
+        max_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
