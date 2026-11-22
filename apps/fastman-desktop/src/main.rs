@@ -61,6 +61,12 @@ fn main() {
     application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
         bind_shortcuts(cx);
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         theme::apply_crisp_motion(cx);

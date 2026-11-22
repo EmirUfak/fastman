@@ -81,5 +81,5 @@ The automated project-switch test checks saving and conflict handling without op
 2. In `CHANGELOG.md`, move the `[Unreleased]` entries into a new dated version section and update the comparison links at the bottom.
 3. Check that the README's Download, Platform support, Features, and Current limitations sections match what the release actually ships.
 4. Review third-party license notices for the binary distribution, for example with `cargo about` or `cargo deny check licenses`.
-5. Tag `vX.Y.Z` on `main` and push the tag. The [release workflow](.github/workflows/release.yml) checks that the tag matches `fastman-cli --version`, then builds and publishes the Windows archive and checksum.
+5. Tag `vX.Y.Z` on `main` and push the tag. The [release workflow](.github/workflows/release.yml) checks that the tag matches `fastman-desktop` in `Cargo.toml`, then builds and publishes `fastman-desktop-<tag>-windows-x86_64.exe` and its `.sha256` checksum.
 6. Edit the generated release notes so they match the changelog and README, including which features are desktop-only and which are in the CLI.

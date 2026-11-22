@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Release workflow publishes only the standalone Windows desktop executable (`fastman-desktop-<tag>-windows-x86_64.exe`) and its `.sha256` checksum instead of a zip archive with the CLI.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

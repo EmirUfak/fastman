@@ -1,4 +1,5 @@
 use crate::command_palette::CommandPaletteView;
+use crate::explorer::{ExplorerCacheKey, ExplorerRow};
 use crate::import_view::CurlImportConfirmView;
 use crate::kv_editor::KvTable;
 use crate::persistence::{OneshotReceiver, PersistenceWorker};
@@ -101,6 +102,9 @@ pub struct WorkspaceView {
     pub(super) selected_id: Option<String>,
     pub(super) open_tabs: Vec<String>,
     pub(super) expanded: HashSet<String>,
+    pub(super) explorer_epoch: u64,
+    pub(super) explorer_cache:
+        std::cell::RefCell<Option<(ExplorerCacheKey, Arc<Vec<ExplorerRow>>)>>,
     pub(super) target_folder: Option<String>,
     pub(super) dirty: bool,
     editor_dirty: bool,
@@ -128,8 +132,8 @@ pub struct WorkspaceView {
     pub(super) auth_token: Entity<InputState>,
     pub(super) api_key_name: Entity<InputState>,
     pub(super) api_key_value: Entity<InputState>,
-    runtime: Arc<Runtime>,
-    engine: HttpEngine,
+    runtime: Option<Runtime>,
+    engine: Option<HttpEngine>,
     run_generation: u64,
     pub(super) in_flight_request_id: Option<String>,
     pending_abort: Option<AbortHandle>,
@@ -163,9 +167,20 @@ pub struct WorkspaceView {
     _subscriptions: Vec<Subscription>,
 }
 
+impl Drop for WorkspaceView {
+    fn drop(&mut self) {
+        if let Some(abort) = self.pending_abort.take() {
+            abort.abort();
+        }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self> {
-        Self::with_store_and_secrets(
+        Self::with_store_and_secrets_deferred(
             ProjectStore::system_default()?,
             Arc::new(OsSecretStore::default()),
             window,
@@ -182,6 +197,41 @@ impl WorkspaceView {
         Self::with_store_and_secrets(store, Arc::new(MemorySecretStore::new()), window, cx)
     }
 
+    #[cfg(test)]
+    pub(super) fn with_store_deferred(
+        store: ProjectStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
+        Self::with_store_and_secrets_deferred(store, Arc::new(MemorySecretStore::new()), window, cx)
+    }
+
+    fn with_store_and_secrets_deferred(
+        store: ProjectStore,
+        secret_store: Arc<dyn SecretStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
+        let workspaces = vec![Workspace {
+            id: "default".into(),
+            name: "My workspace".into(),
+        }];
+        let projects = vec![Project::new("My API Project")];
+        let mut view = Self::build_initial_view(
+            store,
+            secret_store,
+            workspaces,
+            projects,
+            UiSettings::default(),
+            "Loading workspace…",
+            window,
+            cx,
+        );
+        view.focus_handle.focus(window, cx);
+        view.start_async_startup(cx);
+        Ok(view)
+    }
+
     fn with_store_and_secrets(
         store: ProjectStore,
         secret_store: Arc<dyn SecretStore>,
@@ -194,6 +244,42 @@ impl WorkspaceView {
         if projects.is_empty() {
             projects.push(store.create("My API Project")?);
         }
+        let ui_settings = UiSettings::load_from_root(store.root());
+        let mut view = Self::build_initial_view(
+            store,
+            secret_store,
+            workspaces,
+            projects,
+            ui_settings,
+            "Ready · local-first",
+            window,
+            cx,
+        );
+        view.refresh_resolved_variables();
+        view.refresh_request_count();
+        view.expand_initial();
+        view.load_editor(window, cx);
+        view.focus_handle.focus(window, cx);
+        if !startup_warnings.is_empty() {
+            let summary = startup_warnings.join("; ");
+            view.set_status(format!("Loaded with warnings: {summary}"), true, cx);
+            window.push_notification(Notification::warning(summary), cx);
+        }
+
+        Ok(view)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_initial_view(
+        store: ProjectStore,
+        secret_store: Arc<dyn SecretStore>,
+        workspaces: Vec<Workspace>,
+        projects: Vec<Project>,
+        ui_settings: UiSettings,
+        initial_status: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let first = projects[0].first_request_id();
         let project_selector = cx.new(|cx| {
             SelectState::new(
@@ -319,16 +405,7 @@ impl WorkspaceView {
             }));
         }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .context("Build networking runtime")?;
-        let engine = HttpEngine::new().context("Build HTTP client")?;
-
-        let ui_settings = UiSettings::load_from_root(store.root());
-
-        let mut view = Self {
+        Self {
             window_handle: window.window_handle(),
             focus_handle: cx.focus_handle(),
             workspace_store: store.clone(),
@@ -344,6 +421,8 @@ impl WorkspaceView {
             selected_id: first.clone(),
             open_tabs: first.into_iter().collect(),
             expanded: HashSet::new(),
+            explorer_epoch: 0,
+            explorer_cache: std::cell::RefCell::new(None),
             target_folder: None,
             dirty: false,
             editor_dirty: false,
@@ -371,8 +450,8 @@ impl WorkspaceView {
             auth_token,
             api_key_name,
             api_key_value,
-            runtime: Arc::new(runtime),
-            engine,
+            runtime: None,
+            engine: None,
             run_generation: 0,
             in_flight_request_id: None,
             pending_abort: None,
@@ -401,22 +480,79 @@ impl WorkspaceView {
             response_scroll: UniformListScrollHandle::new(),
             headers_scroll: UniformListScrollHandle::new(),
             cookies_scroll: UniformListScrollHandle::new(),
-            status: SharedString::new_static("Ready · local-first"),
+            status: SharedString::new_static(initial_status),
             status_is_error: false,
             _subscriptions: subscriptions,
-        };
-        view.refresh_resolved_variables();
-        view.refresh_request_count();
-        view.expand_all();
-        view.load_editor(window, cx);
-        view.focus_handle.focus(window, cx);
-        if !startup_warnings.is_empty() {
-            let summary = startup_warnings.join("; ");
-            view.set_status(format!("Loaded with warnings: {summary}"), true, cx);
-            window.push_notification(Notification::warning(summary), cx);
         }
+    }
 
-        Ok(view)
+    fn start_async_startup(&mut self, cx: &mut Context<Self>) {
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        let expected_gen = self.transition_generation;
+        let store = self.store.clone();
+        let secret_store = Arc::clone(&self.secret_store);
+        let rx = self.persistence.submit_io(move || {
+            let ui_settings = UiSettings::load_from_root(store.root());
+            let (workspaces, mut startup_warnings) = store.workspaces_resilient()?;
+            let (mut projects, proj_warnings) = store.list_resilient()?;
+            startup_warnings.extend(proj_warnings);
+            if projects.is_empty() {
+                projects.push(store.create("My API Project")?);
+            }
+            let resolved_variables = projects[0].resolve_active_variables(secret_store.as_ref());
+            Ok::<_, anyhow::Error>((
+                ui_settings,
+                workspaces,
+                projects,
+                resolved_variables,
+                startup_warnings,
+            ))
+        });
+        self.spawn_io_callback(rx, cx, move |view, result, mut window, cx| {
+            if view.transition_generation != expected_gen {
+                return;
+            }
+            match result {
+                Ok((ui_settings, workspaces, projects, resolved_variables, startup_warnings)) => {
+                    view.workspaces = workspaces;
+                    view.active_workspace = 0;
+                    view.projects = projects;
+                    view.active_project = 0;
+                    view.resolved_variables = resolved_variables;
+                    view.response_position = ui_settings.response_position;
+                    view.response_raw = ui_settings.response_raw;
+                    view.response_wrap = ui_settings.response_wrap;
+                    view.selected_id = view.current().first_request_id();
+                    view.open_tabs = view.selected_id.clone().into_iter().collect();
+                    view.target_folder = None;
+                    if let Some(window) = window.as_deref_mut() {
+                        let choices = project_choices(&view.projects);
+                        view.project_selector.update(cx, |selector, cx| {
+                            selector.set_items(choices, window, cx);
+                            selector.set_selected_index(Some(IndexPath::default()), window, cx);
+                        });
+                        view.refresh_request_count();
+                        view.expand_initial();
+                        view.load_editor(window, cx);
+                    } else {
+                        view.refresh_request_count();
+                        view.expand_initial();
+                    }
+                    if startup_warnings.is_empty() {
+                        view.set_status("Ready · local-first", false, cx);
+                    } else {
+                        let summary = startup_warnings.join("; ");
+                        view.set_status(format!("Loaded with warnings: {summary}"), true, cx);
+                        Self::push_window_notification(window, Notification::warning(summary), cx);
+                    }
+                }
+                Err(error) => {
+                    let msg = format!("Failed to load workspace: {error:#}");
+                    view.set_status(msg.clone(), true, cx);
+                    Self::push_window_notification(window, Notification::error(msg), cx);
+                }
+            }
+        });
     }
 
     pub(super) fn current(&self) -> &Project {
@@ -435,8 +571,12 @@ impl WorkspaceView {
             .and_then(|id| self.responses.get(id))
     }
 
-    fn current_edit_rev(&self, project_id: &str) -> u64 {
+    pub(super) fn current_edit_rev(&self, project_id: &str) -> u64 {
         self.project_edit_revs.get(project_id).copied().unwrap_or(0)
+    }
+
+    pub(super) fn bump_explorer_epoch(&mut self) {
+        self.explorer_epoch = self.explorer_epoch.wrapping_add(1);
     }
 
     fn current_persisted_rev(&self, project_id: &str) -> u64 {
@@ -578,7 +718,7 @@ impl WorkspaceView {
         }
     }
 
-    fn kv_change_handler(
+    pub(super) fn kv_change_handler(
         table_kind: KvTableKind,
     ) -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
         move |view, window, cx| {
@@ -685,18 +825,32 @@ impl WorkspaceView {
         }
     }
 
-    fn expand_all(&mut self) {
-        fn expand_folders(items: &[Folder], expanded: &mut HashSet<String>) {
-            for folder in items {
-                expanded.insert(folder.id.clone());
-                expand_folders(&folder.folders, expanded);
+    fn expand_initial(&mut self) {
+        fn find_request_path(
+            folders: &[Folder],
+            target_id: &str,
+            expanded: &mut HashSet<String>,
+        ) -> bool {
+            for folder in folders {
+                if folder.requests.iter().any(|r| r.id == target_id)
+                    || find_request_path(&folder.folders, target_id, expanded)
+                {
+                    expanded.insert(folder.id.clone());
+                    return true;
+                }
             }
+            false
         }
+
         self.expanded.clear();
+        let selected_id = self.selected_id.clone();
         for collection in &self.projects[self.active_project].collections {
             self.expanded.insert(collection.id.clone());
-            expand_folders(&collection.folders, &mut self.expanded);
+            if let Some(target_id) = selected_id.as_deref() {
+                find_request_path(&collection.folders, target_id, &mut self.expanded);
+            }
         }
+        self.bump_explorer_epoch();
         self.explorer_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
@@ -707,6 +861,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let value = value.into();
+        if state.read(cx).value().as_ref() == value {
+            return;
+        }
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
@@ -717,6 +874,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let value = value.into();
+        if state.read(cx).value().as_ref() == value {
+            return;
+        }
         state.update(cx, |state, cx| state.set_value(value, window, cx));
     }
 
@@ -764,20 +924,17 @@ impl WorkspaceView {
             HttpBody::None => {
                 self.body_kind = BodyKind::None;
                 Self::set_editor(&self.body_editor, "", window, cx);
-                self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
+                self.form_table.clear();
             }
             HttpBody::Json(text) => {
                 self.body_kind = BodyKind::Json;
                 Self::set_editor(&self.body_editor, text, window, cx);
-                self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
+                self.form_table.clear();
             }
             HttpBody::Text(text) => {
                 self.body_kind = BodyKind::Text;
                 Self::set_editor(&self.body_editor, text, window, cx);
-                self.form_table
-                    .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
+                self.form_table.clear();
             }
             HttpBody::FormUrlEncoded(pairs) => {
                 self.body_kind = BodyKind::FormUrlEncoded;
@@ -793,26 +950,43 @@ impl WorkspaceView {
         Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
         self.verify_tls = request.verify_tls;
         self.auth_kind = AuthKind::from_auth(&request.auth);
-        for field in [
-            &self.auth_user,
-            &self.auth_password,
-            &self.auth_token,
-            &self.api_key_name,
-            &self.api_key_value,
-        ] {
-            Self::set_input(field, "", window, cx);
-        }
         match request.auth {
             Auth::Basic { username, password } => {
                 Self::set_input(&self.auth_user, username, window, cx);
                 Self::set_input(&self.auth_password, password, window, cx);
+                for field in [&self.auth_token, &self.api_key_name, &self.api_key_value] {
+                    Self::set_input(field, "", window, cx);
+                }
             }
-            Auth::Bearer { token } => Self::set_input(&self.auth_token, token, window, cx),
+            Auth::Bearer { token } => {
+                Self::set_input(&self.auth_token, token, window, cx);
+                for field in [
+                    &self.auth_user,
+                    &self.auth_password,
+                    &self.api_key_name,
+                    &self.api_key_value,
+                ] {
+                    Self::set_input(field, "", window, cx);
+                }
+            }
             Auth::ApiKeyHeader { name, value } | Auth::ApiKeyQuery { name, value } => {
                 Self::set_input(&self.api_key_name, name, window, cx);
                 Self::set_input(&self.api_key_value, value, window, cx);
+                for field in [&self.auth_user, &self.auth_password, &self.auth_token] {
+                    Self::set_input(field, "", window, cx);
+                }
             }
-            Auth::None => {}
+            Auth::None => {
+                for field in [
+                    &self.auth_user,
+                    &self.auth_password,
+                    &self.auth_token,
+                    &self.api_key_name,
+                    &self.api_key_value,
+                ] {
+                    Self::set_input(field, "", window, cx);
+                }
+            }
         }
     }
 
@@ -853,8 +1027,7 @@ impl WorkspaceView {
                 cx,
                 Self::kv_change_handler(KvTableKind::Headers),
             );
-            self.form_table
-                .load(&[], window, cx, Self::kv_change_handler(KvTableKind::Form));
+            self.form_table.clear();
             Self::set_input(&self.timeout, "30000", window, cx);
         }
         self.suppress_dirty = false;
@@ -1259,7 +1432,7 @@ impl WorkspaceView {
                     view.prune_responses_to_current_project();
                     view.refresh_resolved_variables();
                     view.refresh_request_count();
-                    view.expand_all();
+                    view.expand_initial();
                     view.load_editor(window, cx);
                     view.set_status(format!("Project: {}", view.current().name), false, cx);
                 }
@@ -1277,6 +1450,7 @@ impl WorkspaceView {
             self.expanded.insert(ancestor);
         }
         self.expanded.insert(id.clone());
+        self.bump_explorer_epoch();
         self.target_folder = Some(id.clone());
         self.scroll_explorer_to_id(&id);
         cx.notify();
@@ -1340,7 +1514,7 @@ impl WorkspaceView {
                                 });
                                 view.refresh_resolved_variables();
                                 view.refresh_request_count();
-                                view.expand_all();
+                                view.expand_initial();
                                 view.load_editor(window, cx);
                             } else {
                                 view.refresh_resolved_variables();
@@ -2269,6 +2443,22 @@ impl WorkspaceView {
         });
     }
 
+    fn ensure_http_runtime(&mut self) -> Result<()> {
+        if self.runtime.is_none() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("Build networking runtime")?;
+            self.runtime = Some(runtime);
+        }
+        if self.engine.is_none() {
+            let engine = HttpEngine::new().context("Build HTTP client")?;
+            self.engine = Some(engine);
+        }
+        Ok(())
+    }
+
     fn perform_send(&mut self, cx: &mut Context<Self>) {
         let Some(request) = self.current_request().cloned() else {
             return;
@@ -2276,6 +2466,15 @@ impl WorkspaceView {
         let request_id = request.id.clone();
         let resolved = self.resolved_variables.clone();
         self.cancel(cx);
+        let sent_method = SharedString::from(request.method.clone());
+        let sent_url = SharedString::from(request.url.clone());
+        let sent_method_fallback = sent_method.clone();
+        let sent_url_fallback = sent_url.clone();
+        if let Err(error) = self.ensure_http_runtime() {
+            let msg = format!("Cannot initialize HTTP client: {error:#}");
+            self.set_status(msg, true, cx);
+            return;
+        }
         self.in_flight_request_id = Some(request_id.clone());
         self.set_status(
             format!(
@@ -2288,12 +2487,9 @@ impl WorkspaceView {
         );
 
         let generation = self.run_generation;
-        let engine = self.engine.clone();
-        let sent_method = SharedString::from(request.method.clone());
-        let sent_url = SharedString::from(request.url.clone());
-        let sent_method_fallback = sent_method.clone();
-        let sent_url_fallback = sent_url.clone();
-        let handle = self.runtime.spawn(async move {
+        let engine = self.engine.as_ref().expect("engine initialized").clone();
+        let runtime = self.runtime.as_ref().expect("runtime initialized");
+        let handle = runtime.spawn(async move {
             match engine.send_with_secrets(&request, &resolved).await {
                 Ok(response) => {
                     let status_line = SharedString::from(format!(
@@ -4184,6 +4380,107 @@ mod tests {
             assert!(after.draft_sensitive_findings.is_empty());
             assert_eq!(after.auth_kind, AuthKind::Bearer);
             assert_eq!(after.auth_token.read(cx).value(), "raw_canary_token_123");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deferred_startup_opens_immediately_and_hydrates_projects_and_lazy_runtime() {
+        run_view_test(check_deferred_startup);
+    }
+
+    fn check_deferred_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        WorkspaceView::with_store_deferred(store.clone(), window, cx).unwrap()
+                    })
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert!(v.runtime.is_none());
+            assert!(v.engine.is_none());
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.current().name, "Test project");
+            assert!(v.selected_id.is_some());
+            assert_eq!(v.request_name.read(cx).value(), "Test request");
+            assert_eq!(v.status, "Ready · local-first");
+            assert!(v.runtime.is_none());
+            assert!(v.engine.is_none());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn expand_initial_keeps_unrelated_folders_collapsed_and_caches_explorer_rows() {
+        run_view_test(check_expand_initial_and_explorer_cache);
+    }
+
+    fn check_expand_initial_and_explorer_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let mut project = store.create("Tree Project").unwrap();
+
+        let mut f1 = Folder::new("First Folder");
+        let f1_id = f1.id.clone();
+        f1.requests
+            .push(ApiRequest::new("GET", "First Req", "https://example.com/1"));
+
+        let mut f2 = Folder::new("Sibling Folder");
+        let f2_id = f2.id.clone();
+        f2.requests.push(ApiRequest::new(
+            "GET",
+            "Second Req",
+            "https://example.com/2",
+        ));
+
+        project.collections[0].folders.push(f1);
+        project.collections[0].folders.push(f2);
+        let coll_id = project.collections[0].id.clone();
+        store.save(&project).unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |v, _| {
+                assert!(v.expanded.contains(&coll_id));
+                assert!(v.expanded.contains(&f1_id));
+                assert!(!v.expanded.contains(&f2_id));
+
+                let first = v.cached_explorer_rows();
+                let second = v.cached_explorer_rows();
+                assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+                v.expanded.insert(f2_id.clone());
+                v.bump_explorer_epoch();
+                let third = v.cached_explorer_rows();
+                assert!(!std::sync::Arc::ptr_eq(&first, &third));
+                assert!(third.len() > first.len());
+            });
         })
         .unwrap();
     }

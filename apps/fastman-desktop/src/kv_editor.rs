@@ -91,6 +91,11 @@ impl KvTable {
         )
     }
 
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.subscriptions.clear();
+    }
+
     pub fn load<V: 'static>(
         &mut self,
         pairs: &[KeyValue],
@@ -98,6 +103,9 @@ impl KvTable {
         cx: &mut Context<V>,
         on_change: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
     ) {
+        if pairs.is_empty() && self.rows.len() == 1 && self.rows[0].is_blank(cx) {
+            return;
+        }
         self.rows.clear();
         self.subscriptions.clear();
         for pair in pairs {

@@ -88,8 +88,19 @@ impl Render for DraggedFolderPreview {
     }
 }
 
+#[derive(PartialEq, Eq)]
+pub(super) struct ExplorerCacheKey {
+    project_id: String,
+    edit_rev: u64,
+    epoch: u64,
+    filter: String,
+    selected_id: Option<String>,
+    target_folder: Option<String>,
+    expanded_len: usize,
+}
+
 #[derive(Clone)]
-struct ExplorerRow {
+pub(super) struct ExplorerRow {
     kind: ExplorerRowKind,
     id: String,
     depth: f32,
@@ -178,7 +189,7 @@ impl WorkspaceView {
         let sidebar_bg = cx.theme().sidebar;
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
-        let rows = Arc::new(self.explorer_rows());
+        let rows = self.cached_explorer_rows();
         let has_matches = !rows.is_empty();
         let weak_view = cx.weak_entity();
         let is_dragging = cx.has_active_drag();
@@ -422,13 +433,34 @@ impl WorkspaceView {
 
     pub(super) fn scroll_explorer_to_id(&self, target_id: &str) {
         if let Some(index) = self
-            .explorer_rows()
+            .cached_explorer_rows()
             .iter()
             .position(|row| row.id == target_id)
         {
             self.explorer_scroll
                 .scroll_to_item(index, ScrollStrategy::Center);
         }
+    }
+
+    pub(super) fn cached_explorer_rows(&self) -> Arc<Vec<ExplorerRow>> {
+        let project_id = self.current().id.clone();
+        let key = ExplorerCacheKey {
+            edit_rev: self.current_edit_rev(&project_id),
+            project_id,
+            epoch: self.explorer_epoch,
+            filter: self.explorer_filter_lower.clone(),
+            selected_id: self.selected_id.clone(),
+            target_folder: self.target_folder.clone(),
+            expanded_len: self.expanded.len(),
+        };
+        if let Some((cached_key, cached_rows)) = self.explorer_cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Arc::clone(cached_rows);
+        }
+        let rows = Arc::new(self.explorer_rows());
+        *self.explorer_cache.borrow_mut() = Some((key, Arc::clone(&rows)));
+        rows
     }
 
     fn explorer_rows(&self) -> Vec<ExplorerRow> {
@@ -617,6 +649,7 @@ fn render_collection_row(
                 if !view.expanded.insert(id.clone()) {
                     view.expanded.remove(&id);
                 }
+                view.bump_explorer_epoch();
                 view.target_folder = None;
                 cx.notify();
             }
@@ -792,6 +825,7 @@ fn render_folder_row(
                         if !view.expanded.insert(id.clone()) {
                             view.expanded.remove(&id);
                         }
+                        view.bump_explorer_epoch();
                         view.target_folder = Some(id.clone());
                         cx.notify();
                     }

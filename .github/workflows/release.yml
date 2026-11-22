@@ -28,46 +28,49 @@ jobs:
         run: cargo lint-all
       - name: Test workspace
         run: cargo test-all
-      - name: Build release binaries
-        run: cargo build --release --locked --workspace
-      - name: Verify tag matches CLI version
+      - name: Build desktop release binary
+        run: cargo build --release --locked -p fastman-desktop
+      - name: Verify tag matches desktop version
         run: |
           $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
-          $cliOutput = & target/release/fastman-cli.exe --version
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $cliVersion = ($cliOutput -replace '^fastman-cli\s+', '').Trim()
-          if ($cliVersion -ne $tagVersion) {
-            throw "Tag version ($tagVersion) does not match fastman-cli --version ($cliVersion)"
+          $desktopPkg = $meta.packages | Where-Object { $_.name -eq 'fastman-desktop' } | Select-Object -First 1
+          if (-not $desktopPkg) {
+            throw "fastman-desktop package not found in cargo metadata"
           }
-      - name: Package Windows archive and checksum
+          if ($desktopPkg.version -ne $tagVersion) {
+            throw "Tag version ($tagVersion) does not match fastman-desktop version ($($desktopPkg.version))"
+          }
+      - name: Package desktop binary and checksum
         run: |
           $tag = "${{ github.ref_name }}"
-          $archive = "fastman-$tag-x86_64-pc-windows-msvc.zip"
-          New-Item -ItemType Directory -Force -Path dist/stage, dist | Out-Null
-          Copy-Item -Path @(
-            "target/release/fastman-desktop.exe",
-            "target/release/fastman-cli.exe",
-            "LICENSE",
-            "README.md"
-          ) -Destination dist/stage/
-          Compress-Archive -Path dist/stage/* -DestinationPath "dist/$archive" -Force
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/$archive").Hash.ToLowerInvariant()
-          "$hash  $archive" | Out-File -FilePath "dist/$archive.sha256" -Encoding ascii
+          $exeName = "fastman-desktop-$tag-windows-x86_64.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Path "target/release/fastman-desktop.exe" -Destination "dist/$exeName" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$exeName").Hash.ToLowerInvariant()
+          "$hash  $exeName" | Out-File -FilePath "dist/$exeName.sha256" -Encoding ascii
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $archive = "fastman-$tag-x86_64-pc-windows-msvc.zip"
-          $ghArgs = @(
-            "release", "create", $tag,
-            "dist/$archive",
-            "dist/$archive.sha256",
-            "--title", "Fastman $tag",
-            "--generate-notes"
-          )
-          if ($tag -match '-') {
-            $ghArgs += "--prerelease"
+          $exeName = "fastman-desktop-$tag-windows-x86_64.exe"
+          $ErrorActionPreference = "Continue"
+          & gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag "dist/$exeName" "dist/$exeName.sha256" --clobber
+          } else {
+            $ghArgs = @(
+              "release", "create", $tag,
+              "dist/$exeName",
+              "dist/$exeName.sha256",
+              "--title", "Fastman $tag",
+              "--generate-notes"
+            )
+            if ($tag -match '-') {
+              $ghArgs += "--prerelease"
+            }
+            & gh @ghArgs
           }
-          & gh @ghArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

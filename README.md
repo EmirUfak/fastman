@@ -20,14 +20,14 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/EmirUfak
 
 | Platform | Binary | Notes |
 |---|---|---|
-| Windows x86_64 | Yes | Portable executables; no installer. |
+| Windows x86_64 | Yes | Portable desktop executable; no installer. |
 | Linux, macOS | No | Build from source; see [Platform support](#platform-support). |
 
-- **Releases from the [release workflow](.github/workflows/release.yml) (`v0.3.0+`)** ship `fastman-<tag>-x86_64-pc-windows-msvc.zip`. It contains `fastman-desktop.exe`, `fastman-cli.exe`, `LICENSE`, and `README.md`, along with a `.sha256` checksum file. (`v0.2.1` shipped only the desktop executable.)
+- **Releases** ship the desktop app as `fastman-desktop-<tag>-windows-x86_64.exe`, along with a `.sha256` checksum file (`fastman-desktop-<tag>-windows-x86_64.exe.sha256` from the [release workflow](.github/workflows/release.yml) for `v0.3.1+`). To use the CLI, build it from source (`cargo run --release -p fastman-cli -- --help`).
 - **The binaries are not code-signed**, so Windows SmartScreen may warn you the first time you run them. You can check the download against the published SHA-256 checksum when one is provided:
 
   ```powershell
-  Get-FileHash .\fastman-<tag>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+  Get-FileHash .\fastman-desktop-<tag>-windows-x86_64.exe -Algorithm SHA256
   ```
 
 ## Quick start (from source)
@@ -106,7 +106,7 @@ The following are **not implemented yet**:
 - **Protocols:** GraphQL tooling, WebSocket, gRPC, and SSE.
 - **Automation:** request tests and assertions. Fastman will never run JavaScript. A collection runner is also missing.
 - **Data:** collection export, request history, and streaming for large responses.
-- **Distribution:** installers, code signing, and Linux/macOS binaries.
+- **Distribution:** installers, code signing, prebuilt CLI binaries, and Linux/macOS binaries.
 
 ## Repository layout
 

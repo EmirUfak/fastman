@@ -1173,8 +1173,15 @@ impl WorkspaceView {
                         let mut btn = Button::new(format!("body-kind-{i}"))
                             .xsmall()
                             .label(kind.label())
-                            .on_click(cx.listener(move |view, _, _, cx| {
+                            .on_click(cx.listener(move |view, _, window, cx| {
                                 view.body_kind = kind;
+                                if kind == BodyKind::FormUrlEncoded {
+                                    view.form_table.ensure_trailing_blank(
+                                        window,
+                                        cx,
+                                        WorkspaceView::kv_change_handler(KvTableKind::Form),
+                                    );
+                                }
                                 view.refresh_body_json_valid(cx);
                                 view.mark_dirty(cx);
                             }));

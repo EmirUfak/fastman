@@ -197,14 +197,24 @@ impl ProjectStore {
         if !dir.is_dir() {
             bail!("Read {}: project directory not found", path.display());
         }
-        let lock = DirLockGuard::acquire(&dir)?;
-        recover_project_files_locked(&lock, &id_str)?;
+        let _lock = if dir_needs_lock_or_recovery(&dir) {
+            let lock = DirLockGuard::acquire(&dir)?;
+            recover_project_files_locked(&lock, &id_str)?;
+            Some(lock)
+        } else {
+            None
+        };
         self.read_and_track_project(&path, &id_str)
     }
 
     fn try_load_project_dir(&self, dir: &Path, id_str: &str) -> Result<Option<Project>> {
-        let lock = DirLockGuard::acquire(dir)?;
-        recover_project_files_locked(&lock, id_str)?;
+        let _lock = if dir_needs_lock_or_recovery(dir) {
+            let lock = DirLockGuard::acquire(dir)?;
+            recover_project_files_locked(&lock, id_str)?;
+            Some(lock)
+        } else {
+            None
+        };
         let path = dir.join("project.json");
         if !path.exists() {
             return Ok(None);
@@ -355,7 +365,7 @@ fn write_private_new_file(path: &Path, data: &[u8]) -> Result<()> {
         .with_context(|| format!("Create {}", path.display()))?;
     file.write_all(data)
         .with_context(|| format!("Write {}", path.display()))?;
-    file.sync_all()
+    file.sync_data()
         .with_context(|| format!("Sync {}", path.display()))?;
     Ok(())
 }
@@ -530,6 +540,24 @@ fn stale_lock_snapshot(path: &Path, stale_age: Duration) -> Option<(SystemTime, 
         return Some((modified, token));
     }
     None
+}
+
+/// Returns true if a project directory has an active lock, backup, or orphaned temp file.
+fn dir_needs_lock_or_recovery(dir: &Path) -> bool {
+    if dir.join(".save.lock").exists() || dir.join("project.json.previous").exists() {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with('.') && s.ends_with(".tmp") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Clean up orphaned temp files and recover interrupted `project.json.previous` backups
