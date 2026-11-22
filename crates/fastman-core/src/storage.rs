@@ -628,6 +628,26 @@ fn validate_project(project: &Project) -> Result<()> {
             validate_folder(folder, 1, &mut seen_ids)?;
         }
     }
+    let mut chain_ids = HashSet::new();
+    for chain in &project.chains {
+        register_id(&mut chain_ids, &chain.id, "chain")?;
+        if chain.name.trim().is_empty() {
+            bail!("Chain name is empty");
+        }
+        let mut step_ids = HashSet::new();
+        for step in &chain.steps {
+            register_id(&mut step_ids, &step.id, "chain step")
+                .with_context(|| format!("Validate chain '{}'", chain.id))?;
+            if project.find_request(&step.request_id).is_none() {
+                bail!(
+                    "Chain '{}' step '{}' references missing request '{}'",
+                    chain.id,
+                    step.id,
+                    step.request_id
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1069,12 +1089,68 @@ mod tests {
         let loaded = store.load(&project_id).unwrap();
         assert!(loaded.secret_variables.is_empty());
         assert!(loaded.environments.is_empty());
+        assert!(loaded.chains.is_empty());
         assert_eq!(loaded.active_environment, None);
         assert_eq!(
             loaded.effective_variables().get("base").map(String::as_str),
             Some("https://legacy.example.com")
         );
         store.save(&loaded).unwrap();
+    }
+
+    #[test]
+    fn persists_chain_definitions_and_validates_references() {
+        use crate::{ChainStep, RequestChain};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let mut project = Project::new("API");
+        let request = ApiRequest::new("GET", "Profile", "https://example.com/profile");
+        let request_id = request.id.clone();
+        let folder = Folder::new("Nested");
+        let folder_id = folder.id.clone();
+        project.insert_folder(None, folder);
+        project.insert_request(Some(&folder_id), request);
+        let step: ChainStep = serde_json::from_value(serde_json::json!({
+            "id": "first",
+            "request_id": request_id,
+        }))
+        .unwrap();
+        assert!(step.enabled);
+        let second = ChainStep {
+            id: "second".into(),
+            enabled: false,
+            ..step.clone()
+        };
+        project.chains.push(RequestChain {
+            id: "chain".into(),
+            name: "Profile checks".into(),
+            steps: vec![step.clone(), second],
+        });
+        store.save(&project).unwrap();
+        let loaded = store.load(&project.id).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.chains, project.chains);
+
+        project.chains[0].steps.push(step);
+        let error = store.save(&project).unwrap_err();
+        assert!(format!("{error:#}").contains("Duplicate chain step ID"));
+        project.chains[0].steps.pop();
+
+        project.chains.push(project.chains[0].clone());
+        let error = store.save(&project).unwrap_err();
+        assert!(format!("{error:#}").contains("Duplicate chain ID"));
+        project.chains.pop();
+
+        project.chains[0].steps[0].request_id = folder_id;
+        let error = store.save(&project).unwrap_err();
+        assert!(format!("{error:#}").contains("references missing request"));
+        assert_eq!(store.load(&project.id).unwrap().chains, loaded.chains);
+
+        let path = dir.path().join(&project.id).join("project.json");
+        fs::write(path, serde_json::to_vec(&project).unwrap()).unwrap();
+        let error = store.load(&project.id).unwrap_err();
+        assert!(format!("{error:#}").contains("references missing request"));
     }
 
     #[test]

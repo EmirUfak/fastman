@@ -311,6 +311,22 @@ impl Environment {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestChain {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub steps: Vec<ChainStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainStep {
+    pub id: String,
+    pub request_id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub schema_version: u32,
@@ -326,6 +342,8 @@ pub struct Project {
     pub active_environment: Option<String>,
     #[serde(default)]
     pub collections: Vec<Collection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chains: Vec<RequestChain>,
 }
 
 impl Project {
@@ -339,6 +357,7 @@ impl Project {
             environments: Vec::new(),
             active_environment: None,
             collections: vec![Collection::new("Default Collection")],
+            chains: Vec::new(),
         }
     }
 

@@ -12,7 +12,8 @@ pub mod template;
 
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{
-    ApiRequest, Auth, Collection, Environment, Folder, HttpBody, KeyValue, Project, SecretRef,
+    ApiRequest, Auth, ChainStep, Collection, Environment, Folder, HttpBody, KeyValue, Project,
+    RequestChain, SecretRef,
 };
 pub use secrets::{
     MemorySecretStore, OsSecretStore, ResolvedVariables, SecretChangePlan, SecretStore,
