@@ -34,6 +34,7 @@ use gpui_kit::*;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    rc::Rc,
     sync::Arc,
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
@@ -76,15 +77,22 @@ pub(super) enum NameDialogKind {
     RenameCollection(String),
 }
 
+struct DestructiveDialogSpec {
+    title: &'static str,
+    ok_text: &'static str,
+    message: String,
+    width: Pixels,
+}
+
 /// Retained window state: project model + editor entities + request lifecycle.
 pub struct WorkspaceView {
-    pub(super) window_handle: AnyWindowHandle,
+    window_handle: AnyWindowHandle,
     pub(super) focus_handle: FocusHandle,
     pub(super) workspace_store: ProjectStore,
     pub(super) workspaces: Vec<Workspace>,
     pub(super) active_workspace: usize,
     pub(super) store: ProjectStore,
-    pub(super) secret_store: Arc<dyn SecretStore>,
+    secret_store: Arc<dyn SecretStore>,
     pub(super) projects: Vec<Project>,
     pub(super) active_project: usize,
     pub(super) project_selector: Entity<SelectState<SearchableVec<ProjectChoice>>>,
@@ -95,14 +103,14 @@ pub struct WorkspaceView {
     pub(super) expanded: HashSet<String>,
     pub(super) target_folder: Option<String>,
     pub(super) dirty: bool,
-    pub(super) editor_dirty: bool,
+    editor_dirty: bool,
     pub(super) suppress_dirty: bool,
     pub(super) persistence: PersistenceWorker,
-    pub(super) project_edit_revs: HashMap<String, u64>,
-    pub(super) project_persisted_revs: HashMap<String, u64>,
-    pub(super) in_flight_saves: HashMap<String, u64>,
-    pub(super) save_errors: HashMap<String, String>,
-    pub(super) transition_generation: u64,
+    project_edit_revs: HashMap<String, u64>,
+    project_persisted_revs: HashMap<String, u64>,
+    in_flight_saves: HashMap<String, u64>,
+    save_errors: HashMap<String, String>,
+    transition_generation: u64,
     pub(super) method: String,
     pub(super) body_kind: BodyKind,
     pub(super) auth_kind: AuthKind,
@@ -120,13 +128,13 @@ pub struct WorkspaceView {
     pub(super) auth_token: Entity<InputState>,
     pub(super) api_key_name: Entity<InputState>,
     pub(super) api_key_value: Entity<InputState>,
-    pub(super) runtime: Arc<Runtime>,
-    pub(super) engine: HttpEngine,
-    pub(super) run_generation: u64,
+    runtime: Arc<Runtime>,
+    engine: HttpEngine,
+    run_generation: u64,
     pub(super) in_flight_request_id: Option<String>,
-    pub(super) pending_abort: Option<AbortHandle>,
-    pub(super) pending: Option<Task<()>>,
-    pub(super) responses: ResponseCache,
+    pending_abort: Option<AbortHandle>,
+    pending: Option<Task<()>>,
+    responses: ResponseCache,
     pub(super) cached_request_count: usize,
     pub(super) params_active_count: usize,
     pub(super) headers_active_count: usize,
@@ -146,11 +154,12 @@ pub struct WorkspaceView {
     pub(super) response_search: Entity<InputState>,
     pub(super) response_search_lower: String,
     pub(super) response_search_matches: usize,
+    pub(super) explorer_scroll: UniformListScrollHandle,
     pub(super) response_scroll: UniformListScrollHandle,
     pub(super) headers_scroll: UniformListScrollHandle,
     pub(super) cookies_scroll: UniformListScrollHandle,
     pub(super) status: SharedString,
-    pub(super) status_is_error: bool,
+    status_is_error: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -165,7 +174,7 @@ impl WorkspaceView {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn with_store(
+    pub(super) fn with_store(
         store: ProjectStore,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -238,12 +247,9 @@ impl WorkspaceView {
         subscriptions.push(
             cx.subscribe_in(&explorer_search, window, |view, _, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    view.explorer_filter_lower = view
-                        .explorer_search
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .to_ascii_lowercase();
+                    view.explorer_filter_lower =
+                        view.explorer_search.read(cx).value().trim().to_lowercase();
+                    view.explorer_scroll.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
                 }
             }),
@@ -391,6 +397,7 @@ impl WorkspaceView {
             response_search,
             response_search_lower: String::new(),
             response_search_matches: 0,
+            explorer_scroll: UniformListScrollHandle::new(),
             response_scroll: UniformListScrollHandle::new(),
             headers_scroll: UniformListScrollHandle::new(),
             cookies_scroll: UniformListScrollHandle::new(),
@@ -439,7 +446,7 @@ impl WorkspaceView {
             .unwrap_or(0)
     }
 
-    pub(super) fn bump_project_revision(&mut self, project_id: &str) -> u64 {
+    fn bump_project_revision(&mut self, project_id: &str) -> u64 {
         let entry = self
             .project_edit_revs
             .entry(project_id.to_owned())
@@ -448,7 +455,7 @@ impl WorkspaceView {
         *entry
     }
 
-    pub(super) fn sync_dirty(&mut self) {
+    fn sync_dirty(&mut self) {
         let project_id = &self.current().id;
         let rev_pending =
             self.current_edit_rev(project_id) > self.current_persisted_rev(project_id);
@@ -471,7 +478,7 @@ impl WorkspaceView {
         self.mark_dirty(cx);
     }
 
-    pub(super) fn refresh_resolved_variables(&mut self) {
+    fn refresh_resolved_variables(&mut self) {
         self.resolved_variables = self
             .current()
             .resolve_active_variables(self.secret_store.as_ref());
@@ -509,7 +516,7 @@ impl WorkspaceView {
         });
     }
 
-    pub(super) fn refresh_request_count(&mut self) {
+    fn refresh_request_count(&mut self) {
         self.cached_request_count = self.current().request_count();
     }
 
@@ -557,7 +564,7 @@ impl WorkspaceView {
         });
     }
 
-    pub(super) fn reset_response_scroll(&self) {
+    fn reset_response_scroll(&self) {
         self.response_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.headers_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.cookies_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -690,6 +697,7 @@ impl WorkspaceView {
             self.expanded.insert(collection.id.clone());
             expand_folders(&collection.folders, &mut self.expanded);
         }
+        self.explorer_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
     pub(super) fn set_input(
@@ -963,7 +971,23 @@ impl WorkspaceView {
         Ok(())
     }
 
-    pub(super) fn enqueue_project_save(
+    /// Apply the active draft, surfacing an invalid draft in the status bar and a toast.
+    fn apply_editor_or_report(
+        &mut self,
+        error_prefix: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Err(error) = self.apply_editor(cx) {
+            let msg = format!("{error_prefix}: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
+            return false;
+        }
+        true
+    }
+
+    fn enqueue_project_save(
         &mut self,
         success_status: Option<SharedString>,
         success_toast: Option<SharedString>,
@@ -1035,7 +1059,7 @@ impl WorkspaceView {
         true
     }
 
-    pub(super) fn flush_current_project_then<F>(
+    fn flush_current_project_then<F>(
         &mut self,
         error_prefix: &'static str,
         window: Option<&mut Window>,
@@ -1146,17 +1170,29 @@ impl WorkspaceView {
             cx,
             move |view, window, cx| {
                 view.cancel(cx);
-                view.selected_id = Some(id.clone());
-                if !view.open_tabs.contains(&id) {
-                    view.open_tabs.push(id);
-                }
-                if let Some(window) = window {
-                    view.load_editor(window, cx);
-                } else {
-                    cx.notify();
-                }
+                view.activate_request_tab(Some(id), window, cx);
             },
         );
+    }
+
+    /// Select a request, ensure it has a tab, and load its draft into the editor.
+    fn activate_request_tab(
+        &mut self,
+        id: Option<String>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_id = id;
+        if let Some(id) = &self.selected_id
+            && !self.open_tabs.contains(id)
+        {
+            self.open_tabs.push(id.clone());
+        }
+        if let Some(window) = window {
+            self.load_editor(window, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub(super) fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1170,10 +1206,8 @@ impl WorkspaceView {
                     view.cancel(cx);
                     view.open_tabs.retain(|tab| tab != &id_owned);
                     if view.selected_id.as_deref() == Some(id_owned.as_str()) {
-                        view.selected_id = view.open_tabs.last().cloned();
-                        if let Some(window) = window {
-                            view.load_editor(window, cx);
-                        }
+                        let next = view.open_tabs.last().cloned();
+                        view.activate_request_tab(next, window, cx);
                     }
                     cx.notify();
                 },
@@ -1243,7 +1277,8 @@ impl WorkspaceView {
             self.expanded.insert(ancestor);
         }
         self.expanded.insert(id.clone());
-        self.target_folder = Some(id);
+        self.target_folder = Some(id.clone());
+        self.scroll_explorer_to_id(&id);
         cx.notify();
     }
 
@@ -1357,15 +1392,6 @@ impl WorkspaceView {
 
     pub(super) fn add_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let request = ApiRequest::new("GET", "New Request", "");
-        self.insert_and_open_request(request, window, cx);
-    }
-
-    pub(super) fn insert_and_open_request(
-        &mut self,
-        request: ApiRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         self.insert_and_open_request_with_notice(request, "Saved locally".into(), None, window, cx);
     }
 
@@ -1378,11 +1404,8 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         if self.editor_dirty
-            && let Err(error) = self.apply_editor(cx)
+            && !self.apply_editor_or_report("Cannot save active request", window, cx)
         {
-            let msg = format!("Cannot save active request: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
             return;
         }
         let id = request.id.clone();
@@ -1393,11 +1416,7 @@ impl WorkspaceView {
         let project_id = self.current().id.clone();
         self.bump_project_revision(&project_id);
         self.cancel(cx);
-        self.selected_id = Some(id.clone());
-        if !self.open_tabs.contains(&id) {
-            self.open_tabs.push(id);
-        }
-        self.load_editor(window, cx);
+        self.activate_request_tab(Some(id), Some(window), cx);
         self.enqueue_project_save(
             Some(success_status),
             success_toast,
@@ -1413,12 +1432,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editor_dirty
-            && let Err(error) = self.apply_editor(cx)
-        {
-            let msg = format!("Save failed: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
+        if self.editor_dirty && !self.apply_editor_or_report("Save failed", window, cx) {
             return;
         }
         if let Some(new_id) = self.projects[self.active_project].duplicate_request(id) {
@@ -1426,11 +1440,7 @@ impl WorkspaceView {
             let project_id = self.current().id.clone();
             self.bump_project_revision(&project_id);
             self.cancel(cx);
-            self.selected_id = Some(new_id.clone());
-            if !self.open_tabs.contains(&new_id) {
-                self.open_tabs.push(new_id);
-            }
-            self.load_editor(window, cx);
+            self.activate_request_tab(Some(new_id), Some(window), cx);
             self.enqueue_project_save(
                 Some("Request duplicated".into()),
                 Some("Request duplicated".into()),
@@ -1442,13 +1452,7 @@ impl WorkspaceView {
     }
 
     fn apply_editor_for_tree_move(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if let Err(error) = self.apply_editor(cx) {
-            let msg = format!("Cannot apply editor changes: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
-            return false;
-        }
-        true
+        self.apply_editor_or_report("Cannot apply editor changes", window, cx)
     }
 
     fn persist_tree_change(
@@ -1637,6 +1641,24 @@ impl WorkspaceView {
         }
     }
 
+    fn finalize_rename(
+        &mut self,
+        status: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.enqueue_project_save(
+            Some(status.clone()),
+            Some(status),
+            "Rename failed",
+            Some(window),
+            cx,
+        );
+    }
+
     pub(super) fn open_name_dialog(
         &mut self,
         kind: NameDialogKind,
@@ -1810,38 +1832,59 @@ impl WorkspaceView {
                             if view.projects[view.active_project]
                                 .rename_folder(folder_id, value.clone())
                             {
-                                let project_id = view.current().id.clone();
-                                view.bump_project_revision(&project_id);
-                                view.sync_dirty();
-                                view.enqueue_project_save(
-                                    Some("Folder renamed".into()),
-                                    Some("Folder renamed".into()),
-                                    "Rename failed",
-                                    Some(window),
-                                    cx,
-                                );
+                                view.finalize_rename("Folder renamed".into(), window, cx);
                             }
                         }
                         NameDialogKind::RenameCollection(collection_id) => {
                             if view.projects[view.active_project]
                                 .rename_collection(collection_id, value.clone())
                             {
-                                let project_id = view.current().id.clone();
-                                view.bump_project_revision(&project_id);
-                                view.sync_dirty();
-                                view.enqueue_project_save(
-                                    Some("Collection renamed".into()),
-                                    Some("Collection renamed".into()),
-                                    "Rename failed",
-                                    Some(window),
-                                    cx,
-                                );
+                                view.finalize_rename("Collection renamed".into(), window, cx);
                             }
                         }
                     });
                     true
                 })
                 .child(Input::new(&input).small())
+        });
+    }
+
+    /// Shared shell for destructive confirmations (danger button, cancel, warning text).
+    fn confirm_destructive_dialog<F>(
+        &self,
+        spec: DestructiveDialogSpec,
+        on_confirm: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let DestructiveDialogSpec {
+            title,
+            ok_text,
+            message,
+            width,
+        } = spec;
+        let weak_view = cx.weak_entity();
+        let on_confirm = Rc::new(on_confirm);
+        window.open_dialog(cx, move |dialog, _, _| {
+            let weak_ok = weak_view.clone();
+            let confirm = Rc::clone(&on_confirm);
+            let message = message.clone();
+            dialog
+                .w(width)
+                .title(title)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text)
+                        .ok_variant(ButtonVariant::Danger)
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = weak_ok.update(cx, |view, cx| confirm(view, window, cx));
+                    true
+                })
+                .child(div().text_size(px(13.)).child(message))
         });
     }
 
@@ -1856,40 +1899,25 @@ impl WorkspaceView {
             .find_request(&id)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| "this request".into());
-        let weak_view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let weak_ok = weak_view.clone();
-            let req_id = id.clone();
-            dialog
-                .w(px(400.))
-                .title("Delete Request")
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Delete")
-                        .ok_variant(ButtonVariant::Danger)
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let _ = weak_ok.update(cx, |view, cx| {
-                        view.delete_request_now(&req_id, window, cx);
-                    });
-                    true
-                })
-                .child(div().text_size(px(13.)).child(format!(
-                    "Delete \"{name}\" from this project? This cannot be undone."
-                )))
-        });
+        self.confirm_destructive_dialog(
+            DestructiveDialogSpec {
+                title: "Delete Request",
+                ok_text: "Delete",
+                message: format!("Delete \"{name}\" from this project? This cannot be undone."),
+                width: px(400.),
+            },
+            move |view, window, cx| view.delete_request_now(&id, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn delete_request_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_id.as_deref() == Some(id) {
             self.cancel(cx);
         } else if self.editor_dirty
-            && let Err(error) = self.apply_editor(cx)
+            && !self.apply_editor_or_report("Cannot save active request", window, cx)
         {
-            let msg = format!("Cannot save active request: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
             return;
         }
         if self.projects[self.active_project].delete_request(id) {
@@ -1900,17 +1928,12 @@ impl WorkspaceView {
             self.bump_project_revision(&project_id);
             self.sync_dirty();
             if self.selected_id.as_deref() == Some(id) {
-                self.selected_id = self
+                let next = self
                     .open_tabs
                     .last()
                     .cloned()
                     .or_else(|| self.current().first_request_id());
-                if let Some(next_id) = &self.selected_id
-                    && !self.open_tabs.contains(next_id)
-                {
-                    self.open_tabs.push(next_id.clone());
-                }
-                self.load_editor(window, cx);
+                self.activate_request_tab(next, Some(window), cx);
             }
             self.enqueue_project_save(
                 Some("Request deleted".into()),
@@ -1933,29 +1956,19 @@ impl WorkspaceView {
             .find_folder(&id)
             .map(|f| f.name.clone())
             .unwrap_or_else(|| "this folder".into());
-        let weak_view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let weak_ok = weak_view.clone();
-            let folder_id = id.clone();
-            dialog
-                .w(px(420.))
-                .title("Delete Folder")
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Delete Folder")
-                        .ok_variant(ButtonVariant::Danger)
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let _ = weak_ok.update(cx, |view, cx| {
-                        view.delete_folder_now(&folder_id, window, cx);
-                    });
-                    true
-                })
-                .child(div().text_size(px(13.)).child(format!(
+        self.confirm_destructive_dialog(
+            DestructiveDialogSpec {
+                title: "Delete Folder",
+                ok_text: "Delete Folder",
+                message: format!(
                     "Delete folder \"{name}\" and all requests inside it? This cannot be undone."
-                )))
-        });
+                ),
+                width: px(420.),
+            },
+            move |view, window, cx| view.delete_folder_now(&id, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn reconcile_after_container_delete(
@@ -1983,17 +1996,12 @@ impl WorkspaceView {
         };
         if selected_removed {
             self.cancel(cx);
-            self.selected_id = self
+            let next = self
                 .open_tabs
                 .last()
                 .cloned()
                 .or_else(|| self.current().first_request_id());
-            if let Some(next_id) = &self.selected_id
-                && !self.open_tabs.contains(next_id)
-            {
-                self.open_tabs.push(next_id.clone());
-            }
-            self.load_editor(window, cx);
+            self.activate_request_tab(next, Some(window), cx);
         } else if self.editor_dirty {
             let _ = self.apply_editor(cx);
         }
@@ -2026,29 +2034,19 @@ impl WorkspaceView {
             .find_collection(&id)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| "this collection".into());
-        let weak_view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let weak_ok = weak_view.clone();
-            let coll_id = id.clone();
-            dialog
-                .w(px(420.))
-                .title("Delete Collection")
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Delete Collection")
-                        .ok_variant(ButtonVariant::Danger)
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    let _ = weak_ok.update(cx, |view, cx| {
-                        view.delete_collection_now(&coll_id, window, cx);
-                    });
-                    true
-                })
-                .child(div().text_size(px(13.)).child(format!(
+        self.confirm_destructive_dialog(
+            DestructiveDialogSpec {
+                title: "Delete Collection",
+                ok_text: "Delete Collection",
+                message: format!(
                     "Delete collection \"{name}\" and all folders/requests inside it? This cannot be undone."
-                )))
-        });
+                ),
+                width: px(420.),
+            },
+            move |view, window, cx| view.delete_collection_now(&id, window, cx),
+            window,
+            cx,
+        );
     }
 
     fn delete_collection_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2180,7 +2178,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    pub(super) fn quick_create_standard_environments(
+    fn quick_create_standard_environments(
         &mut self,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
@@ -2366,7 +2364,7 @@ impl WorkspaceView {
         self.set_status(format!("Theme: {}", next.name()), false, cx);
     }
 
-    pub(super) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx)
             && self
                 .active_command_palette
@@ -2871,6 +2869,54 @@ mod tests {
             .push(ApiRequest::new("GET", "Test request", ""));
         project.collections[0].folders.push(folder);
         store.save(&project).unwrap();
+    }
+
+    #[test]
+    fn activate_request_tab_selects_and_loads_without_duplicate_tabs() {
+        run_view_test(check_activate_request_tab);
+    }
+
+    fn check_activate_request_tab() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store, window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        let request_id = cx
+            .update_window(window, |_, _, cx| {
+                view.update(cx, |view, _| view.current().first_request_id().unwrap())
+            })
+            .unwrap();
+
+        for _ in 0..2 {
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_request_tab(Some(request_id.clone()), Some(window), cx);
+                    assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
+                    assert_eq!(view.open_tabs, vec![request_id.clone()]);
+                    assert_eq!(view.request_name.read(cx).value(), "Test request");
+                });
+            })
+            .unwrap();
+        }
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.activate_request_tab(None, Some(window), cx);
+                assert!(view.selected_id.is_none());
+                assert_eq!(view.open_tabs, vec![request_id]);
+                assert!(view.request_name.read(cx).value().is_empty());
+            });
+        })
+        .unwrap();
     }
 
     #[test]
