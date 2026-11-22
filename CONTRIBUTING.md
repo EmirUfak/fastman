@@ -44,11 +44,12 @@ cargo lint-core   # Clippy for fastman-core and fastman-cli, warnings as errors
 **Required when you change `apps/fastman-desktop`.** These cover the whole workspace and need GPUI's native prerequisites:
 
 ```sh
-cargo test-all
-cargo lint-all
+cargo test-all    # tests across the whole workspace
+cargo lint-all    # Clippy across the whole workspace, warnings as errors
+cargo check-all   # compile check across all workspace targets (used by MSRV CI)
 ```
 
-**Checks that depend on the OS.** CI runs the full workspace checks on **Windows** only, and `cargo audit` on Linux. CI also builds the workspace with the declared minimum Rust version (1.100). If you can't run the desktop checks locally, or you only tested on Linux or macOS, say so in the pull request. Write "not run" rather than ticking the box.
+**Checks that depend on the OS.** CI runs the full workspace checks on **Windows** only, and `cargo audit` on Linux. CI also runs `cargo check-all` with the declared minimum Rust version (1.100). If you can't run the desktop checks locally, or you only tested on Linux or macOS, say so in the pull request. Write "not run" rather than ticking the box.
 
 ### Desktop save and navigation smoke test
 

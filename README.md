@@ -46,7 +46,7 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/EmirUfak
 
 3. **Send your first request.** On first launch, Fastman creates an empty project named **My API Project**. Create a request, enter a URL such as `https://httpbin.org/get`, and click **Send**.
 
-To build and test without a GUI toolchain (core and CLI only), see [CONTRIBUTING.md](CONTRIBUTING.md#local-checks).
+To test and lint core and CLI without a GUI toolchain, run `cargo test-core` and `cargo lint-core`; see [CONTRIBUTING.md](CONTRIBUTING.md#local-checks) for all check aliases.
 
 ## Platform support
 
@@ -114,6 +114,7 @@ The following are **not implemented yet**:
 apps/fastman-desktop/   GPUI workbench: explorer, request and response views
 apps/fastman-cli/       Headless list, import, and send
 crates/fastman-core/    GUI-free domain model, storage, HTTP, templates, import, and cURL
+.cargo/                 Shared Cargo aliases for formatting, lint, test, and check commands
 .github/                CI, release workflow, and issue/PR templates
 ```
 

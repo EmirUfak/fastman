@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fuzzy command palette (`Ctrl+K` / `Cmd+K`) and persistent response panel placement.
 - Explicit per-request TLS verification opt-out with visible warnings, and TTFB / download / total response timing in desktop and CLI.
 - Issue template contact link for private vulnerability reports, and a release checklist.
+- Shared Cargo check aliases in `.cargo/config.toml` (`fmt-check`, `test-core`, `lint-core`, `check-all`, `test-all`, `lint-all`) used by local checks, the PR template, and CI.
 
 ### Changed
 - CI and release builds target Windows; tagged releases publish a Windows x86_64 archive with SHA-256 checksum. CI also checks the declared MSRV (Rust 1.100).
