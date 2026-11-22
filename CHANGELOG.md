@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- URL template variable highlighting with resolved-value inspection and unresolved-variable warnings.
+- Safe cURL paste with a staged import confirmation that reports unsupported flags.
+- Fuzzy command palette (`Ctrl+K` / `Cmd+K`) and persistent response panel placement.
+- Explicit per-request TLS verification opt-out with visible warnings, and TTFB / download / total response timing in desktop and CLI.
+- Issue template contact link for private vulnerability reports, and a release checklist.
+
+### Changed
+- CI and release builds target Windows; tagged releases publish a Windows x86_64 archive with SHA-256 checksum. CI also checks the declared MSRV (Rust 1.100).
+- README reorganized around download, quick start, platform support, and current limitations; contributing workflow and security reporting process clarified.
+
 ## [0.2.1] - 2026-11-21
 
 ### Changed
@@ -48,3 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Commands for `list`, `import-collection`, `send`, `--version`, and `--help`.
 - **Documentation & CI**:
   - Architecture, build, testing/benchmarking, security model, schema format, roadmap, and GitHub Actions CI for headless core and CLI.
+
+[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/EmirUfak/fastman/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/EmirUfak/fastman/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/EmirUfak/fastman/releases/tag/v0.1.0

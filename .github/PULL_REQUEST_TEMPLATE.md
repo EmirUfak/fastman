@@ -1,10 +1,22 @@
 ## Summary
 Describe what changed and why.
 
+Closes #
+
+## Testing evidence
+Tick checks that passed. For checks that failed or were not run, leave unticked and append `— failed: …` or `— not run: <reason>` (e.g. no GPUI toolchain, OS unavailable).
+
+- [ ] `cargo fmt-check`
+- [ ] `cargo test-core`
+- [ ] `cargo lint-core`
+- [ ] Desktop changes: `cargo test-all` and `cargo lint-all`
+- [ ] Manual testing (describe OS and steps):
+
+## Breaking changes
+- [ ] None
+- [ ] Yes — describe impact on CLI output/arguments, persisted project JSON, or user workflows, and the migration path:
+
 ## Checklist
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo test --locked -p fastman-core -p fastman-cli` passes
-- [ ] `cargo clippy --locked -p fastman-core -p fastman-cli --all-targets -- -D warnings` passes
-- [ ] Desktop changes verified with `cargo test --locked --workspace` (if applicable)
 - [ ] No secrets, tokens, or personal paths added to fixtures or docs
-- [ ] Relevant documentation updated (`README.md`, `CHANGELOG.md`)
+- [ ] Security-sensitive areas (TLS, redirects, credentials, imports, escaping, file permissions) unchanged, or reasoning explained above
+- [ ] Relevant documentation updated (`README.md`, `CHANGELOG.md` `[Unreleased]`, `SECURITY.md`)

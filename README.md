@@ -1,92 +1,128 @@
 # Fastman
 
-**A native, local-first API development client written in Rust and GPUI Kit.**
+**A native, local-first API client for building and sending HTTP requests, written in Rust with GPUI Kit.**
 
-> Status: **v0.2.1** (early open-source preview). See the [changelog](CHANGELOG.md) for release details.
+> Status: **v0.2.1**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
 
-## Product contract
+![Fastman desktop workbench](assets/screenshot.png)
 
-- Left panel: **project selector at the top**, then collection/folder/request explorer with nested folders.
-- Center/right: request tabs; method, URL, inline request name editing, Params, Auth, Headers, Body, Scripts, and Settings sections; Send / Cancel / Save; response area.
-- Native UI with no Electron or browser renderer; data stays local unless a request is explicitly sent.
-- No required account, cloud sync, advertising, or developer telemetry.
-- Broad REST/HTTP request-builder coverage is the **long-term target**, not a claim of full feature parity today.
+Fastman is for developers who want a fast desktop API client that keeps everything local:
 
-## Current capabilities
+- **Native UI.** Built on GPUI Kit, with no Electron or embedded browser.
+- **Local-first.** Projects are stored as plain JSON on your machine. Fastman sends network traffic only when you send a request.
+- **No account, cloud sync, ads, or telemetry.**
+- **Safe by default.** TLS verification is on by default. Imported collections and scripts are never executed, and credentials are redacted when you copy a request as cURL.
+- **Desktop app and CLI.** Both use the same project files.
 
-| Area | What exists |
+## Download
+
+Prebuilt binaries are published on [GitHub Releases](https://github.com/EmirUfak/fastman/releases).
+
+| Platform | Binary | Notes |
+|---|---|---|
+| Windows x86_64 | Yes | Portable executables; no installer. |
+| Linux, macOS | No | Build from source; see [Platform support](#platform-support). |
+
+- **v0.2.1** ships only the desktop app, as `fastman-desktop-v0.2.1-windows-x86_64.exe`. To get the CLI for this release, build it from source.
+- **Releases from the [release workflow](.github/workflows/release.yml)** ship `fastman-<tag>-x86_64-pc-windows-msvc.zip`. It contains `fastman-desktop.exe`, `fastman-cli.exe`, `LICENSE`, and `README.md`, along with a `.sha256` checksum file.
+- **The binaries are not code-signed**, so Windows SmartScreen may warn you the first time you run them. You can check the download against the published SHA-256 checksum when one is provided:
+
+  ```powershell
+  Get-FileHash .\fastman-<tag>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+  ```
+
+## Quick start (from source)
+
+1. **Install the prerequisites:**
+   - Rust stable `>= 1.100` via [rustup](https://rustup.rs). The repository's `rust-toolchain.toml` selects the stable channel.
+   - The native build prerequisites for GPUI on your OS. GPUI Kit is built on Zed's GPUI, so follow Zed's per-OS guides: [Windows](https://github.com/zed-industries/zed/blob/main/docs/src/development/windows.md), [Linux](https://github.com/zed-industries/zed/blob/main/docs/src/development/linux.md), [macOS](https://github.com/zed-industries/zed/blob/main/docs/src/development/macos.md). On Windows, that means Visual Studio or Build Tools with the **Desktop development with C++** workload (MSVC and the Windows SDK).
+2. **Clone the repository and run the app:**
+
+   ```sh
+   git clone https://github.com/EmirUfak/fastman.git
+   cd fastman
+   cargo run --release -p fastman-desktop
+   ```
+
+3. **Send your first request.** On first launch, Fastman creates an empty project named **My API Project**. Create a request, enter a URL such as `https://httpbin.org/get`, and click **Send**.
+
+To build and test without a GUI toolchain (core and CLI only), see [CONTRIBUTING.md](CONTRIBUTING.md#local-checks).
+
+## Platform support
+
+| Platform | Status |
 |---|---|
-| Workspaces | Workspace switcher and `+ Workspace` creation in the header; default `My workspace` preserved |
-| Project selector | GPUI Kit `Select`, create named projects, switch projects |
-| Explorer | Search, nested folders, context menus, and drag-and-drop organization |
-| Tabs | Multiple closable request tabs within the active project, inline request rename |
-| Navigation | Command palette for projects, collections, folders, requests, and common actions (`Ctrl+K` / `Cmd+K`) |
-| Request editor | Method, URL with resolved variable highlighting, editable parameter and header tables, auth, body editing with JSON validation and formatting, timeout, and project variables |
-| Request execution | Reqwest async, TLS verification, up to 10 same-origin redirects, 100–300,000 ms timeout, 2 MiB response cap, and cancellation |
-| Response viewer | Status, duration, size, final URL, searchable pretty or raw body, headers, cookies, and persistent panel placement |
-| Storage | Per-project JSON (`schema_version = 1`) in OS local data directory or `FASTMAN_HOME` |
-| Import and export | Collection v2.1 JSON subset through desktop or CLI; desktop cURL import and redacted-by-default Copy as cURL |
-| Tests | Core unit and feature tests (nested lookup, secret exclusion, local persistence, interpolation, importer, localhost HTTP) and CLI integration tests |
+| Windows x86_64 | **Tested.** CI runs format, Clippy, tests, and a release build on every push. Release binaries are Windows-only. |
+| Linux | **Untested.** `fastman-core` and `fastman-cli` have no GUI dependencies and are expected to build. The desktop app depends on GPUI's Linux support. |
+| macOS | **Untested.** Same as Linux. |
 
-### Current limitations
-
-Not yet implemented: request tests/assertions and JS runtime, separate environments, OAuth 2.0, Digest, AWS SigV4, multipart/binary uploads, GraphQL tooling, WebSocket/gRPC/SSE, proxy/certificate configuration, collection runner, collection export, request history, large-response streaming, and distribution packaging.
+Reports from Linux and macOS builds are welcome. Please open an issue with your OS, architecture, and build output.
 
 ## Usage
 
-On first launch Fastman creates **My API Project** with no sample requests. Create a request to start with a blank URL. Network requests are made **only** after clicking **Send** (or invoking `fastman-cli send`).
+### Desktop
 
-- The desktop header selects the active workspace; use **+ Workspace** to create one by name. Each workspace stores its own projects, while existing projects remain in **My workspace**.
-- The CLI currently operates on the default workspace only:
+- The header selects the active **workspace**. Use **+ Workspace** to create one. Each workspace has its own projects, and existing projects stay in **My workspace**.
+- The left panel has the project selector and a collection/folder/request explorer with search, context menus, and drag-and-drop.
+- Request tabs edit the method, URL, Params, Auth, Headers, Body, and Settings. Use **Send**, **Cancel**, and **Save**.
+- `Ctrl+K` (`Cmd+K` on macOS) opens the command palette for projects, collections, requests, and common actions.
+- Import a Collection v2.1 JSON file or paste a cURL command. Use **Copy as cURL** to export a request with secrets redacted by default.
+
+### CLI
+
+The CLI works only with the default workspace. From a source checkout, run:
 
 ```sh
-cargo run -p fastman-cli -- --version
+cargo run -p fastman-cli -- --help
 cargo run -p fastman-cli -- list
 cargo run -p fastman-cli -- import-collection ./my_collection.json
 cargo run -p fastman-cli -- send <project-uuid> <request-uuid>
 ```
 
-Importing a collection file creates a new project. Import does **not** execute requests or scripts.
+Importing a collection creates a new project and never runs any requests or scripts. If the collection contains secrets, you must pass either `--strip-secrets` or `--allow-plaintext-secrets`. Terminal control characters in output are escaped unless you pass `send --raw`.
 
-## Build and test
+### Where data is stored
 
-Install Rust stable (`>= 1.100`) and GPUI Kit's native prerequisites for your target OS.
+Each project is a JSON file (`schema_version = 1`) in the OS local data directory, or in `FASTMAN_HOME` if that is set. `Auth` credentials are kept in memory only and are never written to disk. **Custom headers, query params, bodies, and variable values *are* saved to disk**, so don't put secrets in them. See [SECURITY.md](SECURITY.md#security-model--known-caveats).
 
-```sh
-cargo fmt --all -- --check
-cargo test --locked -p fastman-core -p fastman-cli
-cargo clippy --locked -p fastman-core -p fastman-cli --all-targets -- -D warnings
-cargo test --locked --workspace
-cargo run -p fastman-desktop
-```
+## Features
 
-## Layout
+| Area | Desktop | CLI |
+|---|---|---|
+| Workspaces and projects | Create and switch | Default workspace only (`list`) |
+| Explorer | Nested folders, search, context menus, drag-and-drop | — |
+| Request editor | Method, URL with variable highlighting, params, headers, auth, body (JSON validation and formatting), timeout, project variables, per-request TLS verification opt-out | — |
+| Request execution | Async, cancellable; same-origin redirects only (max 10); 100–300,000 ms timeout; 2 MiB response cap | `send` |
+| Response viewer | Status, TTFB/download/total timing, size, final URL, searchable pretty or raw body, headers, cookies | Escaped text output |
+| Collection v2.1 JSON import (subset) | Yes | `import-collection` |
+| cURL import | Yes | — |
+| Copy as cURL (redacted by default) | Yes | — |
+
+## Current limitations
+
+The following are **not implemented yet**:
+
+- **Requests:** separate environments; OAuth 2.0, Digest, and AWS SigV4 auth; multipart and binary uploads; proxy and client-certificate configuration.
+- **Protocols:** GraphQL tooling, WebSocket, gRPC, and SSE.
+- **Automation:** request tests and assertions. Fastman will never run JavaScript. A collection runner is also missing.
+- **Data:** collection export, request history, and streaming for large responses.
+- **Distribution:** installers, code signing, and Linux/macOS binaries.
+
+## Repository layout
 
 ```text
-fastman/
-  apps/
-    fastman-desktop/    # GPUI workspace, explorer, request and response views
-    fastman-cli/        # Headless list, import, and send CLI
-  crates/
-    fastman-core/       # Domain model, storage, HTTP, templates, import, and cURL
-  .github/              # CI workflow and issue/PR templates
+apps/fastman-desktop/   GPUI workbench: explorer, request and response views
+apps/fastman-cli/       Headless list, import, and send
+crates/fastman-core/    GUI-free domain model, storage, HTTP, templates, import, and cURL
+.github/                CI, release workflow, and issue/PR templates
 ```
 
-## Engineering rules
+## Contributing and community
 
-- Core has no GUI dependency. No HTTP, filesystem I/O, or task spawning in `Render`.
-- Keep native UI state within GPUI entities; no external global state layer.
-- Prefer one direct implementation over compatibility wrappers or speculative abstraction.
-- Do not persist `Auth` credentials in project JSON. **Custom headers, query params, bodies, and variable values ARE persisted**, so avoid storing secrets there until secure variables are implemented.
-- Treat imported collections and scripts as **untrusted** data; scripts are never executed.
-- Build and benchmark on the target OS; do not assume performance without measurement.
-
-## Documentation & community
-
+- [Contributing guide](CONTRIBUTING.md): workflow, checks, and engineering rules
+- [Security policy](SECURITY.md): report vulnerabilities privately, not in public issues
 - [Changelog](CHANGELOG.md)
-- [Contributing guide](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
 
 ## License
 
-Licensed under the [MIT License](LICENSE). GPUI Kit and third-party dependencies keep their own licenses.
+Fastman is licensed under the [MIT License](LICENSE). GPUI Kit and other third-party dependencies are covered by their own licenses.

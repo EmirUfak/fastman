@@ -5,17 +5,27 @@ title: "[Bug]: "
 labels: bug
 ---
 
+<!-- Security vulnerabilities (credential leaks, TLS bypass, path traversal, code execution via imports):
+     do NOT file here. Report privately per SECURITY.md. -->
+
 ## Description
-A clear description of what happened and what you expected to happen.
+A short summary of the problem.
 
 ## Steps to reproduce
 1. ...
 2. ...
 
+## Expected behavior
+What you expected to happen.
+
+## Actual behavior
+What happened instead.
+
 ## Environment
-- Fastman version (`fastman-cli --version` or commit):
+- Fastman version (`fastman-cli --version`, release asset name, or commit):
+- Interface (desktop / CLI):
 - OS and architecture (e.g., Windows 11 x86_64, Linux x86_64, macOS arm64):
 - Rust version (`rustc --version`, if built from source):
 
 ## Additional context
-Logs, error messages, or screenshots (please redact any secrets or tokens).
+Logs, error messages, or screenshots. **Redact secrets, tokens, and private URLs.**

@@ -13,11 +13,19 @@ Fastman is currently in pre-1.0 development (`0.2.x`). Security fixes target the
 
 Please **do not** open a public GitHub issue for suspected security vulnerabilities (credential leaks, TLS bypasses, path traversal, parser crashes, or code execution via imports).
 
-Instead, report vulnerabilities privately to the repository maintainers via GitHub Security Advisories (Private Vulnerability Reporting) if enabled on the repository, or contact the maintainers directly with:
+Instead, report it privately through **[GitHub Private Vulnerability Reporting](https://github.com/EmirUfak/fastman/security/advisories/new)**. On the repository's **Security** tab, choose **Report a vulnerability**. Only the maintainer can see the report. Please include:
 
-- A description of the issue and affected crate (`fastman-core`, `fastman-cli`, or `fastman-desktop`).
-- Steps to reproduce or a minimal proof of concept.
-- Potential impact and any suggested mitigation.
+- A description of the issue and the affected crate (`fastman-core`, `fastman-cli`, or `fastman-desktop`).
+- The Fastman version or commit, and your OS.
+- Steps to reproduce, or a minimal proof of concept. Use test data only, never real credentials.
+- The potential impact and any mitigation you suggest.
+
+### What to expect
+
+- **Acknowledgement:** reports are usually acknowledged within 7 days. This is a goal, not a guarantee.
+- **Next steps:** once the issue is confirmed, any follow-up questions and the fix plan are discussed with you in the private advisory.
+- **Coordinated disclosure:** please keep the issue private until a fix is released or a disclosure date is agreed. When the fix ships, a GitHub Security Advisory is published and you're credited, unless you'd rather stay anonymous.
+- **Out of scope:** risks the security model below already documents, such as plaintext persistence of custom headers or an explicitly disabled TLS check. Reports showing these protections can be bypassed are in scope.
 
 ## Security Model & Known Caveats
 

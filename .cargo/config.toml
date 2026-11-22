@@ -1,0 +1,14 @@
+# Project check commands. Single source of truth for CONTRIBUTING.md, the PR template, and CI.
+# Cargo aliases cannot shadow built-in commands, so names are suffixed.
+[alias]
+# Formatting (whole workspace, check only; run `cargo fmt` to apply).
+fmt-check = "fmt --all -- --check"
+
+# GUI-free crates: run on any OS without GPUI's native prerequisites.
+test-core = "test --locked -p fastman-core -p fastman-cli"
+lint-core = "clippy --locked -p fastman-core -p fastman-cli --all-targets -- -D warnings"
+
+# Full workspace, including fastman-desktop (needs GPUI's native prerequisites).
+check-all = "check --locked --workspace --all-targets"
+test-all = "test --locked --workspace"
+lint-all = "clippy --locked --workspace --all-targets -- -D warnings"
