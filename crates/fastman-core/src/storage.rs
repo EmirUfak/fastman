@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn persists_chain_definitions_and_validates_references() {
-        use crate::{AssertionRule, ChainStep, RequestChain};
+        use crate::{AssertionRule, CaptureRule, CaptureSource, ChainStep, RequestChain};
 
         let dir = tempfile::tempdir().unwrap();
         let store = ProjectStore::at(dir.path());
@@ -1118,6 +1118,13 @@ mod tests {
         .unwrap();
         assert!(step.enabled);
         assert!(step.assertions.is_empty());
+        assert!(step.captures.is_empty());
+        assert!(
+            serde_json::to_value(&step)
+                .unwrap()
+                .get("captures")
+                .is_none()
+        );
         assert!(
             serde_json::to_value(&step)
                 .unwrap()
@@ -1127,6 +1134,14 @@ mod tests {
         let second = ChainStep {
             id: "second".into(),
             enabled: false,
+            captures: vec![CaptureRule {
+                name: "user_id".into(),
+                source: CaptureSource::JsonField {
+                    pointer: "/id".into(),
+                },
+                required: true,
+                sensitive: false,
+            }],
             assertions: vec![
                 AssertionRule::Status { expected: 200 },
                 AssertionRule::Header {

@@ -327,6 +327,33 @@ pub struct ChainStep {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<AssertionRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captures: Vec<CaptureRule>,
+}
+
+/// A named value to extract from a response after assertions pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureRule {
+    pub name: String,
+    pub source: CaptureSource,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default = "default_true")]
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CaptureSource {
+    Status,
+    /// Selects the first value for the case-insensitive header name.
+    Header {
+        name: String,
+    },
+    /// RFC 6901 JSON Pointer. An empty pointer selects the root.
+    JsonField {
+        pointer: String,
+    },
 }
 
 /// Declarative checks against a completed HTTP response.

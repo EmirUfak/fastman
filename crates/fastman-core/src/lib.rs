@@ -2,6 +2,8 @@
 //! The core crate has no dependency on GPUI and can be tested headlessly.
 
 pub mod assertions;
+pub mod captures;
+pub mod chain_runtime;
 pub mod curl;
 pub mod http;
 pub mod import;
@@ -12,10 +14,12 @@ pub mod storage;
 pub mod template;
 
 pub use assertions::{AssertionError, AssertionFailure, evaluate_assertions};
+pub use captures::{CaptureError, CaptureFailure, CapturedValue, capture_step_response};
+pub use chain_runtime::{ChainRunContext, ChainRunError};
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{
-    ApiRequest, AssertionRule, Auth, ChainStep, Collection, Environment, Folder, HttpBody,
-    KeyValue, Project, RequestChain, SecretRef,
+    ApiRequest, AssertionRule, Auth, CaptureRule, CaptureSource, ChainStep, Collection,
+    Environment, Folder, HttpBody, KeyValue, Project, RequestChain, SecretRef,
 };
 pub use secrets::{
     MemorySecretStore, OsSecretStore, ResolvedVariables, SecretChangePlan, SecretStore,
