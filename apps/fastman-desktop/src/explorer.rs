@@ -87,6 +87,12 @@ impl Render for DraggedFolderPreview {
     }
 }
 
+struct TreeRenderContext<'a> {
+    depth: f32,
+    ancestors: &'a [String],
+    query: &'a str,
+}
+
 fn drag_highlight_box(style: StyleRefinement, cx: &App) -> StyleRefinement {
     let accent = crate::theme::brand_accent(cx.theme().is_dark());
     style
@@ -390,18 +396,23 @@ impl WorkspaceView {
         &self,
         folders: &[Folder],
         requests: &[ApiRequest],
-        depth: f32,
-        ancestors: &[String],
-        query: &str,
+        context: TreeRenderContext<'_>,
         cx: &mut Context<Self>,
         out: &mut Vec<AnyElement>,
     ) {
         for folder in folders {
-            self.render_folder(folder, depth, ancestors, query, cx, out);
+            self.render_folder(
+                folder,
+                context.depth,
+                context.ancestors,
+                context.query,
+                cx,
+                out,
+            );
         }
         for req in requests {
-            if query.is_empty() || request_matches(req, query) {
-                self.render_request_link(req, depth, ancestors, cx, out);
+            if context.query.is_empty() || request_matches(req, context.query) {
+                self.render_request_link(req, context.depth, context.ancestors, cx, out);
             }
         }
     }
@@ -414,9 +425,11 @@ impl WorkspaceView {
                 self.render_tree_children(
                     &collection.folders,
                     &collection.requests,
-                    0.,
-                    &[],
-                    query,
+                    TreeRenderContext {
+                        depth: 0.,
+                        ancestors: &[],
+                        query,
+                    },
                     cx,
                     &mut out,
                 );
@@ -597,9 +610,11 @@ impl WorkspaceView {
                 self.render_tree_children(
                     &collection.folders,
                     &collection.requests,
-                    1.,
-                    &[],
-                    query,
+                    TreeRenderContext {
+                        depth: 1.,
+                        ancestors: &[],
+                        query,
+                    },
                     cx,
                     &mut out,
                 );
@@ -952,9 +967,11 @@ impl WorkspaceView {
             self.render_tree_children(
                 &folder.folders,
                 &folder.requests,
-                depth + 1.,
-                &next_ancestors,
-                query,
+                TreeRenderContext {
+                    depth: depth + 1.,
+                    ancestors: &next_ancestors,
+                    query,
+                },
                 cx,
                 out,
             );
