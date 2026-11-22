@@ -180,7 +180,7 @@ fn send_resolves_environments_and_env_secret_refs_without_plaintext_on_disk() {
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("x-api-key:"))
                 .unwrap_or("");
-            let body = format!("{request_line} | {api_key_line}");
+            let body = format!("{request_line}\n{api_key_line}");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -238,13 +238,14 @@ fn send_resolves_environments_and_env_secret_refs_without_plaintext_on_disk() {
     );
     let active_stdout = String::from_utf8_lossy(&active_out.stdout);
     assert!(active_stdout.contains("GET /local HTTP/1.1"));
-    assert!(active_stdout.contains("super_secret_cli_token"));
+    assert!(!active_stdout.contains("super_secret_cli_token"));
+    assert!(active_stdout.contains("<REDACTED>"));
 
-    // 2) Override with `--env staging` by name
+    // 2) Override by name; explicit raw output preserves the server's echo.
     let staging_out = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
         .env("FASTMAN_HOME", &home)
         .env("FASTMAN_TEST_CLI_SECRET", "super_secret_cli_token")
-        .args(["send", "--env", "staging", &project.id, &req_id])
+        .args(["send", "--raw", "--env", "staging", &project.id, &req_id])
         .output()
         .unwrap();
     assert!(

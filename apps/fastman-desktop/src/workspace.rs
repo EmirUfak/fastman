@@ -2467,7 +2467,7 @@ impl WorkspaceView {
         let resolved = self.resolved_variables.clone();
         self.cancel(cx);
         let sent_method = SharedString::from(request.method.clone());
-        let sent_url = SharedString::from(request.url.clone());
+        let sent_url = SharedString::from(fastman_core::security::redact_url_secrets(&request.url));
         let sent_method_fallback = sent_method.clone();
         let sent_url_fallback = sent_url.clone();
         if let Err(error) = self.ensure_http_runtime() {
@@ -2477,11 +2477,7 @@ impl WorkspaceView {
         }
         self.in_flight_request_id = Some(request_id.clone());
         self.set_status(
-            format!(
-                "Sending {} {}…",
-                request.method,
-                fastman_core::security::redact_url_secrets(&request.url)
-            ),
+            format!("Sending {} {}…", request.method, sent_url),
             false,
             cx,
         );
@@ -2490,7 +2486,7 @@ impl WorkspaceView {
         let engine = self.engine.as_ref().expect("engine initialized").clone();
         let runtime = self.runtime.as_ref().expect("runtime initialized");
         let handle = runtime.spawn(async move {
-            match engine.send_with_secrets(&request, &resolved).await {
+            match engine.send_for_display(&request, &resolved).await {
                 Ok(response) => {
                     let status_line = SharedString::from(format!(
                         "{} {} · {} · {}",

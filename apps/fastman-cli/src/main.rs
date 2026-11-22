@@ -146,9 +146,12 @@ async fn main() -> Result<()> {
             }
             let secret_store = OsSecretStore::default();
             let resolved = project.resolve_variables(selected_env_id, &secret_store);
-            let result = HttpEngine::new()?
-                .send_with_secrets(request, &resolved)
-                .await?;
+            let engine = HttpEngine::new()?;
+            let result = if raw_output {
+                engine.send_with_secrets(request, &resolved).await?
+            } else {
+                engine.send_for_display(request, &resolved).await?
+            };
             let body_out = if raw_output {
                 result.body
             } else {

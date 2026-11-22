@@ -1,6 +1,9 @@
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::secrets::ResolvedVariables;
-use crate::security::{is_valid_http_method, redact_url_secrets};
+use crate::security::{
+    is_sensitive_header_name, is_sensitive_param_name, is_valid_http_method, percent_decode,
+    redact_url_secrets,
+};
 use reqwest::{
     Client, Method, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
@@ -89,15 +92,24 @@ fn evaluate_redirect(initial: &Url, next: &Url, hops_so_far: usize) -> RedirectD
     RedirectDecision::Follow
 }
 
+fn url_contains_secret(raw: &str, secret_values: &[&str]) -> bool {
+    if secret_values.is_empty() {
+        return false;
+    }
+    let decoded = percent_decode(&raw.replace('+', "%2B"));
+    let form_decoded = percent_decode(raw);
+    secret_values.iter().any(|secret| {
+        !secret.is_empty()
+            && (raw.contains(secret) || decoded.contains(secret) || form_decoded.contains(secret))
+    })
+}
+
 fn sanitize_reqwest_error(err: reqwest::Error, secret_values: &[&str]) -> reqwest::Error {
     let has_sensitive_url = err.url().is_some_and(|url| {
-        let raw = url.as_str();
         url.query().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
-            || secret_values
-                .iter()
-                .any(|secret| !secret.is_empty() && raw.contains(secret))
+            || url_contains_secret(url.as_str(), secret_values)
     });
     if has_sensitive_url {
         err.without_url()
@@ -163,7 +175,7 @@ impl HttpEngine {
         variables: &BTreeMap<String, String>,
     ) -> Result<HttpResponse, HttpError> {
         let empty_unresolved = BTreeMap::new();
-        self.send_inner(request, variables, &empty_unresolved, &[])
+        self.send_inner(request, variables, &empty_unresolved, &[], false)
             .await
     }
 
@@ -174,12 +186,31 @@ impl HttpEngine {
         request: &ApiRequest,
         resolved: &ResolvedVariables,
     ) -> Result<HttpResponse, HttpError> {
+        self.send_resolved(request, resolved, false).await
+    }
+
+    /// Send normally, but mask credentials in response content intended for display.
+    pub async fn send_for_display(
+        &self,
+        request: &ApiRequest,
+        resolved: &ResolvedVariables,
+    ) -> Result<HttpResponse, HttpError> {
+        self.send_resolved(request, resolved, true).await
+    }
+
+    async fn send_resolved(
+        &self,
+        request: &ApiRequest,
+        resolved: &ResolvedVariables,
+        redact_content: bool,
+    ) -> Result<HttpResponse, HttpError> {
         let secret_values = resolved.secret_values();
         self.send_inner(
             request,
             &resolved.values,
             &resolved.unresolved_secrets,
             &secret_values,
+            redact_content,
         )
         .await
     }
@@ -190,6 +221,7 @@ impl HttpEngine {
         variables: &BTreeMap<String, String>,
         unresolved_secrets: &BTreeMap<String, String>,
         secret_values: &[&str],
+        redact_content: bool,
     ) -> Result<HttpResponse, HttpError> {
         if !is_valid_http_method(&request.method) {
             return Err(HttpError::Method(request.method.clone()));
@@ -204,6 +236,7 @@ impl HttpEngine {
             ));
         }
 
+        let mut query_credential = None;
         if request
             .params
             .iter()
@@ -225,12 +258,18 @@ impl HttpEngine {
                 if key.is_empty() {
                     return Err(HttpError::EmptyApiKeyParam);
                 }
-                pairs.append_pair(
-                    key,
-                    &interpolate_resolved(value, variables, unresolved_secrets)?,
-                );
+                let value = interpolate_resolved(value, variables, unresolved_secrets)?;
+                pairs.append_pair(key, &value);
+                query_credential = Some(value);
             }
         }
+        let mut credentials = Vec::new();
+        credentials.extend(query_credential);
+        credentials.extend(
+            url.query_pairs()
+                .filter(|(key, _)| is_sensitive_param_name(key))
+                .map(|(_, value)| value.into_owned()),
+        );
 
         let resolved_api_key_header = match &request.auth {
             Auth::ApiKeyHeader { name, value } => {
@@ -240,13 +279,11 @@ impl HttpEngine {
                     return Err(HttpError::HeaderName("API key header name is empty".into()));
                 }
                 let header_name = HeaderName::from_bytes(trimmed.as_bytes())
-                    .map_err(|_| HttpError::HeaderName(trimmed.to_owned()))?;
-                let header_value = HeaderValue::from_str(&interpolate_resolved(
-                    value,
-                    variables,
-                    unresolved_secrets,
-                )?)
-                .map_err(|_| HttpError::HeaderValue(trimmed.to_owned()))?;
+                    .map_err(|_| HttpError::HeaderName(name.clone()))?;
+                let value_text = interpolate_resolved(value, variables, unresolved_secrets)?;
+                let header_value = HeaderValue::from_str(&value_text)
+                    .map_err(|_| HttpError::HeaderValue(name.clone()))?;
+                credentials.push(value_text);
                 Some((header_name, header_value))
             }
             _ => None,
@@ -265,13 +302,26 @@ impl HttpEngine {
             }
             let name_text = interpolate_resolved(&header.key, variables, unresolved_secrets)?;
             let name = HeaderName::from_bytes(name_text.trim().as_bytes())
-                .map_err(|_| HttpError::HeaderName(name_text.clone()))?;
+                .map_err(|_| HttpError::HeaderName(header.key.clone()))?;
             if auth_header_name.as_ref() == Some(&name) {
                 continue;
             }
             let value_text = interpolate_resolved(&header.value, variables, unresolved_secrets)?;
             let value = HeaderValue::from_str(&value_text)
-                .map_err(|_| HttpError::HeaderValue(name_text))?;
+                .map_err(|_| HttpError::HeaderValue(header.key.clone()))?;
+            if is_sensitive_header_name(name.as_str()) {
+                if name == reqwest::header::COOKIE {
+                    credentials.extend(value_text.split(';').filter_map(|pair| {
+                        pair.split_once('=')
+                            .map(|(_, value)| value.trim().to_owned())
+                    }));
+                } else if name == AUTHORIZATION
+                    && let Some((_, credential)) = value_text.split_once(' ')
+                {
+                    credentials.push(credential.trim().to_owned());
+                }
+                credentials.push(value_text);
+            }
             if name == CONTENT_TYPE || name == AUTHORIZATION {
                 header_map.insert(name, value);
             } else {
@@ -295,16 +345,18 @@ impl HttpEngine {
 
         builder = match &request.auth {
             Auth::None | Auth::ApiKeyQuery { .. } => builder,
-            Auth::Basic { username, password } => builder.basic_auth(
-                interpolate_resolved(username, variables, unresolved_secrets)?,
-                Some(interpolate_resolved(
-                    password,
-                    variables,
-                    unresolved_secrets,
-                )?),
-            ),
+            Auth::Basic { username, password } => {
+                let username = interpolate_resolved(username, variables, unresolved_secrets)?;
+                let password = interpolate_resolved(password, variables, unresolved_secrets)?;
+                let builder = builder.basic_auth(&username, Some(&password));
+                credentials.push(password);
+                builder
+            }
             Auth::Bearer { token } => {
-                builder.bearer_auth(interpolate_resolved(token, variables, unresolved_secrets)?)
+                let token = interpolate_resolved(token, variables, unresolved_secrets)?;
+                let builder = builder.bearer_auth(&token);
+                credentials.push(token);
+                builder
             }
             Auth::ApiKeyHeader { .. } => {
                 if let Some((header_name, header_value)) = resolved_api_key_header {
@@ -342,28 +394,46 @@ impl HttpEngine {
                 }
             }
         };
+        let mut display_secrets = secret_values.to_vec();
+        display_secrets.extend(credentials.iter().map(String::as_str));
         let started = Instant::now();
         let mut response = builder
             .send()
             .await
-            .map_err(|err| sanitize_reqwest_error(err, secret_values))?;
+            .map_err(|err| sanitize_reqwest_error(err, &display_secrets))?;
         let headers_received = Instant::now();
         let ttfb_ms = headers_received
             .saturating_duration_since(started)
             .as_millis();
         let status = response.status();
-        let final_url = response.url().to_string();
+        let display_url = redact_url_secrets(response.url().as_str());
+        let final_url = if url_contains_secret(&display_url, &display_secrets) {
+            "<REDACTED>".to_owned()
+        } else {
+            display_url
+        };
         let headers = response
             .headers()
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("<binary>").to_string()))
+            .map(|(k, v)| {
+                let value = v.to_str().unwrap_or("<binary>");
+                let value = if redact_content
+                    && (is_sensitive_header_name(k.as_str())
+                        || contains_secret(value, &display_secrets))
+                {
+                    "<REDACTED>"
+                } else {
+                    value
+                };
+                (k.to_string(), value.to_owned())
+            })
             .collect();
         let mut received = Vec::with_capacity(8192);
         let mut truncated = false;
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|err| sanitize_reqwest_error(err, secret_values))?
+            .map_err(|err| sanitize_reqwest_error(err, &display_secrets))?
         {
             let remaining = MAX_RESPONSE_BYTES.saturating_sub(received.len());
             if chunk.len() > remaining {
@@ -390,6 +460,26 @@ impl HttpEngine {
                 hex_preview(e.as_bytes(), 80)
             )
         });
+        let body = if !redact_content || !contains_secret(&body, &display_secrets) {
+            body
+        } else if display_secrets
+            .iter()
+            .any(|secret| secret.contains('\n') && body.contains(secret))
+        {
+            "<REDACTED>".to_owned()
+        } else {
+            body.split_inclusive('\n')
+                .map(|line| {
+                    if !contains_secret(line, &display_secrets) {
+                        line
+                    } else if line.ends_with('\n') {
+                        "<REDACTED>\n"
+                    } else {
+                        "<REDACTED>"
+                    }
+                })
+                .collect()
+        };
         Ok(HttpResponse {
             status: status.as_u16(),
             reason: status.canonical_reason().unwrap_or("").to_owned(),
@@ -403,6 +493,12 @@ impl HttpEngine {
             truncated,
         })
     }
+}
+
+fn contains_secret(text: &str, secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret))
 }
 
 fn hex_preview(bytes: &[u8], limit: usize) -> String {
@@ -567,6 +663,76 @@ mod tests {
         assert_eq!(response.body, "ok");
         assert!(response.final_url.contains("check=yes"));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_credentials_reach_server_but_not_display_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let len = conn.read(&mut bytes).await.unwrap();
+            let request = std::str::from_utf8(&bytes[..len]).unwrap();
+            assert!(request.starts_with("GET /?custom=caf%C3%A9%2Bkey HTTP/"));
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut request = ApiRequest::new("GET", "Query key", format!("http://{addr}/"));
+        request.auth = Auth::ApiKeyQuery {
+            name: "custom".into(),
+            value: "café+key".into(),
+        };
+        let response = HttpEngine::new()
+            .unwrap()
+            .send_for_display(&request, &ResolvedVariables::default())
+            .await
+            .unwrap();
+        assert_eq!(response.final_url, "<REDACTED>");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn display_masks_echoed_header_and_cookie_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let len = conn.read(&mut bytes).await.unwrap();
+            let request = std::str::from_utf8(&bytes[..len]).unwrap();
+            assert!(request.contains("x-custom: test-header-key\r\n"));
+            assert!(request.contains("cookie: session=test-cookie-key\r\n"));
+            let body = "ok\ntest-header-key\ntest-cookie-key\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Echo: test-header-key\r\nSet-Cookie: session=new-cookie-key; Path=/\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            conn.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut request = ApiRequest::new("GET", "Credentials", format!("http://{addr}/"));
+        request.auth = Auth::ApiKeyHeader {
+            name: "X-Custom".into(),
+            value: "test-header-key".into(),
+        };
+        request
+            .headers
+            .push(KeyValue::new("Cookie", "session=test-cookie-key"));
+        let response = HttpEngine::new()
+            .unwrap()
+            .send_for_display(&request, &ResolvedVariables::default())
+            .await
+            .unwrap();
+        assert_eq!(response.body, "ok\n<REDACTED>\n<REDACTED>\n");
+        for name in ["x-echo", "set-cookie"] {
+            assert!(
+                response
+                    .headers
+                    .contains(&(name.into(), "<REDACTED>".into()))
+            );
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]
