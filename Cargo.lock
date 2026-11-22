@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "fastman-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "fastman-core",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "fastman-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "fastman-desktop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "fastman-core",

@@ -2,7 +2,7 @@
 
 **A native, local-first API client for building and sending HTTP requests, written in Rust with GPUI Kit.**
 
-> Status: **v0.3.0**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
+> Status: **v0.3.1**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
 
 ![Fastman desktop workbench](assets/screenshot.png)
 

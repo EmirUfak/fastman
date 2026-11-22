@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-22
+
 ### Changed
+- Deferred workspace, project, and UI settings loading off the UI startup path and initialized the Tokio runtime and HTTP client lazily on first request send.
+- Cached flattened explorer rows across frames, expanded only the active request's ancestor path on load/switch, and skipped redundant form/input/auth editor updates.
+- Skipped directory lock acquisition and recovery scans on clean project directories during `ProjectStore` loads and switched private file writes from `sync_all()` to `sync_data()`.
 - Release workflow publishes only the standalone Windows desktop executable (`fastman-desktop-<tag>-windows-x86_64.exe`) and its `.sha256` checksum instead of a zip archive with the CLI.
+
+### Fixed
+- Quit the desktop application cleanly when the last window closes, and ensure a trailing blank row when switching body type to `FormUrlEncoded`.
 
 ## [0.3.0] - 2026-11-22
 
@@ -76,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation & CI**:
   - Architecture, build, testing/benchmarking, security model, schema format, roadmap, and GitHub Actions CI for headless core and CLI.
 
-[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/EmirUfak/fastman/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/EmirUfak/fastman/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/EmirUfak/fastman/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/EmirUfak/fastman/compare/v0.1.0...v0.2.0
