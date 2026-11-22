@@ -1,4 +1,4 @@
-use fastman_core::{ApiRequest, ProjectStore};
+use fastman_core::{ApiRequest, Environment, KeyValue, ProjectStore, SecretRef};
 use std::{
     fs,
     io::{Read, Write},
@@ -148,6 +148,145 @@ fn send_escapes_control_sequences_unless_raw_is_specified() {
         .unwrap();
     assert!(raw.status.success());
     assert!(raw.stdout.windows(4).any(|w| w == b"\x1b[2J"));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn send_resolves_environments_and_env_secret_refs_without_plaintext_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("data");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&raw);
+            let request_line = text.lines().next().unwrap_or("");
+            let api_key_line = text
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("x-api-key:"))
+                .unwrap_or("");
+            let body = format!("{request_line} | {api_key_line}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    let store = ProjectStore::at(&home);
+    let mut project = store.create("EnvSecretCli").unwrap();
+    project.variables.insert("host".into(), addr.to_string());
+    project.variables.insert("stage".into(), "base".into());
+    project.secret_variables.insert(
+        "api_key".into(),
+        SecretRef::Env {
+            var: "FASTMAN_TEST_CLI_SECRET".into(),
+        },
+    );
+
+    let mut local_env = Environment::new("local");
+    local_env.variables.insert("stage".into(), "local".into());
+    let local_id = local_env.id.clone();
+
+    let mut staging_env = Environment::new("staging");
+    staging_env
+        .variables
+        .insert("stage".into(), "staging".into());
+
+    project.environments = vec![local_env, staging_env];
+    project.active_environment = Some(local_id.clone());
+
+    let mut req = ApiRequest::new("GET", "Check", "http://{{host}}/{{stage}}");
+    req.headers.push(KeyValue::new("X-Api-Key", "{{api_key}}"));
+    let req_id = req.id.clone();
+    project.collections[0].requests.push(req);
+    store.save(&project).unwrap();
+
+    // Ensure disk JSON stores only the env var reference, never the runtime secret.
+    let disk_json = fs::read_to_string(home.join(&project.id).join("project.json")).unwrap();
+    assert!(disk_json.contains("FASTMAN_TEST_CLI_SECRET"));
+    assert!(!disk_json.contains("super_secret_cli_token"));
+
+    // 1) Default active environment (`local`)
+    let active_out = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+        .env("FASTMAN_HOME", &home)
+        .env("FASTMAN_TEST_CLI_SECRET", "super_secret_cli_token")
+        .args(["send", &project.id, &req_id])
+        .output()
+        .unwrap();
+    assert!(
+        active_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&active_out.stderr)
+    );
+    let active_stdout = String::from_utf8_lossy(&active_out.stdout);
+    assert!(active_stdout.contains("GET /local HTTP/1.1"));
+    assert!(active_stdout.contains("super_secret_cli_token"));
+
+    // 2) Override with `--env staging` by name
+    let staging_out = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+        .env("FASTMAN_HOME", &home)
+        .env("FASTMAN_TEST_CLI_SECRET", "super_secret_cli_token")
+        .args(["send", "--env", "staging", &project.id, &req_id])
+        .output()
+        .unwrap();
+    assert!(
+        staging_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staging_out.stderr)
+    );
+    let staging_stdout = String::from_utf8_lossy(&staging_out.stdout);
+    assert!(staging_stdout.contains("GET /staging HTTP/1.1"));
+    assert!(staging_stdout.contains("super_secret_cli_token"));
+
+    // 3) Override with `--env=<id>` form
+    let id_flag = format!("--env={local_id}");
+    let by_id_out = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+        .env("FASTMAN_HOME", &home)
+        .env("FASTMAN_TEST_CLI_SECRET", "super_secret_cli_token")
+        .args(["send", &id_flag, &project.id, &req_id])
+        .output()
+        .unwrap();
+    assert!(by_id_out.status.success());
+    assert!(String::from_utf8_lossy(&by_id_out.stdout).contains("GET /local HTTP/1.1"));
+
+    // 4) Unknown `--env` fails non-zero before making a network call
+    let bad_env = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+        .env("FASTMAN_HOME", &home)
+        .env("FASTMAN_TEST_CLI_SECRET", "super_secret_cli_token")
+        .args(["send", "--env", "nonexistent", &project.id, &req_id])
+        .output()
+        .unwrap();
+    assert!(!bad_env.status.success());
+    assert!(String::from_utf8_lossy(&bad_env.stderr).contains("Environment not found"));
+
+    // 5) Missing secret env var fails non-zero with unresolved secret message
+    let missing_secret = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+        .env("FASTMAN_HOME", &home)
+        .env_remove("FASTMAN_TEST_CLI_SECRET")
+        .args(["send", &project.id, &req_id])
+        .output()
+        .unwrap();
+    assert!(!missing_secret.status.success());
+    let missing_err = String::from_utf8_lossy(&missing_secret.stderr);
+    assert!(missing_err.contains("api_key"));
 
     server.join().unwrap();
 }

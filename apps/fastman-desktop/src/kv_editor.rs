@@ -9,7 +9,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::BTreeMap;
 
 /// A single editable key-value row backed by retained GPUI input states.
 struct KvRow {
@@ -116,17 +115,6 @@ impl KvTable {
         self.add_row(window, cx, on_change);
     }
 
-    pub fn load_map<V: 'static>(
-        &mut self,
-        map: &BTreeMap<String, String>,
-        window: &mut Window,
-        cx: &mut Context<V>,
-        on_change: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
-    ) {
-        let pairs: Vec<KeyValue> = map.iter().map(|(k, v)| KeyValue::new(k, v)).collect();
-        self.load(&pairs, window, cx, on_change);
-    }
-
     pub fn add_row<V: 'static>(
         &mut self,
         window: &mut Window,
@@ -206,22 +194,6 @@ impl KvTable {
                 }
             })
             .collect()
-    }
-
-    pub fn to_map(&self, cx: &App) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::new();
-        for row in &self.rows {
-            if !row.enabled {
-                continue;
-            }
-            let key = row.key.read(cx).value().trim().to_owned();
-            if key.is_empty() {
-                continue;
-            }
-            let value = row.value.read(cx).value().to_string();
-            out.insert(key, value);
-        }
-        out
     }
 
     pub fn active_count(&self, cx: &App) -> usize {

@@ -1,5 +1,7 @@
+use crate::secrets::{ResolvedVariables, SecretStore};
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -281,6 +283,34 @@ impl Collection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum SecretRef {
+    Keychain { key: String },
+    Env { var: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Environment {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_variables: BTreeMap<String, SecretRef>,
+}
+
+impl Environment {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            name: name.into(),
+            variables: BTreeMap::new(),
+            secret_variables: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub schema_version: u32,
@@ -288,6 +318,12 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_variables: BTreeMap<String, SecretRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<Environment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_environment: Option<String>,
     #[serde(default)]
     pub collections: Vec<Collection>,
 }
@@ -299,8 +335,204 @@ impl Project {
             id: new_id(),
             name: name.into(),
             variables: BTreeMap::new(),
+            secret_variables: BTreeMap::new(),
+            environments: Vec::new(),
+            active_environment: None,
             collections: vec![Collection::new("Default Collection")],
         }
+    }
+
+    pub fn find_environment(&self, id: &str) -> Option<&Environment> {
+        self.environments.iter().find(|env| env.id == id)
+    }
+
+    pub fn find_environment_mut(&mut self, id: &str) -> Option<&mut Environment> {
+        self.environments.iter_mut().find(|env| env.id == id)
+    }
+
+    pub fn find_environment_by_name_or_id(&self, selector: &str) -> anyhow::Result<&Environment> {
+        let trimmed = selector.trim();
+        if let Some(env) = self.environments.iter().find(|env| env.id == trimmed) {
+            return Ok(env);
+        }
+        let exact: Vec<&Environment> = self
+            .environments
+            .iter()
+            .filter(|env| env.name == trimmed)
+            .collect();
+        if exact.len() == 1 {
+            return Ok(exact[0]);
+        }
+        if exact.len() > 1 {
+            bail!(
+                "Environment name '{}' is ambiguous in project '{}'; specify environment ID",
+                trimmed,
+                self.name
+            );
+        }
+        let fold: Vec<&Environment> = self
+            .environments
+            .iter()
+            .filter(|env| env.name.eq_ignore_ascii_case(trimmed))
+            .collect();
+        if fold.len() == 1 {
+            return Ok(fold[0]);
+        }
+        if fold.len() > 1 {
+            bail!(
+                "Environment name '{}' is ambiguous in project '{}'; specify environment ID",
+                trimmed,
+                self.name
+            );
+        }
+        bail!(
+            "Environment '{}' not found in project '{}'",
+            trimmed,
+            self.name
+        );
+    }
+
+    pub fn active_env(&self) -> Option<&Environment> {
+        self.active_environment
+            .as_deref()
+            .and_then(|id| self.find_environment(id))
+    }
+
+    pub fn set_active_environment(&mut self, env_id: Option<String>) -> bool {
+        if let Some(id) = env_id.as_deref()
+            && self.find_environment(id).is_none()
+        {
+            return false;
+        }
+        if self.active_environment == env_id {
+            return false;
+        }
+        self.active_environment = env_id;
+        true
+    }
+
+    pub fn add_environment(&mut self, name: impl Into<String>) -> String {
+        let raw = name.into();
+        let trimmed = raw.trim();
+        let clean = if trimmed.is_empty() {
+            "New Environment"
+        } else {
+            trimmed
+        };
+        let env = Environment::new(clean);
+        let id = env.id.clone();
+        self.environments.push(env);
+        id
+    }
+
+    pub fn rename_environment(&mut self, env_id: &str, name: String) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(env) = self.find_environment_mut(env_id) {
+            env.name = trimmed.to_owned();
+            return true;
+        }
+        false
+    }
+
+    pub fn delete_environment(&mut self, env_id: &str) -> Option<Environment> {
+        let idx = self.environments.iter().position(|env| env.id == env_id)?;
+        let removed = self.environments.remove(idx);
+        if self.active_environment.as_deref() == Some(env_id) {
+            self.active_environment = None;
+        }
+        Some(removed)
+    }
+
+    pub fn effective_variables(&self) -> BTreeMap<String, String> {
+        self.effective_variables_for(self.active_environment.as_deref())
+    }
+
+    pub fn effective_variables_for(&self, env_id: Option<&str>) -> BTreeMap<String, String> {
+        let mut merged = self.variables.clone();
+        if let Some(env) = env_id.and_then(|id| self.find_environment(id)) {
+            for key in env.secret_variables.keys() {
+                merged.remove(key);
+            }
+            for (k, v) in &env.variables {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
+    pub fn effective_secret_refs(&self, env_id: Option<&str>) -> BTreeMap<String, SecretRef> {
+        let mut merged = self.secret_variables.clone();
+        if let Some(env) = env_id.and_then(|id| self.find_environment(id)) {
+            for key in env.variables.keys() {
+                merged.remove(key);
+            }
+            for (k, v) in &env.secret_variables {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
+    pub fn effective_variable_count(&self) -> usize {
+        let env_id = self.active_environment.as_deref();
+        let mut names = BTreeSet::new();
+        names.extend(self.effective_variables_for(env_id).into_keys());
+        names.extend(self.effective_secret_refs(env_id).into_keys());
+        names.len()
+    }
+
+    pub fn resolve_variables(
+        &self,
+        env_id: Option<&str>,
+        secret_store: &dyn SecretStore,
+    ) -> ResolvedVariables {
+        self.resolve_variables_with_env_lookup(env_id, secret_store, |var| std::env::var(var).ok())
+    }
+
+    pub fn resolve_active_variables(&self, secret_store: &dyn SecretStore) -> ResolvedVariables {
+        self.resolve_variables(self.active_environment.as_deref(), secret_store)
+    }
+
+    pub(crate) fn resolve_variables_with_env_lookup(
+        &self,
+        env_id: Option<&str>,
+        secret_store: &dyn SecretStore,
+        mut env_lookup: impl FnMut(&str) -> Option<String>,
+    ) -> ResolvedVariables {
+        let mut resolved = ResolvedVariables::from_plain(self.effective_variables_for(env_id));
+        let refs = self.effective_secret_refs(env_id);
+        for (name, secret_ref) in refs {
+            resolved.secret_names.insert(name.clone());
+            match secret_ref {
+                SecretRef::Keychain { key } => match secret_store.get(&key) {
+                    Ok(Some(value)) => {
+                        resolved.values.insert(name, value);
+                    }
+                    Ok(None) => {
+                        resolved
+                            .unresolved_secrets
+                            .insert(name, "missing from OS credential store".to_owned());
+                    }
+                    Err(err) => {
+                        resolved.unresolved_secrets.insert(name, err.to_string());
+                    }
+                },
+                SecretRef::Env { var } => match env_lookup(&var) {
+                    Some(value) => {
+                        resolved.values.insert(name, value);
+                    }
+                    None => {
+                        resolved
+                            .unresolved_secrets
+                            .insert(name, format!("environment variable '{var}' is not set"));
+                    }
+                },
+            }
+        }
+        resolved
     }
 
     pub fn first_request_id(&self) -> Option<String> {
@@ -1039,5 +1271,106 @@ mod tests {
         let serialized = serde_json::to_string(&req).unwrap();
         let roundtrip: ApiRequest = serde_json::from_str(&serialized).unwrap();
         assert!(!roundtrip.verify_tls);
+    }
+
+    #[test]
+    fn environment_overlays_resolve_plain_and_secret_variables_with_precedence() {
+        use crate::secrets::MemorySecretStore;
+
+        let mut project = Project::new("Envs");
+        project
+            .variables
+            .insert("host".into(), "http://localhost:8080".into());
+        project
+            .variables
+            .insert("mode".into(), "plain_default".into());
+        project.secret_variables.insert(
+            "api_key".into(),
+            SecretRef::Keychain {
+                key: "fastman:base:api_key".into(),
+            },
+        );
+        project.secret_variables.insert(
+            "mode_secret".into(),
+            SecretRef::Env {
+                var: "BASE_MODE_SEC".into(),
+            },
+        );
+
+        let store = MemorySecretStore::new();
+        store.set("fastman:base:api_key", "base_secret").unwrap();
+        store.set("fastman:prod:api_key", "prod_secret").unwrap();
+
+        let local_id = project.add_environment("local");
+        let prod_id = project.add_environment("prod");
+        {
+            let prod = project.find_environment_mut(&prod_id).unwrap();
+            prod.variables
+                .insert("host".into(), "https://api.example.com".into());
+            // Environment plain overrides base secret_variable `mode_secret`.
+            prod.variables
+                .insert("mode_secret".into(), "override_plain".into());
+            // Environment secret_variable overrides base plain variable `mode` and base secret `api_key`.
+            prod.secret_variables.insert(
+                "mode".into(),
+                SecretRef::Env {
+                    var: "PROD_MODE_TOKEN".into(),
+                },
+            );
+            prod.secret_variables.insert(
+                "api_key".into(),
+                SecretRef::Keychain {
+                    key: "fastman:prod:api_key".into(),
+                },
+            );
+        }
+
+        assert!(project.set_active_environment(Some(prod_id.clone())));
+        assert_eq!(project.effective_variable_count(), 4);
+
+        let resolved = project.resolve_variables_with_env_lookup(
+            project.active_environment.as_deref(),
+            &store,
+            |var| match var {
+                "PROD_MODE_TOKEN" => Some("env_secret_token".into()),
+                _ => None,
+            },
+        );
+        assert_eq!(
+            resolved.values.get("host").map(String::as_str),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            resolved.values.get("mode_secret").map(String::as_str),
+            Some("override_plain")
+        );
+        assert!(!resolved.secret_names.contains("mode_secret"));
+        assert!(resolved.secret_names.contains("mode"));
+        assert!(resolved.secret_names.contains("api_key"));
+        assert_eq!(
+            resolved.values.get("mode").map(String::as_str),
+            Some("env_secret_token")
+        );
+        assert_eq!(
+            resolved.values.get("api_key").map(String::as_str),
+            Some("prod_secret")
+        );
+
+        assert_eq!(
+            project
+                .find_environment_by_name_or_id(&local_id)
+                .unwrap()
+                .name,
+            "local"
+        );
+        assert_eq!(
+            project.find_environment_by_name_or_id("PROD").unwrap().id,
+            prod_id
+        );
+        assert!(project.find_environment_by_name_or_id("missing").is_err());
+
+        // Deleting active environment clears active_environment cleanly.
+        assert!(project.delete_environment(&prod_id).is_some());
+        assert_eq!(project.active_environment, None);
     }
 }

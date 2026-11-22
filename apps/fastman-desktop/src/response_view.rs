@@ -546,7 +546,11 @@ impl WorkspaceView {
     }
 
     pub(super) fn persist_ui_settings(&self) {
-        self.ui_settings().save_to_root(self.workspace_store.root());
+        let settings = self.ui_settings();
+        let root = self.workspace_store.root().to_path_buf();
+        drop(self.persistence.submit_io(move || {
+            settings.save_to_root(&root);
+        }));
     }
 
     pub(super) fn set_response_position(

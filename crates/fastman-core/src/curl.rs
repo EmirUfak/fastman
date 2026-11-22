@@ -5,12 +5,12 @@ use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::security::{
     has_non_port_scheme, is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name,
     is_valid_header_name, is_valid_http_method, parse_urlencoded_pairs, percent_encode,
-    redact_url_secrets, split_url_query, try_extract_auth_from_header,
+    redact_json_secrets, redact_url_secrets, split_url_query, try_extract_auth_from_header,
     validate_template_or_http_url,
 };
 use crate::template::{self, MAX_INTERPOLATED_BYTES};
 use anyhow::{Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub const MAX_CURL_IMPORT_BYTES: usize = 1024 * 1024;
 
@@ -289,6 +289,7 @@ pub fn to_curl(request: &ApiRequest, variables: &BTreeMap<String, String>) -> Re
 
 struct CurlResolver<'a> {
     variables: &'a BTreeMap<String, String>,
+    secret_names: &'a HashSet<String>,
     redact_secrets: bool,
     had_variables: bool,
     had_secrets: bool,
@@ -299,6 +300,7 @@ impl<'a> CurlResolver<'a> {
         expand_template_for_curl(
             text,
             self.variables,
+            self.secret_names,
             self.redact_secrets,
             &mut self.had_variables,
             &mut self.had_secrets,
@@ -313,6 +315,18 @@ pub fn to_curl_export(
     variables: &BTreeMap<String, String>,
     redact_secrets: bool,
 ) -> Result<CurlExport> {
+    let empty_secrets = HashSet::new();
+    to_curl_export_with_secrets(request, variables, &empty_secrets, redact_secrets)
+}
+
+/// Format an [`ApiRequest`] as a POSIX shell `curl` command while recognizing both heuristic
+/// sensitive names and explicitly typed `secret_names` variables.
+pub fn to_curl_export_with_secrets(
+    request: &ApiRequest,
+    variables: &BTreeMap<String, String>,
+    secret_names: &HashSet<String>,
+    redact_secrets: bool,
+) -> Result<CurlExport> {
     let method = request.method.trim().to_uppercase();
     if !is_valid_http_method(&method) {
         bail!("Invalid HTTP method: {}", request.method);
@@ -320,6 +334,7 @@ pub fn to_curl_export(
 
     let mut resolver = CurlResolver {
         variables,
+        secret_names,
         redact_secrets,
         had_variables: false,
         had_secrets: false,
@@ -490,10 +505,14 @@ pub fn to_curl_export(
                 parts.push("-H 'Content-Type: application/json'".to_owned());
             }
             if !text.is_empty() {
-                parts.push(format!(
-                    "--data-raw {}",
-                    shell_quote(&resolver.resolve(text)?)
-                ));
+                let mut payload = resolver.resolve(text)?;
+                if let Some(redacted_json) = redact_json_secrets(&payload) {
+                    resolver.had_secrets = true;
+                    if redact_secrets {
+                        payload = redacted_json;
+                    }
+                }
+                parts.push(format!("--data-raw {}", shell_quote(&payload)));
             }
         }
         HttpBody::Text(text) => {
@@ -543,6 +562,7 @@ pub fn to_curl_export(
 fn expand_template_for_curl(
     input: &str,
     variables: &BTreeMap<String, String>,
+    secret_names: &HashSet<String>,
     redact_secrets: bool,
     had_variables: &mut bool,
     had_secrets: &mut bool,
@@ -555,7 +575,9 @@ fn expand_template_for_curl(
                 return Ok(raw_token);
             };
             *had_variables = true;
-            if is_sensitive_var_name(name) && !value.trim().is_empty() {
+            let is_secret = secret_names.contains(name)
+                || (is_sensitive_var_name(name) && !value.trim().is_empty());
+            if is_secret {
                 *had_secrets = true;
             }
             Ok(if redact_secrets { raw_token } else { value })
@@ -1264,5 +1286,28 @@ mod tests {
         );
         assert!(!exported.contains("%2520"));
         assert!(!exported.contains("%252B"));
+    }
+
+    #[test]
+    fn to_curl_export_with_secrets_redacts_json_literals_and_typed_secret_vars() {
+        let mut req = ApiRequest::new("POST", "SecretBody", "https://api.example.com/{{custom}}");
+        req.body = HttpBody::Json(
+            r#"{"password":"inline_pw_canary","nested":{"token":"{{custom}}"}}"#.into(),
+        );
+        let vars = BTreeMap::from([("custom".into(), "secret_custom_value".into())]);
+        let secret_names = HashSet::from(["custom".to_owned()]);
+
+        let redacted = to_curl_export_with_secrets(&req, &vars, &secret_names, true).unwrap();
+        assert!(redacted.had_secrets);
+        assert!(redacted.had_variables);
+        assert!(!redacted.command.contains("secret_custom_value"));
+        assert!(!redacted.command.contains("inline_pw_canary"));
+        assert!(redacted.command.contains("{{custom}}"));
+        assert!(redacted.command.contains("<REDACTED>"));
+
+        let full = to_curl_export_with_secrets(&req, &vars, &secret_names, false).unwrap();
+        assert!(full.had_secrets);
+        assert!(full.command.contains("secret_custom_value"));
+        assert!(full.command.contains("inline_pw_canary"));
     }
 }

@@ -14,15 +14,17 @@ use gpui_kit::*;
 pub(super) enum PaletteSection {
     Requests,
     Folders,
+    Environments,
     Projects,
     Workspaces,
     Actions,
 }
 
 impl PaletteSection {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Requests,
         Self::Folders,
+        Self::Environments,
         Self::Projects,
         Self::Workspaces,
         Self::Actions,
@@ -32,6 +34,7 @@ impl PaletteSection {
         match self {
             Self::Requests => "Requests",
             Self::Folders => "Folders",
+            Self::Environments => "Environments",
             Self::Projects => "Projects",
             Self::Workspaces => "Workspaces",
             Self::Actions => "Actions",
@@ -72,7 +75,7 @@ impl PaletteAction {
             Self::NewWorkspace => "New Workspace...",
             Self::FocusUrl => "Focus URL Bar",
             Self::FocusSearch => "Search Explorer",
-            Self::OpenVariables => "Edit Project Variables",
+            Self::OpenVariables => "Edit Project Variables & Environments",
             Self::OpenImport => "Import Collection or cURL",
             Self::ToggleTheme => "Toggle Theme (Light / Dark)",
             Self::CycleResponsePosition => "Cycle Response Layout",
@@ -92,7 +95,7 @@ impl PaletteAction {
             Self::NewWorkspace => "Create a new isolated local workspace",
             Self::FocusUrl => "Jump cursor to the request URL bar",
             Self::FocusSearch => "Filter requests and folders in the sidebar",
-            Self::OpenVariables => "Inspect or update {{template}} variables",
+            Self::OpenVariables => "Inspect or update plain, secret, and environment {{variables}}",
             Self::OpenImport => "Import Collection v2.1 JSON or paste cURL",
             Self::ToggleTheme => "Switch between Dark and Light appearance",
             Self::CycleResponsePosition => "Rotate response pane (Right / Bottom / Left)",
@@ -161,6 +164,9 @@ pub(super) enum PaletteTarget {
     Folder {
         id: String,
         ancestor_ids: Vec<String>,
+    },
+    Environment {
+        id: Option<String>,
     },
     Project {
         index: usize,
@@ -377,10 +383,47 @@ pub(super) fn build_catalog(view: &WorkspaceView) -> Vec<PaletteEntry> {
         );
     }
 
+    if !project.environments.is_empty() {
+        entries.push(PaletteEntry {
+            section: PaletteSection::Environments,
+            title: "Base only (No environment)".into(),
+            subtitle: Some("Use only project base variables".into()),
+            method: None,
+            icon: "icons/sliders-horizontal.svg",
+            active: project.active_environment.is_none(),
+            search_text: "base only no environment env".to_owned(),
+            target: PaletteTarget::Environment { id: None },
+        });
+        for env in &project.environments {
+            let active = project.active_environment.as_deref() == Some(env.id.as_str());
+            let var_count = env.variables.len() + env.secret_variables.len();
+            entries.push(PaletteEntry {
+                section: PaletteSection::Environments,
+                title: env.name.clone().into(),
+                subtitle: Some(format!("{var_count} override variable(s)").into()),
+                method: None,
+                icon: "icons/sliders-horizontal.svg",
+                active,
+                search_text: format!("{} environment env switch", env.name),
+                target: PaletteTarget::Environment {
+                    id: Some(env.id.clone()),
+                },
+            });
+        }
+    }
+
     for (index, proj) in view.projects.iter().enumerate() {
         let active = index == view.active_project;
         let req_count = proj.request_count();
-        let subtitle = format!("{req_count} requests · {} variables", proj.variables.len());
+        let eff_vars = proj.effective_variable_count();
+        let subtitle = if proj.environments.is_empty() {
+            format!("{req_count} requests · {eff_vars} variables")
+        } else {
+            format!(
+                "{req_count} requests · {eff_vars} variables · {} envs",
+                proj.environments.len()
+            )
+        };
         entries.push(PaletteEntry {
             section: PaletteSection::Projects,
             title: proj.name.clone().into(),
@@ -457,7 +500,7 @@ pub(super) fn filter_catalog<'a>(
     query: &str,
 ) -> Vec<(PaletteSection, Vec<&'a PaletteEntry>)> {
     let has_query = !query.trim().is_empty();
-    let mut section_buckets: [Vec<(i32, usize, &'a PaletteEntry)>; 5] = Default::default();
+    let mut section_buckets: [Vec<(i32, usize, &'a PaletteEntry)>; 6] = Default::default();
 
     for (orig_ix, entry) in catalog.iter().enumerate() {
         let Some(score) = fuzzy_score(query, &entry.search_text) else {
@@ -466,9 +509,10 @@ pub(super) fn filter_catalog<'a>(
         let bucket_ix = match entry.section {
             PaletteSection::Requests => 0,
             PaletteSection::Folders => 1,
-            PaletteSection::Projects => 2,
-            PaletteSection::Workspaces => 3,
-            PaletteSection::Actions => 4,
+            PaletteSection::Environments => 2,
+            PaletteSection::Projects => 3,
+            PaletteSection::Workspaces => 4,
+            PaletteSection::Actions => 5,
         };
         section_buckets[bucket_ix].push((score, orig_ix, entry));
     }
@@ -509,6 +553,9 @@ pub(super) fn execute_palette_target(
         }
         PaletteTarget::Folder { id, ancestor_ids } => {
             view.focus_folder_from_palette(id, ancestor_ids, cx);
+        }
+        PaletteTarget::Environment { id } => {
+            view.set_active_environment(id, Some(window), cx);
         }
         PaletteTarget::Project { index } => {
             view.switch_project(index, window, cx);
@@ -684,7 +731,9 @@ impl Render for CommandPaletteView {
             .bordered(false)
             .filterable(false)
             .max_h(px(360.))
-            .placeholder("Jump to request, folder, project, workspace, or run command...")
+            .placeholder(
+                "Jump to request, folder, environment, project, workspace, or run command...",
+            )
             .on_query({
                 let weak_self = cx.weak_entity();
                 move |next_query, _, cx| {

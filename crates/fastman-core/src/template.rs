@@ -1,6 +1,7 @@
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
+use crate::secrets::ResolvedVariables;
 use crate::security::is_sensitive_var_name;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub const MAX_INTERPOLATED_BYTES: usize = 4 * 1024 * 1024;
 const MASKED_SECRET: &str = "••••";
@@ -20,6 +21,7 @@ pub struct RequestTemplateInspection {
     pub url_has_templates: bool,
     pub url_resolved_count: usize,
     pub missing_variables: Vec<String>,
+    pub unresolved_secrets: Vec<(String, String)>,
     pub unclosed: bool,
 }
 
@@ -100,6 +102,18 @@ pub fn inspect(
     variables: &BTreeMap<String, String>,
     mask_sensitive: bool,
 ) -> TemplateInspection {
+    let empty_secrets = HashSet::new();
+    inspect_with_secrets(input, variables, &empty_secrets, mask_sensitive)
+}
+
+/// Inspect `{{variable}}` placeholders while always masking explicitly typed `secret_names`
+/// in addition to heuristic sensitive names when `mask_sensitive` is enabled.
+pub fn inspect_with_secrets(
+    input: &str,
+    variables: &BTreeMap<String, String>,
+    secret_names: &HashSet<String>,
+    mask_sensitive: bool,
+) -> TemplateInspection {
     let mut used_variables = Vec::new();
     let mut missing_variables = Vec::new();
     let mut unclosed = false;
@@ -113,7 +127,8 @@ pub fn inspect(
             };
             if let Some(value) = variables.get(name) {
                 push_unique(&mut used_variables, name);
-                if mask_sensitive && is_sensitive_var_name(name) && !value.is_empty() {
+                let is_secret = secret_names.contains(name) || is_sensitive_var_name(name);
+                if mask_sensitive && is_secret && !value.is_empty() {
                     Ok(MASKED_SECRET)
                 } else {
                     Ok(value.as_str())
@@ -180,8 +195,33 @@ pub fn inspect_request(
     request: &ApiRequest,
     variables: &BTreeMap<String, String>,
 ) -> RequestTemplateInspection {
+    let empty_secrets = HashSet::new();
+    let empty_unresolved = BTreeMap::new();
+    inspect_request_parts(request, variables, &empty_secrets, &empty_unresolved)
+}
+
+/// Inspect all interpolated fields of an [`ApiRequest`] against resolved plain and secret
+/// variables, masking secret values in the URL preview and reporting unresolved secrets.
+pub fn inspect_request_with_secrets(
+    request: &ApiRequest,
+    resolved: &ResolvedVariables,
+) -> RequestTemplateInspection {
+    inspect_request_parts(
+        request,
+        &resolved.values,
+        &resolved.secret_names,
+        &resolved.unresolved_secrets,
+    )
+}
+
+fn inspect_request_parts(
+    request: &ApiRequest,
+    variables: &BTreeMap<String, String>,
+    secret_names: &HashSet<String>,
+    unresolved_map: &BTreeMap<String, String>,
+) -> RequestTemplateInspection {
     let url_has_templates = request.url.contains("{{");
-    let url_result = inspect(&request.url, variables, true);
+    let url_result = inspect_with_secrets(&request.url, variables, secret_names, true);
     let url_resolved_count = url_result.used_variables.len();
     let mut missing_variables = url_result.missing_variables;
     let mut unclosed = url_result.unclosed;
@@ -224,6 +264,13 @@ pub fn inspect_request(
         }
     }
 
+    let mut unresolved_secrets = Vec::new();
+    for name in &missing_variables {
+        if let Some(reason) = unresolved_map.get(name) {
+            unresolved_secrets.push((name.clone(), reason.clone()));
+        }
+    }
+
     let url_preview = if url_result.truncated {
         "<preview exceeds 4 MiB limit>".to_owned()
     } else {
@@ -235,6 +282,7 @@ pub fn inspect_request(
         url_has_templates,
         url_resolved_count,
         missing_variables,
+        unresolved_secrets,
         unclosed,
     }
 }
@@ -299,6 +347,53 @@ mod tests {
             report.missing_variables,
             vec!["missing_param", "missing_hdr", "missing_body"]
         );
+        assert!(report.unresolved_secrets.is_empty());
         assert!(report.unclosed);
+    }
+
+    #[test]
+    fn inspect_request_with_secrets_masks_non_heuristic_names_and_reports_unresolved() {
+        let mut req = ApiRequest::new(
+            "GET",
+            "CustomSecret",
+            "{{base}}/v1/{{custom_val}}?extra={{missing_keychain}}",
+        );
+        req.headers.push(KeyValue::new("X-Other", "static"));
+
+        let resolved = ResolvedVariables {
+            values: BTreeMap::from([
+                ("base".into(), "https://api.example.com".into()),
+                ("custom_val".into(), "super_secret_custom".into()),
+            ]),
+            secret_names: HashSet::from([
+                "custom_val".to_owned(),
+                "missing_keychain".to_owned(),
+                "unused_missing".to_owned(),
+            ]),
+            unresolved_secrets: BTreeMap::from([
+                (
+                    "missing_keychain".into(),
+                    "missing from OS credential store".into(),
+                ),
+                (
+                    "unused_missing".into(),
+                    "missing from OS credential store".into(),
+                ),
+            ]),
+        };
+
+        let report = inspect_request_with_secrets(&req, &resolved);
+        assert_eq!(
+            report.url_preview,
+            "https://api.example.com/v1/••••?extra={{missing_keychain}}"
+        );
+        assert_eq!(report.missing_variables, vec!["missing_keychain"]);
+        assert_eq!(
+            report.unresolved_secrets,
+            vec![(
+                "missing_keychain".to_owned(),
+                "missing from OS credential store".to_owned(),
+            )]
+        );
     }
 }

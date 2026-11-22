@@ -1,5 +1,4 @@
 use crate::workspace::WorkspaceView;
-use anyhow::Result;
 use fastman_core::{
     ApiRequest, Auth, curl, import,
     security::{
@@ -550,7 +549,12 @@ impl WorkspaceView {
         let Some(req) = lookup_id.and_then(|id| self.current().find_request(id)) else {
             return;
         };
-        let export = match curl::to_curl_export(req, &self.current().variables, !force_full) {
+        let export = match curl::to_curl_export_with_secrets(
+            req,
+            &self.resolved_variables.values,
+            &self.resolved_variables.secret_names,
+            !force_full,
+        ) {
             Ok(export) => export,
             Err(error) => {
                 let msg = format!("Cannot export cURL: {error:#}");
@@ -626,27 +630,44 @@ impl WorkspaceView {
         &mut self,
         report: import::ImportReport,
         sanitized_summary: Option<SanitizeSummary>,
-        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<()> {
+    ) {
         let count = report.requests_imported;
         let warnings = report.warnings.len();
         let project_name = report.project.name.clone();
-        self.store.save(&report.project)?;
-        self.push_and_select_project(report.project, window, cx);
-        let note = match sanitized_summary {
-            Some(s) => format!(
-                "Imported {count} requests into '{project_name}' (moved {} auth field(s) to session-only, stripped {})",
-                s.moved_to_session_auth, s.stripped_fields
-            ),
-            None if warnings > 0 => {
-                format!("Imported {count} requests into '{project_name}' ({warnings} warning(s))")
+        let store = self.store.clone();
+        let expected_root = store.root().to_path_buf();
+        let project = report.project;
+        self.set_status(format!("Importing '{project_name}'…"), false, cx);
+        let rx = self.persistence.submit_save(store, project.clone(), 0);
+        self.spawn_io_callback(rx, cx, move |view, outcome, mut window, cx| match outcome {
+            Ok(_) => {
+                if view.store.root() == expected_root.as_path()
+                    && let Some(window) = window.as_deref_mut()
+                {
+                    view.push_and_select_project(project, window, cx);
+                }
+                let note = match sanitized_summary {
+                    Some(s) => format!(
+                        "Imported {count} requests into '{project_name}' (moved {} auth field(s) to session-only, stripped {})",
+                        s.moved_to_session_auth, s.stripped_fields
+                    ),
+                    None if warnings > 0 => {
+                        format!(
+                            "Imported {count} requests into '{project_name}' ({warnings} warning(s))"
+                        )
+                    }
+                    None => format!("Imported {count} requests into '{project_name}'"),
+                };
+                view.set_status(note.clone(), false, cx);
+                Self::push_window_notification(window, Notification::success(note), cx);
             }
-            None => format!("Imported {count} requests into '{project_name}'"),
-        };
-        self.set_status(note.clone(), false, cx);
-        window.push_notification(Notification::success(note), cx);
-        Ok(())
+            Err(err) => {
+                let msg = format!("Failed to save project: {err}");
+                view.set_status(msg.clone(), true, cx);
+                Self::push_window_notification(window, Notification::error(msg), cx);
+            }
+        });
     }
 
     fn finalize_curl_import(
@@ -658,9 +679,13 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let note = Self::format_curl_notice("Imported cURL", &req, summary, unsupported, false);
-        self.insert_and_open_request(req, window, cx);
-        self.set_status(note.clone(), false, cx);
-        window.push_notification(Notification::success(note), cx);
+        self.insert_and_open_request_with_notice(
+            req,
+            note.clone().into(),
+            Some(note.into()),
+            window,
+            cx,
+        );
     }
 
     pub(super) fn open_import_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -708,20 +733,10 @@ impl WorkspaceView {
                                 } else {
                                     None
                                 };
-                                let mut saved_ok = true;
                                 let _ = weak_ok.update(cx, |view, cx| {
-                                    if let Err(err) = view
-                                        .finalize_collection_import(report, sanitized, window, cx)
-                                    {
-                                        saved_ok = false;
-                                        modal_ok.update(cx, |m, cx| {
-                                            m.error =
-                                                Some(format!("Failed to save project: {err:#}"));
-                                            cx.notify();
-                                        });
-                                    }
+                                    view.finalize_collection_import(report, sanitized, cx);
                                 });
-                                return saved_ok;
+                                return true;
                             }
                             PendingSensitiveImport::Curl(report, findings) => {
                                 let mut req = report.request;
@@ -775,20 +790,10 @@ impl WorkspaceView {
                                 false
                             }
                             Ok(report) => {
-                                let mut saved_ok = true;
                                 let _ = weak_ok.update(cx, |view, cx| {
-                                    if let Err(err) =
-                                        view.finalize_collection_import(report, None, window, cx)
-                                    {
-                                        saved_ok = false;
-                                        modal_ok.update(cx, |m, cx| {
-                                            m.error =
-                                                Some(format!("Failed to save project: {err:#}"));
-                                            cx.notify();
-                                        });
-                                    }
+                                    view.finalize_collection_import(report, None, cx);
                                 });
-                                saved_ok
+                                true
                             }
                             Err(err) => {
                                 modal_ok.update(cx, |m, cx| {

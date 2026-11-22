@@ -1,9 +1,10 @@
-use crate::model::{ApiRequest, Folder, MAX_FOLDER_DEPTH, Project, SCHEMA_VERSION};
+use crate::model::{ApiRequest, Folder, MAX_FOLDER_DEPTH, Project, SCHEMA_VERSION, SecretRef};
+use crate::secrets::{validate_env_var_name, validate_secret_key};
 use crate::security::{is_valid_http_method, sha256};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -600,12 +601,60 @@ fn validate_project(project: &Project) -> Result<()> {
         bail!("Project name is empty");
     }
 
+    validate_variable_scope("project", &project.variables, &project.secret_variables)?;
+
+    let mut seen_env_ids = HashSet::new();
+    for env in &project.environments {
+        register_id(&mut seen_env_ids, &env.id, "environment")?;
+        if env.name.trim().is_empty() {
+            bail!("Environment name is empty");
+        }
+        validate_variable_scope(
+            &format!("environment '{}'", env.name),
+            &env.variables,
+            &env.secret_variables,
+        )?;
+    }
+    if let Some(active_id) = &project.active_environment
+        && !seen_env_ids.contains(active_id.as_str())
+    {
+        bail!("Active environment '{active_id}' does not exist in project");
+    }
+
     let mut seen_ids = HashSet::new();
     for coll in &project.collections {
         register_id(&mut seen_ids, &coll.id, "collection")?;
         validate_requests(&coll.requests, &mut seen_ids)?;
         for folder in &coll.folders {
             validate_folder(folder, 1, &mut seen_ids)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_variable_scope(
+    scope: &str,
+    plain: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, SecretRef>,
+) -> Result<()> {
+    for (name, secret_ref) in secrets {
+        if name.trim().is_empty() {
+            bail!("Empty secret variable name in {scope}");
+        }
+        if plain.contains_key(name) {
+            bail!("Variable '{name}' in {scope} cannot be both plain and secret");
+        }
+        match secret_ref {
+            SecretRef::Keychain { key } => {
+                validate_secret_key(key).map_err(|err| {
+                    anyhow::anyhow!("Invalid keychain reference for '{name}' in {scope}: {err}")
+                })?;
+            }
+            SecretRef::Env { var } => {
+                if !validate_env_var_name(var) {
+                    bail!("Invalid environment variable reference '{var}' for '{name}' in {scope}");
+                }
+            }
         }
     }
     Ok(())
@@ -976,5 +1025,139 @@ mod tests {
 
         drop(new_guard);
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn legacy_schema_v1_project_loads_and_resaves_with_empty_environments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let project_id = Uuid::new_v4().to_string();
+        let coll_id = Uuid::new_v4().to_string();
+        let legacy_dir = dir.path().join(&project_id);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "id": "{project_id}",
+                "name": "Legacy API",
+                "variables": {{"base": "https://legacy.example.com"}},
+                "collections": [{{"id": "{coll_id}", "name": "Default", "folders": [], "requests": []}}]
+            }}"#
+        );
+        fs::write(legacy_dir.join("project.json"), legacy_json).unwrap();
+
+        let loaded = store.load(&project_id).unwrap();
+        assert!(loaded.secret_variables.is_empty());
+        assert!(loaded.environments.is_empty());
+        assert_eq!(loaded.active_environment, None);
+        assert_eq!(
+            loaded.effective_variables().get("base").map(String::as_str),
+            Some("https://legacy.example.com")
+        );
+        store.save(&loaded).unwrap();
+    }
+
+    #[test]
+    fn secret_refs_persist_without_plaintext_secrets_and_validate_environments() {
+        use crate::secrets::{MemorySecretStore, SecretStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let secret_store = MemorySecretStore::new();
+        let mut project = store.create("Secrets & Envs").unwrap();
+
+        let base_key = format!("fastman:{}:base:api_key", project.id);
+        secret_store
+            .set(&base_key, "plaintext_secret_canary_value")
+            .unwrap();
+        project.secret_variables.insert(
+            "api_key".into(),
+            SecretRef::Keychain {
+                key: base_key.clone(),
+            },
+        );
+        let staging_id = project.add_environment("staging");
+        let staging_key = format!("fastman:{}:staging:db_pass", project.id);
+        secret_store
+            .set(&staging_key, "staging_secret_canary_value")
+            .unwrap();
+        project
+            .find_environment_mut(&staging_id)
+            .unwrap()
+            .secret_variables
+            .insert(
+                "db_pass".into(),
+                SecretRef::Keychain {
+                    key: staging_key.clone(),
+                },
+            );
+        project
+            .find_environment_mut(&staging_id)
+            .unwrap()
+            .secret_variables
+            .insert(
+                "env_secret".into(),
+                SecretRef::Env {
+                    var: "FASTMAN_ENV_CANARY".into(),
+                },
+            );
+        assert!(project.set_active_environment(Some(staging_id.clone())));
+        store.save(&project).unwrap();
+
+        let disk_path = dir.path().join(&project.id).join("project.json");
+        let raw = fs::read_to_string(&disk_path).unwrap();
+        assert!(!raw.contains("plaintext_secret_canary_value"));
+        assert!(!raw.contains("staging_secret_canary_value"));
+        assert!(raw.contains(&base_key));
+        assert!(raw.contains(&staging_key));
+
+        let reloaded = store.load(&project.id).unwrap();
+        assert_eq!(
+            reloaded.active_environment.as_deref(),
+            Some(staging_id.as_str())
+        );
+        let resolved = reloaded.resolve_active_variables(&secret_store);
+        assert_eq!(
+            resolved.values.get("api_key").map(String::as_str),
+            Some("plaintext_secret_canary_value")
+        );
+        assert_eq!(
+            resolved.values.get("db_pass").map(String::as_str),
+            Some("staging_secret_canary_value")
+        );
+
+        // Validation rejects dangling active_environment, duplicate env IDs, overlaps, and bad refs.
+        let mut bad_active = reloaded.clone();
+        bad_active.active_environment = Some(Uuid::new_v4().to_string());
+        assert!(store.save(&bad_active).is_err());
+
+        let mut dup_env = reloaded.clone();
+        let dup = dup_env.environments[0].clone();
+        dup_env.environments.push(dup);
+        assert!(store.save(&dup_env).is_err());
+
+        let mut overlap = reloaded.clone();
+        overlap
+            .variables
+            .insert("api_key".into(), "plain_overlap".into());
+        assert!(store.save(&overlap).is_err());
+
+        let mut bad_ref = reloaded.clone();
+        bad_ref.secret_variables.insert(
+            "bad".into(),
+            SecretRef::Keychain {
+                key: "bad/../key".into(),
+            },
+        );
+        assert!(store.save(&bad_ref).is_err());
+
+        let mut bad_env_var = reloaded.clone();
+        bad_env_var.secret_variables.insert(
+            "bad_env".into(),
+            SecretRef::Env {
+                var: "123_INVALID".into(),
+            },
+        );
+        assert!(store.save(&bad_env_var).is_err());
     }
 }

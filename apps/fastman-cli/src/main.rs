@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use fastman_core::{
-    HttpEngine, ProjectStore,
+    HttpEngine, OsSecretStore, ProjectStore,
     import::{collection_v21, read_collection_file},
     security::{sanitize_terminal_body, sanitize_terminal_line, summarize_sensitive_findings},
 };
@@ -8,7 +8,7 @@ use std::path::Path;
 
 fn usage() {
     eprintln!(
-        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] <project-id> <request-id>\n  fastman-cli --version\n  fastman-cli --help\n\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
+        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] [--env <name-or-id>] <project-id> <request-id>\n  fastman-cli --version\n  fastman-cli --help\n\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -93,10 +93,27 @@ async fn main() -> Result<()> {
         }
         "send" => {
             let mut raw_output = false;
+            let mut env_selector: Option<String> = None;
             let mut positional = Vec::new();
-            for arg in args {
+            while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--raw" => raw_output = true,
+                    "--env" => {
+                        let value = args
+                            .next()
+                            .context("Missing environment name or ID after --env")?;
+                        if value.trim().is_empty() {
+                            bail!("--env value cannot be empty");
+                        }
+                        env_selector = Some(value);
+                    }
+                    s if s.starts_with("--env=") => {
+                        let value = &s["--env=".len()..];
+                        if value.trim().is_empty() {
+                            bail!("--env value cannot be empty");
+                        }
+                        env_selector = Some(value.to_owned());
+                    }
                     s if s.starts_with('-') => bail!("Unknown option for send: {s}"),
                     _ => positional.push(arg),
                 }
@@ -111,10 +128,27 @@ async fn main() -> Result<()> {
             let request = project
                 .find_request(&request_id)
                 .context("Request not found")?;
+            let selected_env_id = if let Some(selector) = env_selector.as_deref() {
+                let env = project
+                    .find_environment_by_name_or_id(selector)
+                    .with_context(|| {
+                        format!(
+                            "Environment not found: {}",
+                            sanitize_terminal_line(selector)
+                        )
+                    })?;
+                Some(env.id.as_str())
+            } else {
+                project.active_environment.as_deref()
+            };
             if !request.verify_tls {
                 eprintln!("Warning: TLS certificate verification is disabled for this request.");
             }
-            let result = HttpEngine::new()?.send(request, &project.variables).await?;
+            let secret_store = OsSecretStore::default();
+            let resolved = project.resolve_variables(selected_env_id, &secret_store);
+            let result = HttpEngine::new()?
+                .send_with_secrets(request, &resolved)
+                .await?;
             let body_out = if raw_output {
                 result.body
             } else {

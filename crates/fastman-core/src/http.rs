@@ -1,4 +1,5 @@
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
+use crate::secrets::ResolvedVariables;
 use crate::security::{is_valid_http_method, redact_url_secrets};
 use reqwest::{
     Client, Method, Url,
@@ -18,6 +19,8 @@ const MAX_REDIRECT_HOPS: usize = 10;
 pub enum HttpError {
     #[error("Unknown variable: {{{{{0}}}}}")]
     MissingVariable(String),
+    #[error("Secret variable {{{{{name}}}}} could not be resolved: {reason}")]
+    UnresolvedSecret { name: String, reason: String },
     #[error("Unclosed variable expression")]
     UnclosedVariable,
     #[error("Interpolated value exceeds maximum size ({0} bytes)")]
@@ -86,9 +89,15 @@ fn evaluate_redirect(initial: &Url, next: &Url, hops_so_far: usize) -> RedirectD
     RedirectDecision::Follow
 }
 
-fn sanitize_reqwest_error(err: reqwest::Error) -> reqwest::Error {
+fn sanitize_reqwest_error(err: reqwest::Error, secret_values: &[&str]) -> reqwest::Error {
     let has_sensitive_url = err.url().is_some_and(|url| {
-        url.query().is_some() || !url.username().is_empty() || url.password().is_some()
+        let raw = url.as_str();
+        url.query().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || secret_values
+                .iter()
+                .any(|secret| !secret.is_empty() && raw.contains(secret))
     });
     if has_sensitive_url {
         err.without_url()
@@ -153,12 +162,41 @@ impl HttpEngine {
         request: &ApiRequest,
         variables: &BTreeMap<String, String>,
     ) -> Result<HttpResponse, HttpError> {
+        let empty_unresolved = BTreeMap::new();
+        self.send_inner(request, variables, &empty_unresolved, &[])
+            .await
+    }
+
+    /// Executes `request` with resolved plain and secret variables, reporting
+    /// unresolved secret failures clearly and stripping secret values from error URLs.
+    pub async fn send_with_secrets(
+        &self,
+        request: &ApiRequest,
+        resolved: &ResolvedVariables,
+    ) -> Result<HttpResponse, HttpError> {
+        let secret_values = resolved.secret_values();
+        self.send_inner(
+            request,
+            &resolved.values,
+            &resolved.unresolved_secrets,
+            &secret_values,
+        )
+        .await
+    }
+
+    async fn send_inner(
+        &self,
+        request: &ApiRequest,
+        variables: &BTreeMap<String, String>,
+        unresolved_secrets: &BTreeMap<String, String>,
+        secret_values: &[&str],
+    ) -> Result<HttpResponse, HttpError> {
         if !is_valid_http_method(&request.method) {
             return Err(HttpError::Method(request.method.clone()));
         }
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| HttpError::Method(request.method.clone()))?;
-        let url_text = interpolate(&request.url, variables)?;
+        let url_text = interpolate_resolved(&request.url, variables, unresolved_secrets)?;
         let mut url = Url::parse(&url_text).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
         if url.scheme() != "https" && url.scheme() != "http" {
             return Err(HttpError::InvalidUrl(
@@ -176,32 +214,39 @@ impl HttpEngine {
             for item in &request.params {
                 if item.enabled && !item.key.trim().is_empty() {
                     pairs.append_pair(
-                        &interpolate(&item.key, variables)?,
-                        &interpolate(&item.value, variables)?,
+                        &interpolate_resolved(&item.key, variables, unresolved_secrets)?,
+                        &interpolate_resolved(&item.value, variables, unresolved_secrets)?,
                     );
                 }
             }
             if let Auth::ApiKeyQuery { name, value } = &request.auth {
-                let key_text = interpolate(name, variables)?;
+                let key_text = interpolate_resolved(name, variables, unresolved_secrets)?;
                 let key = key_text.trim();
                 if key.is_empty() {
                     return Err(HttpError::EmptyApiKeyParam);
                 }
-                pairs.append_pair(key, &interpolate(value, variables)?);
+                pairs.append_pair(
+                    key,
+                    &interpolate_resolved(value, variables, unresolved_secrets)?,
+                );
             }
         }
 
         let resolved_api_key_header = match &request.auth {
             Auth::ApiKeyHeader { name, value } => {
-                let name_text = interpolate(name, variables)?;
+                let name_text = interpolate_resolved(name, variables, unresolved_secrets)?;
                 let trimmed = name_text.trim();
                 if trimmed.is_empty() {
                     return Err(HttpError::HeaderName("API key header name is empty".into()));
                 }
                 let header_name = HeaderName::from_bytes(trimmed.as_bytes())
                     .map_err(|_| HttpError::HeaderName(trimmed.to_owned()))?;
-                let header_value = HeaderValue::from_str(&interpolate(value, variables)?)
-                    .map_err(|_| HttpError::HeaderValue(trimmed.to_owned()))?;
+                let header_value = HeaderValue::from_str(&interpolate_resolved(
+                    value,
+                    variables,
+                    unresolved_secrets,
+                )?)
+                .map_err(|_| HttpError::HeaderValue(trimmed.to_owned()))?;
                 Some((header_name, header_value))
             }
             _ => None,
@@ -218,13 +263,13 @@ impl HttpEngine {
             if !header.enabled || header.key.trim().is_empty() {
                 continue;
             }
-            let name_text = interpolate(&header.key, variables)?;
+            let name_text = interpolate_resolved(&header.key, variables, unresolved_secrets)?;
             let name = HeaderName::from_bytes(name_text.trim().as_bytes())
                 .map_err(|_| HttpError::HeaderName(name_text.clone()))?;
             if auth_header_name.as_ref() == Some(&name) {
                 continue;
             }
-            let value_text = interpolate(&header.value, variables)?;
+            let value_text = interpolate_resolved(&header.value, variables, unresolved_secrets)?;
             let value = HeaderValue::from_str(&value_text)
                 .map_err(|_| HttpError::HeaderValue(name_text))?;
             if name == CONTENT_TYPE || name == AUTHORIZATION {
@@ -251,10 +296,16 @@ impl HttpEngine {
         builder = match &request.auth {
             Auth::None | Auth::ApiKeyQuery { .. } => builder,
             Auth::Basic { username, password } => builder.basic_auth(
-                interpolate(username, variables)?,
-                Some(interpolate(password, variables)?),
+                interpolate_resolved(username, variables, unresolved_secrets)?,
+                Some(interpolate_resolved(
+                    password,
+                    variables,
+                    unresolved_secrets,
+                )?),
             ),
-            Auth::Bearer { token } => builder.bearer_auth(interpolate(token, variables)?),
+            Auth::Bearer { token } => {
+                builder.bearer_auth(interpolate_resolved(token, variables, unresolved_secrets)?)
+            }
             Auth::ApiKeyHeader { .. } => {
                 if let Some((header_name, header_value)) = resolved_api_key_header {
                     builder.header(header_name, header_value)
@@ -266,15 +317,17 @@ impl HttpEngine {
 
         builder = match &request.body {
             HttpBody::None => builder,
-            HttpBody::Text(text) => builder.body(interpolate(text, variables)?),
+            HttpBody::Text(text) => {
+                builder.body(interpolate_resolved(text, variables, unresolved_secrets)?)
+            }
             HttpBody::Json(text) => {
                 if !has_content_type {
                     builder = builder.header(CONTENT_TYPE, "application/json");
                 }
-                builder.body(interpolate(text, variables)?)
+                builder.body(interpolate_resolved(text, variables, unresolved_secrets)?)
             }
             HttpBody::FormUrlEncoded(rows) => {
-                let data = expand_pairs(rows, variables)?;
+                let data = expand_pairs(rows, variables, unresolved_secrets)?;
                 if has_content_type {
                     let mut dummy = Url::parse("http://localhost").expect("static URL");
                     {
@@ -290,7 +343,10 @@ impl HttpEngine {
             }
         };
         let started = Instant::now();
-        let mut response = builder.send().await.map_err(sanitize_reqwest_error)?;
+        let mut response = builder
+            .send()
+            .await
+            .map_err(|err| sanitize_reqwest_error(err, secret_values))?;
         let headers_received = Instant::now();
         let ttfb_ms = headers_received
             .saturating_duration_since(started)
@@ -304,7 +360,11 @@ impl HttpEngine {
             .collect();
         let mut received = Vec::with_capacity(8192);
         let mut truncated = false;
-        while let Some(chunk) = response.chunk().await.map_err(sanitize_reqwest_error)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| sanitize_reqwest_error(err, secret_values))?
+        {
             let remaining = MAX_RESPONSE_BYTES.saturating_sub(received.len());
             if chunk.len() > remaining {
                 received.extend_from_slice(&chunk[..remaining]);
@@ -357,33 +417,48 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
 fn expand_pairs(
     items: &[KeyValue],
     variables: &BTreeMap<String, String>,
+    unresolved_secrets: &BTreeMap<String, String>,
 ) -> Result<Vec<(String, String)>, HttpError> {
     items
         .iter()
         .filter(|item| item.enabled && !item.key.trim().is_empty())
         .map(|item| {
             Ok((
-                interpolate(&item.key, variables)?,
-                interpolate(&item.value, variables)?,
+                interpolate_resolved(&item.key, variables, unresolved_secrets)?,
+                interpolate_resolved(&item.value, variables, unresolved_secrets)?,
             ))
         })
         .collect()
 }
 
-/// Single-pass substitution; values are not recursively interpreted and total
-/// output length is bounded to prevent memory exhaustion bombs.
-pub fn interpolate(input: &str, variables: &BTreeMap<String, String>) -> Result<String, HttpError> {
+fn interpolate_resolved(
+    input: &str,
+    variables: &BTreeMap<String, String>,
+    unresolved_secrets: &BTreeMap<String, String>,
+) -> Result<String, HttpError> {
     crate::template::expand(
         input,
         |name, _| {
             let name = name.ok_or(HttpError::UnclosedVariable)?;
-            variables
-                .get(name)
-                .map(String::as_str)
-                .ok_or_else(|| HttpError::MissingVariable(name.to_owned()))
+            if let Some(value) = variables.get(name) {
+                Ok(value.as_str())
+            } else if let Some(reason) = unresolved_secrets.get(name) {
+                Err(HttpError::UnresolvedSecret {
+                    name: name.to_owned(),
+                    reason: reason.clone(),
+                })
+            } else {
+                Err(HttpError::MissingVariable(name.to_owned()))
+            }
         },
         || HttpError::InterpolatedTooLarge(MAX_INTERPOLATED_BYTES),
     )
+}
+
+/// Single-pass substitution; values are not recursively interpreted and total
+/// output length is bounded to prevent memory exhaustion bombs.
+pub fn interpolate(input: &str, variables: &BTreeMap<String, String>) -> Result<String, HttpError> {
+    interpolate_resolved(input, variables, &BTreeMap::new())
 }
 
 #[cfg(test)]
@@ -790,6 +865,72 @@ mod tests {
             lines[1].starts_with("GET /bare?flag HTTP/"),
             "bare key-only query mutated: {}",
             lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_secret_errors_only_when_referenced_and_error_urls_strip_path_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let resolved = ResolvedVariables {
+            values: BTreeMap::from([("path_secret".into(), "super_path_canary_42".into())]),
+            secret_names: std::collections::HashSet::from([
+                "path_secret".to_owned(),
+                "missing_secret".to_owned(),
+            ]),
+            unresolved_secrets: BTreeMap::from([(
+                "missing_secret".into(),
+                "missing from OS credential store".into(),
+            )]),
+        };
+        let engine = HttpEngine::new().unwrap();
+
+        // Request not referencing missing_secret succeeds despite unrelated unresolved secret.
+        let ok_req = ApiRequest::new("GET", "Ok", format!("http://{addr}/ping"));
+        let ok_resp = engine.send_with_secrets(&ok_req, &resolved).await.unwrap();
+        assert_eq!(ok_resp.status, 200);
+        server.await.unwrap();
+
+        // Request referencing missing_secret fails explicitly with UnresolvedSecret.
+        let bad_req = ApiRequest::new(
+            "GET",
+            "MissingSec",
+            format!("http://{addr}/{{{{missing_secret}}}}"),
+        );
+        let err = engine
+            .send_with_secrets(&bad_req, &resolved)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::UnresolvedSecret { ref name, .. } if name == "missing_secret")
+        );
+
+        // Transport error must strip URL when a secret value was interpolated into path segments.
+        let path_secret_req = ApiRequest::new(
+            "GET",
+            "PathSec",
+            format!("http://{closed_addr}/v1/{{{{path_secret}}}}/token"),
+        );
+        let transport_err = engine
+            .send_with_secrets(&path_secret_req, &resolved)
+            .await
+            .unwrap_err();
+        assert!(
+            !transport_err.to_string().contains("super_path_canary_42"),
+            "{transport_err}"
         );
     }
 }

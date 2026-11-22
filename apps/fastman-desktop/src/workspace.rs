@@ -1,9 +1,11 @@
 use crate::command_palette::CommandPaletteView;
 use crate::import_view::CurlImportConfirmView;
-use crate::kv_editor::{KvTable, render_kv_table};
+use crate::kv_editor::KvTable;
+use crate::persistence::{OneshotReceiver, PersistenceWorker};
 use crate::request_editor::{AuthKind, BodyKind, KvTableKind};
 use crate::response_view::{ResponseCache, ResponseCacheEntry, ResponsePosition, UiSettings};
 use crate::theme::{count_pill, svg_icon};
+use crate::variables_sheet::{VariablesSheetView, VariablesSubmission};
 use crate::{
     CloseActiveTab, FocusSearch, FocusUrl, NewRequest, OpenCommandPalette, OpenImport,
     OpenVariables, SaveRequest, SendRequest, ToggleTheme,
@@ -11,6 +13,10 @@ use crate::{
 use anyhow::{Context as _, Result};
 use fastman_core::{
     ApiRequest, Auth, Folder, HttpBody, HttpEngine, Project, ProjectStore, Workspace, curl,
+    secrets::{MemorySecretStore, OsSecretStore, ResolvedVariables, SecretStore},
+    security::{
+        SensitiveFieldFinding, collect_sensitive_request_findings, sanitize_request_credentials,
+    },
 };
 use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Sizable as _, Theme, ThemeMode, WindowExt as _,
@@ -27,7 +33,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
@@ -70,82 +76,15 @@ pub(super) enum NameDialogKind {
     RenameCollection(String),
 }
 
-struct VariablesSheetView {
-    table: KvTable,
-}
-
-impl VariablesSheetView {
-    fn new(
-        variables: &BTreeMap<String, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut table = KvTable::new("variable_name", "value", true);
-        table.load_map(variables, window, cx, Self::on_table_change());
-        Self { table }
-    }
-
-    fn on_table_change() -> impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static {
-        |view, window, cx| {
-            view.table
-                .ensure_trailing_blank(window, cx, Self::on_table_change());
-            cx.notify();
-        }
-    }
-
-    fn variables_map(&self, cx: &App) -> BTreeMap<String, String> {
-        self.table.to_map(cx)
-    }
-}
-
-impl Render for VariablesSheetView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Use {{variable_name}} inside URLs, query params, headers, auth, or body payloads. Saved in plaintext project JSON—avoid storing real secrets here."),
-            )
-            .child(
-                div()
-                    .id("variables-sheet-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(render_kv_table(
-                        "project-vars",
-                        &self.table,
-                        cx,
-                        |view, idx, cx| {
-                            view.table.toggle_row(idx);
-                            cx.notify();
-                        },
-                        |view, idx, window, cx| {
-                            view.table
-                                .remove_row(idx, window, cx, Self::on_table_change());
-                            cx.notify();
-                        },
-                        |view, window, cx| {
-                            view.table.add_row(window, cx, Self::on_table_change());
-                            cx.notify();
-                        },
-                    )),
-            )
-    }
-}
-
 /// Retained window state: project model + editor entities + request lifecycle.
 pub struct WorkspaceView {
+    pub(super) window_handle: AnyWindowHandle,
     pub(super) focus_handle: FocusHandle,
     pub(super) workspace_store: ProjectStore,
     pub(super) workspaces: Vec<Workspace>,
     pub(super) active_workspace: usize,
     pub(super) store: ProjectStore,
+    pub(super) secret_store: Arc<dyn SecretStore>,
     pub(super) projects: Vec<Project>,
     pub(super) active_project: usize,
     pub(super) project_selector: Entity<SelectState<SearchableVec<ProjectChoice>>>,
@@ -156,7 +95,14 @@ pub struct WorkspaceView {
     pub(super) expanded: HashSet<String>,
     pub(super) target_folder: Option<String>,
     pub(super) dirty: bool,
+    pub(super) editor_dirty: bool,
     pub(super) suppress_dirty: bool,
+    pub(super) persistence: PersistenceWorker,
+    pub(super) project_edit_revs: HashMap<String, u64>,
+    pub(super) project_persisted_revs: HashMap<String, u64>,
+    pub(super) in_flight_saves: HashMap<String, u64>,
+    pub(super) save_errors: HashMap<String, String>,
+    pub(super) transition_generation: u64,
     pub(super) method: String,
     pub(super) body_kind: BodyKind,
     pub(super) auth_kind: AuthKind,
@@ -188,7 +134,9 @@ pub struct WorkspaceView {
     pub(super) last_url: String,
     pub(super) active_curl_confirm: Option<WeakEntity<CurlImportConfirmView>>,
     pub(super) active_command_palette: Option<WeakEntity<CommandPaletteView>>,
+    pub(super) resolved_variables: ResolvedVariables,
     pub(super) template_inspection: fastman_core::template::RequestTemplateInspection,
+    pub(super) draft_sensitive_findings: Vec<SensitiveFieldFinding>,
     pub(super) explorer_filter_lower: String,
     pub(super) response_tab: usize,
     pub(super) response_position: ResponsePosition,
@@ -208,11 +156,26 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Result<Self> {
-        Self::with_store(ProjectStore::system_default()?, window, cx)
+        Self::with_store_and_secrets(
+            ProjectStore::system_default()?,
+            Arc::new(OsSecretStore::default()),
+            window,
+            cx,
+        )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_store(
         store: ProjectStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
+        Self::with_store_and_secrets(store, Arc::new(MemorySecretStore::new()), window, cx)
+    }
+
+    fn with_store_and_secrets(
+        store: ProjectStore,
+        secret_store: Arc<dyn SecretStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
@@ -360,11 +323,13 @@ impl WorkspaceView {
         let ui_settings = UiSettings::load_from_root(store.root());
 
         let mut view = Self {
+            window_handle: window.window_handle(),
             focus_handle: cx.focus_handle(),
             workspace_store: store.clone(),
             workspaces,
             active_workspace: 0,
             store,
+            secret_store,
             projects,
             active_project: 0,
             project_selector,
@@ -375,7 +340,14 @@ impl WorkspaceView {
             expanded: HashSet::new(),
             target_folder: None,
             dirty: false,
+            editor_dirty: false,
             suppress_dirty: false,
+            persistence: PersistenceWorker::new(),
+            project_edit_revs: HashMap::new(),
+            project_persisted_revs: HashMap::new(),
+            in_flight_saves: HashMap::new(),
+            save_errors: HashMap::new(),
+            transition_generation: 0,
             method: "GET".into(),
             body_kind: BodyKind::None,
             auth_kind: AuthKind::None,
@@ -407,7 +379,9 @@ impl WorkspaceView {
             last_url: String::new(),
             active_curl_confirm: None,
             active_command_palette: None,
+            resolved_variables: ResolvedVariables::default(),
             template_inspection: fastman_core::template::RequestTemplateInspection::default(),
+            draft_sensitive_findings: Vec::new(),
             explorer_filter_lower: String::new(),
             response_tab: 0,
             response_position: ui_settings.response_position,
@@ -424,6 +398,7 @@ impl WorkspaceView {
             status_is_error: false,
             _subscriptions: subscriptions,
         };
+        view.refresh_resolved_variables();
         view.refresh_request_count();
         view.expand_all();
         view.load_editor(window, cx);
@@ -453,10 +428,40 @@ impl WorkspaceView {
             .and_then(|id| self.responses.get(id))
     }
 
+    fn current_edit_rev(&self, project_id: &str) -> u64 {
+        self.project_edit_revs.get(project_id).copied().unwrap_or(0)
+    }
+
+    fn current_persisted_rev(&self, project_id: &str) -> u64 {
+        self.project_persisted_revs
+            .get(project_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn bump_project_revision(&mut self, project_id: &str) -> u64 {
+        let entry = self
+            .project_edit_revs
+            .entry(project_id.to_owned())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    pub(super) fn sync_dirty(&mut self) {
+        let project_id = &self.current().id;
+        let rev_pending =
+            self.current_edit_rev(project_id) > self.current_persisted_rev(project_id);
+        let in_flight = self.in_flight_saves.contains_key(project_id);
+        self.dirty = self.editor_dirty || rev_pending || in_flight;
+    }
+
     pub(super) fn mark_dirty(&mut self, cx: &mut Context<Self>) {
-        if !self.dirty {
-            self.dirty = true;
-        }
+        self.editor_dirty = true;
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
         self.refresh_template_inspection(cx);
         cx.notify();
     }
@@ -466,20 +471,31 @@ impl WorkspaceView {
         self.mark_dirty(cx);
     }
 
+    pub(super) fn refresh_resolved_variables(&mut self) {
+        self.resolved_variables = self
+            .current()
+            .resolve_active_variables(self.secret_store.as_ref());
+    }
+
     pub(super) fn refresh_template_inspection(&mut self, cx: &mut Context<Self>) {
         if self.selected_id.is_none() {
             self.template_inspection = fastman_core::template::RequestTemplateInspection::default();
+            self.draft_sensitive_findings.clear();
             return;
         }
         let draft = self.snapshot_draft_request(cx);
         self.template_inspection =
-            fastman_core::template::inspect_request(&draft, &self.current().variables);
+            fastman_core::template::inspect_request_with_secrets(&draft, &self.resolved_variables);
+        let mut findings = Vec::new();
+        collect_sensitive_request_findings(&draft, &mut findings);
+        self.draft_sensitive_findings = findings;
         self.refresh_url_tokens(cx);
     }
 
     fn refresh_url_tokens(&mut self, cx: &mut Context<Self>) {
         let text = self.url.read(cx).value().to_string();
-        let spans = fastman_core::template::find_resolved_spans(&text, &self.current().variables);
+        let spans =
+            fastman_core::template::find_resolved_spans(&text, &self.resolved_variables.values);
         let mut content = InputContent::new(text.clone());
         for span in spans {
             let raw = &text[span.range.clone()];
@@ -834,7 +850,8 @@ impl WorkspaceView {
             Self::set_input(&self.timeout, "30000", window, cx);
         }
         self.suppress_dirty = false;
-        self.dirty = false;
+        self.editor_dirty = false;
+        self.sync_dirty();
         self.refresh_kv_counts(cx);
         self.refresh_body_json_valid(cx);
         self.refresh_template_inspection(cx);
@@ -843,30 +860,243 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    pub(super) fn push_window_notification(
+        window: Option<&mut Window>,
+        notification: Notification,
+        cx: &mut App,
+    ) {
+        if let Some(window) = window {
+            window.push_notification(notification, cx);
+        }
+    }
+
+    pub(super) fn spawn_io_callback<T, F>(
+        &self,
+        rx: OneshotReceiver<T>,
+        cx: &Context<Self>,
+        on_done: F,
+    ) where
+        T: 'static,
+        F: FnOnce(&mut Self, T, Option<&mut Window>, &mut Context<Self>) + 'static,
+    {
+        let window_handle = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            let value = rx.await;
+            let slot = std::rc::Rc::new(std::cell::RefCell::new(Some((value, on_done))));
+            let slot_win = std::rc::Rc::clone(&slot);
+            let this_win = this.clone();
+            let win_res = cx.update_window(window_handle, move |_, window, cx| {
+                if let Some((val, cb)) = slot_win.borrow_mut().take() {
+                    let _ = this_win.update(cx, |view, cx| cb(view, val, Some(window), cx));
+                }
+            });
+            if win_res.is_err()
+                && let Some((val, cb)) = slot.borrow_mut().take()
+            {
+                let _ = this.update(cx, |view, cx| cb(view, val, None, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn record_in_flight_save(&mut self, project_id: &str, revision: u64) {
+        self.in_flight_saves
+            .entry(project_id.to_owned())
+            .and_modify(|prev| *prev = (*prev).max(revision))
+            .or_insert(revision);
+        self.sync_dirty();
+    }
+
+    fn finish_save_tracking(
+        &mut self,
+        project_id: &str,
+        submitted_rev: u64,
+        outcome: &Result<u64, String>,
+    ) -> bool {
+        if let Some(&tracked) = self.in_flight_saves.get(project_id)
+            && tracked <= submitted_rev
+        {
+            self.in_flight_saves.remove(project_id);
+        }
+        let has_newer_in_flight = self
+            .in_flight_saves
+            .get(project_id)
+            .is_some_and(|&r| r > submitted_rev);
+
+        match outcome {
+            Ok(committed_rev) => {
+                let updated_rev = {
+                    let entry = self
+                        .project_persisted_revs
+                        .entry(project_id.to_owned())
+                        .or_insert(0);
+                    *entry = (*entry).max(*committed_rev);
+                    *entry
+                };
+                let current_edit_rev = self.current_edit_rev(project_id);
+                if updated_rev >= current_edit_rev {
+                    self.save_errors.remove(project_id);
+                }
+                self.sync_dirty();
+                self.current().id == project_id && updated_rev >= current_edit_rev && !self.dirty
+            }
+            Err(err_msg) => {
+                if !has_newer_in_flight {
+                    self.save_errors
+                        .insert(project_id.to_owned(), err_msg.clone());
+                }
+                self.sync_dirty();
+                false
+            }
+        }
+    }
+
     pub(super) fn apply_editor(&mut self, cx: &mut Context<Self>) -> Result<()> {
-        let Some(id) = self.selected_id.as_deref() else {
-            return Ok(());
-        };
-        let draft = self.read_request_draft(cx)?;
-        if let Some(request) = self.projects[self.active_project].find_request_mut(id) {
-            draft.apply_to(request);
+        if let Some(id) = self.selected_id.as_deref() {
+            let draft = self.read_request_draft(cx)?;
+            if let Some(request) = self.projects[self.active_project].find_request_mut(id) {
+                draft.apply_to(request);
+            }
         }
+        self.editor_dirty = false;
+        self.sync_dirty();
         Ok(())
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) -> Result<()> {
-        self.apply_editor(cx)?;
-        self.store.save(self.current())?;
-        self.dirty = false;
-        self.set_status("Saved locally", false, cx);
-        Ok(())
+    pub(super) fn enqueue_project_save(
+        &mut self,
+        success_status: Option<SharedString>,
+        success_toast: Option<SharedString>,
+        error_prefix: &'static str,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.editor_dirty
+            && let Err(err) = self.apply_editor(cx)
+        {
+            let msg = format!("{error_prefix}: {err:#}");
+            self.set_status(msg.clone(), true, cx);
+            Self::push_window_notification(window, Notification::error(msg), cx);
+            return false;
+        }
+        let project_id = self.current().id.clone();
+        let revision = self.current_edit_rev(&project_id);
+        let persisted = self.current_persisted_rev(&project_id);
+        let has_error = self.save_errors.contains_key(&project_id);
+        if revision <= persisted && !has_error && !self.in_flight_saves.contains_key(&project_id) {
+            self.sync_dirty();
+            if let Some(status) = success_status {
+                self.set_status(status, false, cx);
+            }
+            if let Some(toast) = success_toast {
+                Self::push_window_notification(window, Notification::success(toast), cx);
+            }
+            return true;
+        }
+        let snapshot = self.current().clone();
+        let store = self.store.clone();
+        self.record_in_flight_save(&project_id, revision);
+        self.set_status("Saving locally…", false, cx);
+        let rx = self.persistence.submit_save(store, snapshot, revision);
+        self.spawn_io_callback(rx, cx, move |view, outcome, window, cx| {
+            let clean_current = view.finish_save_tracking(&project_id, revision, &outcome);
+            let has_newer = view
+                .in_flight_saves
+                .get(&project_id)
+                .is_some_and(|&r| r > revision);
+            match outcome {
+                Ok(_) => {
+                    if clean_current {
+                        if let Some(status) = success_status {
+                            view.set_status(status, false, cx);
+                        }
+                        if let Some(toast) = success_toast {
+                            Self::push_window_notification(
+                                window,
+                                Notification::success(toast),
+                                cx,
+                            );
+                        }
+                    } else {
+                        cx.notify();
+                    }
+                }
+                Err(err_msg) => {
+                    if !has_newer {
+                        let msg = format!("{error_prefix}: {err_msg}");
+                        view.set_status(msg.clone(), true, cx);
+                        Self::push_window_notification(window, Notification::error(msg), cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+            }
+        });
+        true
     }
 
-    fn save_if_dirty(&mut self, cx: &mut Context<Self>) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
+    pub(super) fn flush_current_project_then<F>(
+        &mut self,
+        error_prefix: &'static str,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+        on_flushed: F,
+    ) where
+        F: FnOnce(&mut Self, Option<&mut Window>, &mut Context<Self>) + 'static,
+    {
+        let project_id = self.current().id.clone();
+        let needs_flush = self.dirty
+            || self.editor_dirty
+            || self.current_edit_rev(&project_id) > self.current_persisted_rev(&project_id)
+            || self.in_flight_saves.contains_key(&project_id)
+            || self.save_errors.contains_key(&project_id);
+        if !needs_flush {
+            on_flushed(self, window, cx);
+            return;
         }
-        self.save(cx)
+        if self.editor_dirty
+            && let Err(err) = self.apply_editor(cx)
+        {
+            let msg = format!("{error_prefix}: {err:#}");
+            self.set_status(msg.clone(), true, cx);
+            Self::push_window_notification(window, Notification::error(msg), cx);
+            return;
+        }
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        let expected_gen = self.transition_generation;
+        let revision = self.current_edit_rev(&project_id);
+        let snapshot = self.current().clone();
+        let store = self.store.clone();
+        self.record_in_flight_save(&project_id, revision);
+        self.set_status("Saving locally…", false, cx);
+        let rx = self.persistence.submit_save(store, snapshot, revision);
+        self.spawn_io_callback(rx, cx, move |view, outcome, window, cx| {
+            let clean_current = view.finish_save_tracking(&project_id, revision, &outcome);
+            match outcome {
+                Ok(_) => {
+                    if view.transition_generation == expected_gen && clean_current {
+                        on_flushed(view, window, cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+                Err(err_msg) => {
+                    let msg = format!("{error_prefix}: {err_msg}");
+                    view.set_status(msg.clone(), true, cx);
+                    Self::push_window_notification(window, Notification::error(msg), cx);
+                }
+            }
+        });
+    }
+
+    fn save(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) -> bool {
+        self.enqueue_project_save(
+            Some("Saved locally".into()),
+            None,
+            "Save failed",
+            window,
+            cx,
+        )
     }
 
     fn prune_responses_to_current_project(&mut self) {
@@ -876,27 +1106,25 @@ impl WorkspaceView {
     }
 
     pub(super) fn save_with_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.save(cx) {
-            Ok(()) => {
-                window.push_notification(Notification::success("Request saved locally"), cx);
-            }
-            Err(error) => {
-                let msg = format!("Save failed: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
-        }
+        self.enqueue_project_save(
+            Some("Saved locally".into()),
+            Some("Request saved locally".into()),
+            "Save failed",
+            Some(window),
+            cx,
+        );
     }
 
     pub(super) fn toggle_rename_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_request_name {
-            match self.save(cx) {
-                Ok(()) => self.editing_request_name = false,
-                Err(error) => {
-                    let msg = format!("Cannot rename: {error:#}");
-                    self.set_status(msg.clone(), true, cx);
-                    window.push_notification(Notification::error(msg), cx);
-                }
+            if self.enqueue_project_save(
+                Some("Saved locally".into()),
+                None,
+                "Cannot rename",
+                Some(window),
+                cx,
+            ) {
+                self.editing_request_name = false;
             }
         } else {
             self.editing_request_name = true;
@@ -912,36 +1140,48 @@ impl WorkspaceView {
         if self.selected_id.as_ref() == Some(&id) {
             return;
         }
-        if let Err(error) = self.save_if_dirty(cx) {
-            let msg = format!("Cannot switch tab: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
-            return;
-        }
-        self.cancel(cx);
-        self.selected_id = Some(id.clone());
-        if !self.open_tabs.contains(&id) {
-            self.open_tabs.push(id);
-        }
-        self.load_editor(window, cx);
+        self.flush_current_project_then(
+            "Cannot switch tab",
+            Some(window),
+            cx,
+            move |view, window, cx| {
+                view.cancel(cx);
+                view.selected_id = Some(id.clone());
+                if !view.open_tabs.contains(&id) {
+                    view.open_tabs.push(id);
+                }
+                if let Some(window) = window {
+                    view.load_editor(window, cx);
+                } else {
+                    cx.notify();
+                }
+            },
+        );
     }
 
     pub(super) fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let id_owned = id.to_owned();
         if self.selected_id.as_deref() == Some(id) {
-            if let Err(error) = self.save_if_dirty(cx) {
-                let msg = format!("Cannot close tab: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-                return;
-            }
-            self.cancel(cx);
+            self.flush_current_project_then(
+                "Cannot close tab",
+                Some(window),
+                cx,
+                move |view, window, cx| {
+                    view.cancel(cx);
+                    view.open_tabs.retain(|tab| tab != &id_owned);
+                    if view.selected_id.as_deref() == Some(id_owned.as_str()) {
+                        view.selected_id = view.open_tabs.last().cloned();
+                        if let Some(window) = window {
+                            view.load_editor(window, cx);
+                        }
+                    }
+                    cx.notify();
+                },
+            );
+        } else {
+            self.open_tabs.retain(|tab| tab != id);
+            cx.notify();
         }
-        self.open_tabs.retain(|tab| tab != id);
-        if self.selected_id.as_deref() == Some(id) {
-            self.selected_id = self.open_tabs.last().cloned();
-            self.load_editor(window, cx);
-        }
-        cx.notify();
     }
 
     pub(super) fn switch_project(
@@ -953,33 +1193,44 @@ impl WorkspaceView {
         if index == self.active_project || index >= self.projects.len() {
             return;
         }
-        if let Err(error) = self.save_if_dirty(cx) {
-            let msg = format!("Cannot switch project: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            window.push_notification(Notification::error(msg), cx);
-            return;
-        }
-        self.cancel(cx);
-        self.active_project = index;
-        if self
-            .project_selector
-            .read(cx)
-            .selected_index(cx)
-            .map(|p| p.row)
-            != Some(index)
-        {
-            self.project_selector.update(cx, |sel, cx| {
-                sel.set_selected_index(Some(IndexPath::default().row(index)), window, cx);
-            });
-        }
-        self.selected_id = self.current().first_request_id();
-        self.open_tabs = self.selected_id.clone().into_iter().collect();
-        self.target_folder = None;
-        self.prune_responses_to_current_project();
-        self.refresh_request_count();
-        self.expand_all();
-        self.load_editor(window, cx);
-        self.set_status(format!("Project: {}", self.current().name), false, cx);
+        self.flush_current_project_then(
+            "Cannot switch project",
+            Some(window),
+            cx,
+            move |view, window, cx| {
+                if index >= view.projects.len() || index == view.active_project {
+                    return;
+                }
+                view.cancel(cx);
+                view.active_project = index;
+                if let Some(window) = window {
+                    if view
+                        .project_selector
+                        .read(cx)
+                        .selected_index(cx)
+                        .map(|p| p.row)
+                        != Some(index)
+                    {
+                        view.project_selector.update(cx, |sel, cx| {
+                            sel.set_selected_index(
+                                Some(IndexPath::default().row(index)),
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                    view.selected_id = view.current().first_request_id();
+                    view.open_tabs = view.selected_id.clone().into_iter().collect();
+                    view.target_folder = None;
+                    view.prune_responses_to_current_project();
+                    view.refresh_resolved_variables();
+                    view.refresh_request_count();
+                    view.expand_all();
+                    view.load_editor(window, cx);
+                    view.set_status(format!("Project: {}", view.current().name), false, cx);
+                }
+            },
+        );
     }
 
     pub(super) fn focus_folder_from_palette(
@@ -1005,54 +1256,81 @@ impl WorkspaceView {
         if index == self.active_workspace || index >= self.workspaces.len() {
             return;
         }
-        let result = (|| -> Result<(ProjectStore, Vec<Project>, Vec<String>)> {
-            self.save_if_dirty(cx)?;
-            let store = self
-                .workspace_store
-                .for_workspace(&self.workspaces[index].id)?;
-            let (mut projects, warnings) = store.list_resilient()?;
-            if projects.is_empty() {
-                projects.push(store.create("Project 1")?);
-            }
-            Ok((store, projects, warnings))
-        })();
-        match result {
-            Ok((store, projects, warnings)) => {
-                self.cancel(cx);
-                self.responses.clear();
-                self.store = store;
-                self.projects = projects;
-                self.active_workspace = index;
-                self.active_project = 0;
-                self.target_folder = None;
-                self.selected_id = self.current().first_request_id();
-                self.open_tabs = self.selected_id.clone().into_iter().collect();
-                let choices = project_choices(&self.projects);
-                self.project_selector.update(cx, |selector, cx| {
-                    selector.set_items(choices, window, cx);
-                    selector.set_selected_index(Some(IndexPath::default()), window, cx);
-                });
-                self.refresh_request_count();
-                self.expand_all();
-                self.load_editor(window, cx);
-                if warnings.is_empty() {
-                    self.set_status(
-                        format!("Workspace: {}", self.workspaces[index].name),
-                        false,
-                        cx,
-                    );
-                } else {
-                    let msg = warnings.join("; ");
-                    self.set_status(format!("Loaded with warnings: {msg}"), true, cx);
-                    window.push_notification(Notification::warning(msg), cx);
+        self.flush_current_project_then(
+            "Cannot switch workspace",
+            Some(window),
+            cx,
+            move |view, _window, cx| {
+                if index >= view.workspaces.len() || index == view.active_workspace {
+                    return;
                 }
-            }
-            Err(error) => {
-                let msg = format!("Cannot switch workspace: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
-        }
+                view.transition_generation = view.transition_generation.wrapping_add(1);
+                let expected_gen = view.transition_generation;
+                let ws_store = view.workspace_store.clone();
+                let ws_id = view.workspaces[index].id.clone();
+                let ws_name = view.workspaces[index].name.clone();
+                view.set_status(format!("Loading workspace '{ws_name}'…"), false, cx);
+                let rx = view.persistence.submit_io(move || {
+                    let store = ws_store.for_workspace(&ws_id)?;
+                    let (mut projects, warnings) = store.list_resilient()?;
+                    if projects.is_empty() {
+                        projects.push(store.create("Project 1")?);
+                    }
+                    Ok::<_, anyhow::Error>((store, projects, warnings))
+                });
+                view.spawn_io_callback(rx, cx, move |view, result, mut window, cx| {
+                    if view.transition_generation != expected_gen {
+                        return;
+                    }
+                    match result {
+                        Ok((store, projects, warnings)) => {
+                            view.cancel(cx);
+                            view.responses.clear();
+                            view.store = store;
+                            view.projects = projects;
+                            view.active_workspace = index;
+                            view.active_project = 0;
+                            view.target_folder = None;
+                            view.selected_id = view.current().first_request_id();
+                            view.open_tabs = view.selected_id.clone().into_iter().collect();
+                            if let Some(window) = window.as_deref_mut() {
+                                let choices = project_choices(&view.projects);
+                                view.project_selector.update(cx, |selector, cx| {
+                                    selector.set_items(choices, window, cx);
+                                    selector.set_selected_index(
+                                        Some(IndexPath::default()),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                view.refresh_resolved_variables();
+                                view.refresh_request_count();
+                                view.expand_all();
+                                view.load_editor(window, cx);
+                            } else {
+                                view.refresh_resolved_variables();
+                            }
+                            if warnings.is_empty() {
+                                view.set_status(format!("Workspace: {ws_name}"), false, cx);
+                            } else {
+                                let msg = warnings.join("; ");
+                                view.set_status(format!("Loaded with warnings: {msg}"), true, cx);
+                                Self::push_window_notification(
+                                    window,
+                                    Notification::warning(msg),
+                                    cx,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let msg = format!("Cannot switch workspace: {error:#}");
+                            view.set_status(msg.clone(), true, cx);
+                            Self::push_window_notification(window, Notification::error(msg), cx);
+                        }
+                    }
+                });
+            },
+        );
     }
 
     pub(super) fn add_folder(&mut self, cx: &mut Context<Self>) {
@@ -1071,9 +1349,10 @@ impl WorkspaceView {
         self.expanded.insert(container_id);
         self.expanded.insert(id.clone());
         self.target_folder = Some(id);
-        if let Err(err) = self.save(cx) {
-            self.set_status(format!("Save failed: {err:#}"), true, cx);
-        }
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.save(None, cx);
     }
 
     pub(super) fn add_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1087,7 +1366,20 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.save_if_dirty(cx) {
+        self.insert_and_open_request_with_notice(request, "Saved locally".into(), None, window, cx);
+    }
+
+    pub(super) fn insert_and_open_request_with_notice(
+        &mut self,
+        request: ApiRequest,
+        success_status: SharedString,
+        success_toast: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_dirty
+            && let Err(error) = self.apply_editor(cx)
+        {
             let msg = format!("Cannot save active request: {error:#}");
             self.set_status(msg.clone(), true, cx);
             window.push_notification(Notification::error(msg), cx);
@@ -1098,14 +1390,21 @@ impl WorkspaceView {
             .insert_request(self.target_folder.as_deref(), request);
         self.expanded.insert(container_id);
         self.refresh_request_count();
-        match self.store.save(self.current()) {
-            Ok(()) => self.open_request(id, window, cx),
-            Err(error) => {
-                let msg = format!("Create request failed: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.cancel(cx);
+        self.selected_id = Some(id.clone());
+        if !self.open_tabs.contains(&id) {
+            self.open_tabs.push(id);
         }
+        self.load_editor(window, cx);
+        self.enqueue_project_save(
+            Some(success_status),
+            success_toast,
+            "Create request failed",
+            Some(window),
+            cx,
+        );
     }
 
     pub(super) fn duplicate_request(
@@ -1114,20 +1413,31 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.save_if_dirty(cx) {
-            window.push_notification(Notification::error(format!("Save failed: {error:#}")), cx);
+        if self.editor_dirty
+            && let Err(error) = self.apply_editor(cx)
+        {
+            let msg = format!("Save failed: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
             return;
         }
         if let Some(new_id) = self.projects[self.active_project].duplicate_request(id) {
             self.refresh_request_count();
-            if let Err(error) = self.store.save(self.current()) {
-                let msg = format!("Save failed: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-                return;
+            let project_id = self.current().id.clone();
+            self.bump_project_revision(&project_id);
+            self.cancel(cx);
+            self.selected_id = Some(new_id.clone());
+            if !self.open_tabs.contains(&new_id) {
+                self.open_tabs.push(new_id);
             }
-            self.open_request(new_id, window, cx);
-            window.push_notification(Notification::success("Request duplicated"), cx);
+            self.load_editor(window, cx);
+            self.enqueue_project_save(
+                Some("Request duplicated".into()),
+                Some("Request duplicated".into()),
+                "Save failed",
+                Some(window),
+                cx,
+            );
         }
     }
 
@@ -1147,19 +1457,10 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.store.save(self.current()) {
-            Ok(()) => {
-                self.dirty = false;
-                self.set_status(status, false, cx);
-            }
-            Err(error) => {
-                self.dirty = true;
-                let msg = format!("Save failed: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
-        }
-        cx.notify();
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.enqueue_project_save(Some(status.into()), None, "Save failed", Some(window), cx);
     }
 
     pub(super) fn move_request_offset(
@@ -1405,96 +1706,140 @@ impl WorkspaceView {
                         window.push_notification(Notification::warning("Name cannot be empty"), cx);
                         return false;
                     }
-                    let mut ok = true;
                     let _ = weak_ok.update(cx, |view, cx| match &kind_exec {
                         NameDialogKind::NewWorkspace => {
-                            match view.workspace_store.create_workspace(&value) {
-                                Ok(ws) => {
-                                    view.workspaces.push(ws);
-                                    let idx = view.workspaces.len() - 1;
-                                    view.switch_workspace(idx, window, cx);
-                                    window.push_notification(
-                                        Notification::success(format!(
-                                            "Workspace '{value}' created"
-                                        )),
-                                        cx,
-                                    );
+                            let ws_store = view.workspace_store.clone();
+                            let name_for_io = value.clone();
+                            let name_for_ui = value.clone();
+                            view.set_status(
+                                format!("Creating workspace '{name_for_ui}'…"),
+                                false,
+                                cx,
+                            );
+                            let rx = view.persistence.submit_io(move || {
+                                ws_store
+                                    .create_workspace(&name_for_io)
+                                    .map_err(|err| format!("{err:#}"))
+                            });
+                            view.spawn_io_callback(rx, cx, move |view, outcome, mut window, cx| {
+                                match outcome {
+                                    Ok(ws) => {
+                                        view.workspaces.push(ws);
+                                        let idx = view.workspaces.len() - 1;
+                                        if let Some(window) = window.as_deref_mut() {
+                                            view.switch_workspace(idx, window, cx);
+                                        }
+                                        Self::push_window_notification(
+                                            window,
+                                            Notification::success(format!(
+                                                "Workspace '{name_for_ui}' created"
+                                            )),
+                                            cx,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let msg = format!("Workspace failed: {err}");
+                                        view.set_status(msg.clone(), true, cx);
+                                        Self::push_window_notification(
+                                            window,
+                                            Notification::error(msg),
+                                            cx,
+                                        );
+                                    }
                                 }
-                                Err(err) => {
-                                    ok = false;
-                                    window.push_notification(
-                                        Notification::error(format!("Workspace failed: {err:#}")),
-                                        cx,
-                                    );
-                                }
-                            }
+                            });
                         }
                         NameDialogKind::NewProject => {
-                            if let Err(err) = view.save_if_dirty(cx) {
-                                ok = false;
-                                window.push_notification(
-                                    Notification::error(format!("Save failed: {err:#}")),
-                                    cx,
-                                );
-                                return;
-                            }
-                            match view.store.create(&value) {
-                                Ok(project) => {
-                                    view.push_and_select_project(project, window, cx);
-                                    window.push_notification(
-                                        Notification::success(format!("Project '{value}' created")),
+                            let name = value.clone();
+                            view.flush_current_project_then(
+                                "Save failed",
+                                Some(window),
+                                cx,
+                                move |view, _, cx| {
+                                    view.transition_generation =
+                                        view.transition_generation.wrapping_add(1);
+                                    let expected_gen = view.transition_generation;
+                                    let store = view.store.clone();
+                                    let expected_root = store.root().to_path_buf();
+                                    let name_for_io = name.clone();
+                                    view.set_status(
+                                        format!("Creating project '{name}'…"),
+                                        false,
                                         cx,
                                     );
-                                }
-                                Err(err) => {
-                                    ok = false;
-                                    window.push_notification(
-                                        Notification::error(format!("Project failed: {err:#}")),
+                                    let rx = view.persistence.submit_io(move || {
+                                        store.create(&name_for_io).map_err(|err| format!("{err:#}"))
+                                    });
+                                    view.spawn_io_callback(
+                                        rx,
                                         cx,
+                                        move |view, outcome, mut window, cx| match outcome {
+                                            Ok(project) => {
+                                                if view.transition_generation == expected_gen
+                                                    && view.store.root() == expected_root.as_path()
+                                                {
+                                                    if let Some(window) = window.as_deref_mut() {
+                                                        view.push_and_select_project(
+                                                            project, window, cx,
+                                                        );
+                                                    }
+                                                    Self::push_window_notification(
+                                                        window,
+                                                        Notification::success(format!(
+                                                            "Project '{name}' created"
+                                                        )),
+                                                        cx,
+                                                    );
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let msg = format!("Project failed: {err}");
+                                                view.set_status(msg.clone(), true, cx);
+                                                Self::push_window_notification(
+                                                    window,
+                                                    Notification::error(msg),
+                                                    cx,
+                                                );
+                                            }
+                                        },
                                     );
-                                }
-                            }
+                                },
+                            );
                         }
                         NameDialogKind::RenameFolder(folder_id) => {
                             if view.projects[view.active_project]
                                 .rename_folder(folder_id, value.clone())
                             {
-                                match view.save(cx) {
-                                    Ok(()) => window.push_notification(
-                                        Notification::success("Folder renamed"),
-                                        cx,
-                                    ),
-                                    Err(err) => {
-                                        ok = false;
-                                        window.push_notification(
-                                            Notification::error(format!("Rename failed: {err:#}")),
-                                            cx,
-                                        );
-                                    }
-                                }
+                                let project_id = view.current().id.clone();
+                                view.bump_project_revision(&project_id);
+                                view.sync_dirty();
+                                view.enqueue_project_save(
+                                    Some("Folder renamed".into()),
+                                    Some("Folder renamed".into()),
+                                    "Rename failed",
+                                    Some(window),
+                                    cx,
+                                );
                             }
                         }
                         NameDialogKind::RenameCollection(collection_id) => {
                             if view.projects[view.active_project]
                                 .rename_collection(collection_id, value.clone())
                             {
-                                match view.save(cx) {
-                                    Ok(()) => window.push_notification(
-                                        Notification::success("Collection renamed"),
-                                        cx,
-                                    ),
-                                    Err(err) => {
-                                        ok = false;
-                                        window.push_notification(
-                                            Notification::error(format!("Rename failed: {err:#}")),
-                                            cx,
-                                        );
-                                    }
-                                }
+                                let project_id = view.current().id.clone();
+                                view.bump_project_revision(&project_id);
+                                view.sync_dirty();
+                                view.enqueue_project_save(
+                                    Some("Collection renamed".into()),
+                                    Some("Collection renamed".into()),
+                                    "Rename failed",
+                                    Some(window),
+                                    cx,
+                                );
                             }
                         }
                     });
-                    ok
+                    true
                 })
                 .child(Input::new(&input).small())
         });
@@ -1539,11 +1884,21 @@ impl WorkspaceView {
     fn delete_request_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_id.as_deref() == Some(id) {
             self.cancel(cx);
+        } else if self.editor_dirty
+            && let Err(error) = self.apply_editor(cx)
+        {
+            let msg = format!("Cannot save active request: {error:#}");
+            self.set_status(msg.clone(), true, cx);
+            window.push_notification(Notification::error(msg), cx);
+            return;
         }
         if self.projects[self.active_project].delete_request(id) {
             self.responses.remove(id);
             self.open_tabs.retain(|tab| tab != id);
             self.refresh_request_count();
+            let project_id = self.current().id.clone();
+            self.bump_project_revision(&project_id);
+            self.sync_dirty();
             if self.selected_id.as_deref() == Some(id) {
                 self.selected_id = self
                     .open_tabs
@@ -1557,17 +1912,13 @@ impl WorkspaceView {
                 }
                 self.load_editor(window, cx);
             }
-            match self.store.save(self.current()) {
-                Ok(()) => {
-                    self.set_status("Request deleted", false, cx);
-                    window.push_notification(Notification::success("Request deleted"), cx);
-                }
-                Err(error) => {
-                    let msg = format!("Save failed: {error:#}");
-                    self.set_status(msg.clone(), true, cx);
-                    window.push_notification(Notification::error(msg), cx);
-                }
-            }
+            self.enqueue_project_save(
+                Some("Request deleted".into()),
+                Some("Request deleted".into()),
+                "Save failed",
+                Some(window),
+                cx,
+            );
         }
     }
 
@@ -1643,18 +1994,19 @@ impl WorkspaceView {
                 self.open_tabs.push(next_id.clone());
             }
             self.load_editor(window, cx);
+        } else if self.editor_dirty {
+            let _ = self.apply_editor(cx);
         }
-        match self.store.save(self.current()) {
-            Ok(()) => {
-                self.set_status(status, false, cx);
-                window.push_notification(Notification::success(status), cx);
-            }
-            Err(error) => {
-                let msg = format!("Save failed: {error:#}");
-                self.set_status(msg.clone(), true, cx);
-                window.push_notification(Notification::error(msg), cx);
-            }
-        }
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.enqueue_project_save(
+            Some(status.into()),
+            Some(status.into()),
+            "Save failed",
+            Some(window),
+            cx,
+        );
     }
 
     fn delete_folder_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1706,67 +2058,182 @@ impl WorkspaceView {
     }
 
     pub(super) fn open_variables_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sheet_view =
-            cx.new(|cx| VariablesSheetView::new(&self.current().variables, window, cx));
-        let weak_workspace = cx.weak_entity();
-        let project_name = self.current().name.clone();
-        window.open_sheet(cx, move |sheet, _, _| {
-            let sheet_save = sheet_view.clone();
-            let weak_save = weak_workspace.clone();
-            sheet
-                .size(px(520.))
-                .title(format!("Variables · {project_name}"))
-                .child(sheet_view.clone())
-                .footer(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("vars-cancel")
-                                .small()
-                                .outline()
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_sheet(cx)),
-                        )
-                        .child(
-                            Button::new("vars-save")
-                                .small()
-                                .primary()
-                                .icon(svg_icon("icons/save.svg").small())
-                                .label("Save Variables")
-                                .on_click(move |_, window, cx| {
-                                    let map = sheet_save.read(cx).variables_map(cx);
-                                    let _ = weak_save.update(cx, |view, cx| {
-                                        view.projects[view.active_project].variables = map;
-                                        view.refresh_template_inspection(cx);
-                                        match view.store.save(view.current()) {
-                                            Ok(()) => {
-                                                view.set_status("Variables saved", false, cx);
-                                                window.push_notification(
-                                                    Notification::success(
-                                                        "Project variables saved",
-                                                    ),
-                                                    cx,
-                                                );
-                                            }
-                                            Err(err) => {
-                                                let msg = format!("Save variables failed: {err:#}");
-                                                view.set_status(msg.clone(), true, cx);
-                                                window.push_notification(
-                                                    Notification::error(msg),
-                                                    cx,
-                                                );
-                                            }
-                                        }
-                                    });
-                                    window.close_sheet(cx);
-                                }),
-                        ),
-                )
+        crate::variables_sheet::open_variables_sheet(self, window, cx);
+    }
+
+    pub(super) fn save_variables_and_environments(
+        &mut self,
+        submission: VariablesSubmission,
+        sheet: Entity<VariablesSheetView>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_dirty
+            && let Err(err) = self.apply_editor(cx)
+        {
+            let msg = format!("Cannot apply editor changes: {err:#}");
+            self.set_status(msg.clone(), true, cx);
+            sheet.update(cx, |s, cx| {
+                s.saving = false;
+                s.error = Some(msg);
+                cx.notify();
+            });
+            return;
+        }
+        let mut snapshot = self.current().clone();
+        snapshot.variables = submission.variables.clone();
+        snapshot.secret_variables = submission.secret_variables.clone();
+        snapshot.environments = submission.environments.clone();
+        snapshot.active_environment = submission.active_environment.clone();
+
+        let project_id = snapshot.id.clone();
+        let next_rev = self.current_edit_rev(&project_id).saturating_add(1);
+        self.record_in_flight_save(&project_id, next_rev);
+        self.set_status("Saving variables…", false, cx);
+
+        let store = self.store.clone();
+        let secret_store = Arc::clone(&self.secret_store);
+        let sheet_weak = sheet.downgrade();
+        let rx = self.persistence.submit_save_with_secrets(
+            store,
+            snapshot,
+            next_rev,
+            secret_store,
+            submission.secret_plan,
+        );
+        self.spawn_io_callback(rx, cx, move |view, outcome, window, cx| match outcome {
+            Ok(committed_rev) => {
+                let entry = view
+                    .project_edit_revs
+                    .entry(project_id.clone())
+                    .or_insert(0);
+                *entry = (*entry).max(committed_rev);
+                if let Some(target) = view.projects.iter_mut().find(|p| p.id == project_id) {
+                    target.variables = submission.variables;
+                    target.secret_variables = submission.secret_variables;
+                    target.environments = submission.environments;
+                    target.active_environment = submission.active_environment;
+                }
+                let _clean = view.finish_save_tracking(&project_id, next_rev, &Ok(committed_rev));
+                view.refresh_resolved_variables();
+                view.refresh_template_inspection(cx);
+                view.set_status("Variables saved", false, cx);
+                if let Some(sheet_entity) = sheet_weak.upgrade() {
+                    sheet_entity.update(cx, |s, _| s.saving = false);
+                    if let Some(w) = window {
+                        w.close_sheet(cx);
+                        w.push_notification(
+                            Notification::success("Variables & environments saved"),
+                            cx,
+                        );
+                    }
+                }
+            }
+            Err(err_msg) => {
+                if let Some(&tracked) = view.in_flight_saves.get(&project_id)
+                    && tracked <= next_rev
+                {
+                    view.in_flight_saves.remove(&project_id);
+                }
+                view.sync_dirty();
+                let msg = format!("Save variables failed: {err_msg}");
+                view.set_status(msg.clone(), true, cx);
+                if let Some(sheet_entity) = sheet_weak.upgrade() {
+                    sheet_entity.update(cx, |s, cx| {
+                        s.saving = false;
+                        s.error = Some(msg.clone());
+                        cx.notify();
+                    });
+                } else {
+                    Self::push_window_notification(window, Notification::error(msg), cx);
+                }
+            }
         });
+    }
+
+    pub(super) fn set_active_environment(
+        &mut self,
+        env_id: Option<String>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.projects[self.active_project].set_active_environment(env_id) {
+            return;
+        }
+        self.refresh_resolved_variables();
+        self.refresh_template_inspection(cx);
+        let label = self
+            .current()
+            .active_env()
+            .map(|env| format!("Environment: {}", env.name))
+            .unwrap_or_else(|| "Environment: Base only".to_owned());
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.enqueue_project_save(
+            Some(label.into()),
+            None,
+            "Save environment failed",
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(super) fn quick_create_standard_environments(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.current().environments.is_empty() {
+            return;
+        }
+        let proj = &mut self.projects[self.active_project];
+        let local_id = proj.add_environment("local");
+        let _ = proj.add_environment("staging");
+        let _ = proj.add_environment("prod");
+        proj.set_active_environment(Some(local_id));
+        self.refresh_resolved_variables();
+        self.refresh_template_inspection(cx);
+        let project_id = self.current().id.clone();
+        self.bump_project_revision(&project_id);
+        self.sync_dirty();
+        self.enqueue_project_save(
+            Some("Created local / staging / prod environments".into()),
+            Some("Added local, staging, and prod environments".into()),
+            "Create environments failed",
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(super) fn sanitize_active_draft_credentials(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_id.is_none() {
+            return;
+        }
+        let mut snap = self.snapshot_draft_request(cx);
+        let summary = sanitize_request_credentials(&mut snap);
+        if summary.moved_to_session_auth == 0 && summary.stripped_fields == 0 {
+            return;
+        }
+        self.editing_request_name = false;
+        self.suppress_dirty = true;
+        self.populate_editor_from_request(snap, true, window, cx);
+        self.suppress_dirty = false;
+        self.refresh_kv_counts(cx);
+        self.refresh_body_json_valid(cx);
+        self.mark_dirty(cx);
+        let msg = format!(
+            "Moved {} credential field(s) to session-only Auth and stripped {} field(s)",
+            summary.moved_to_session_auth, summary.stripped_fields
+        );
+        self.set_status(msg.clone(), false, cx);
+        window.push_notification(Notification::success(msg), cx);
     }
 
     pub(super) fn push_and_select_project(
@@ -1796,19 +2263,20 @@ impl WorkspaceView {
     }
 
     pub(super) fn send(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        if let Err(error) = self.save_if_dirty(cx) {
-            let msg = format!("Cannot send: {error:#}");
-            self.set_status(msg.clone(), true, cx);
-            if let Some(window) = window {
-                window.push_notification(Notification::error(msg), cx);
+        let expected_run_gen = self.run_generation;
+        self.flush_current_project_then("Cannot send", window, cx, move |view, _, cx| {
+            if view.run_generation == expected_run_gen {
+                view.perform_send(cx);
             }
-            return;
-        }
+        });
+    }
+
+    fn perform_send(&mut self, cx: &mut Context<Self>) {
         let Some(request) = self.current_request().cloned() else {
             return;
         };
         let request_id = request.id.clone();
-        let variables = self.current().variables.clone();
+        let resolved = self.resolved_variables.clone();
         self.cancel(cx);
         self.in_flight_request_id = Some(request_id.clone());
         self.set_status(
@@ -1828,7 +2296,7 @@ impl WorkspaceView {
         let sent_method_fallback = sent_method.clone();
         let sent_url_fallback = sent_url.clone();
         let handle = self.runtime.spawn(async move {
-            match engine.send(&request, &variables).await {
+            match engine.send_with_secrets(&request, &resolved).await {
                 Ok(response) => {
                     let status_line = SharedString::from(format!(
                         "{} {} · {} · {}",
@@ -1991,7 +2459,9 @@ impl Render for WorkspaceView {
         let is_dark = cx.theme().is_dark();
 
         let workspace_view = cx.weak_entity();
-        let var_count = self.current().variables.len();
+        let env_view = cx.weak_entity();
+        let active_env_name = self.current().active_env().map(|env| env.name.clone());
+        let var_count = self.current().effective_variable_count();
         let req_count = self.cached_request_count;
 
         let header = div()
@@ -2070,13 +2540,95 @@ impl Render for WorkspaceView {
                     })),
             )
             .child(
+                Button::new("env-selector")
+                    .small()
+                    .outline()
+                    .dropdown_caret(true)
+                    .icon(svg_icon("icons/layers.svg").small())
+                    .label(
+                        active_env_name
+                            .clone()
+                            .unwrap_or_else(|| "Base Env".to_owned()),
+                    )
+                    .tooltip("Switch active project environment")
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        let (envs, active_id) = env_view
+                            .upgrade()
+                            .map(|entity| {
+                                let proj = entity.read(cx).current();
+                                (
+                                    proj.environments
+                                        .iter()
+                                        .map(|e| (e.id.clone(), e.name.clone()))
+                                        .collect::<Vec<_>>(),
+                                    proj.active_environment.clone(),
+                                )
+                            })
+                            .unwrap_or_default();
+
+                        let v_base = env_view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new("Base only (No environment)")
+                                .checked(active_id.is_none())
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_base.update(cx, |view, cx| {
+                                        view.set_active_environment(None, Some(window), cx);
+                                    });
+                                }),
+                        );
+                        for (env_id, env_name) in &envs {
+                            let v_env = env_view.clone();
+                            let id_pick = env_id.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(env_name.clone())
+                                    .checked(active_id.as_deref() == Some(env_id.as_str()))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = v_env.update(cx, |view, cx| {
+                                            view.set_active_environment(
+                                                Some(id_pick.clone()),
+                                                Some(window),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            );
+                        }
+                        menu = menu.separator();
+                        if envs.is_empty() {
+                            let v_quick = env_view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new("Quick Add: local / staging / prod")
+                                    .icon(svg_icon("icons/plus.svg"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = v_quick.update(cx, |view, cx| {
+                                            view.quick_create_standard_environments(
+                                                Some(window),
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            );
+                        }
+                        let v_manage = env_view.clone();
+                        menu.item(
+                            PopupMenuItem::new("Manage Environments & Variables...")
+                                .icon(svg_icon("icons/variable.svg"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = v_manage.update(cx, |view, cx| {
+                                        view.open_variables_sheet(window, cx);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(
                 Button::new("open-variables")
                     .small()
                     .outline()
                     .icon(svg_icon("icons/variable.svg").small())
                     .label("Variables")
                     .when(var_count > 0, |btn| btn.child(count_pill(var_count, cx)))
-                    .tooltip("Edit project variables")
+                    .tooltip("Edit variables, secrets, and environments")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_variables_sheet(window, cx);
                     })),
@@ -2114,13 +2666,14 @@ impl Render for WorkspaceView {
                     })),
             );
 
-        let status_dot_color = if self.in_flight_request_id.is_some() {
-            cx.theme().info
-        } else if self.status_is_error {
-            cx.theme().danger
-        } else {
-            cx.theme().success
-        };
+        let status_dot_color =
+            if self.in_flight_request_id.is_some() || !self.in_flight_saves.is_empty() {
+                cx.theme().info
+            } else if self.status_is_error {
+                cx.theme().danger
+            } else {
+                cx.theme().success
+            };
 
         let status_bar = div()
             .h(px(26.))
@@ -2179,6 +2732,19 @@ impl Render for WorkspaceView {
                                 }))
                                 .child(svg_icon("icons/triangle-alert.svg").xsmall())
                                 .child("TLS verification off (dev)"),
+                        )
+                    })
+                    .when_some(active_env_name, |row, env_name| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(cx.theme().secondary)
+                                .text_color(cx.theme().secondary_foreground)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("Env: {env_name}")),
                         )
                     })
                     .child(format!("{req_count} requests · {var_count} variables"))
@@ -2266,7 +2832,11 @@ impl Render for WorkspaceView {
 #[cfg(test)]
 mod tests {
     use super::WorkspaceView;
+    use crate::request_editor::AuthKind;
+    use crate::variables_sheet::{VariablesSheetView, VariablesSubmission};
+    use fastman_core::curl;
     use fastman_core::model::{ApiRequest, Folder};
+    use fastman_core::secrets::{MemorySecretStore, SecretStore as _};
     use fastman_core::storage::ProjectStore;
     use gpui::{AppContext, TestAppContext};
 
@@ -2313,6 +2883,18 @@ mod tests {
         run_view_test(check_failed_tree_move);
     }
 
+    fn drain_persistence(cx: &mut TestAppContext, view: &gpui::Entity<WorkspaceView>) {
+        loop {
+            let worker = cx.update(|cx| view.read(cx).persistence.clone());
+            worker.flush_blocking();
+            cx.run_until_parked();
+            let idle = cx.update(|cx| view.read(cx).in_flight_saves.is_empty());
+            if idle {
+                break;
+            }
+        }
+    }
+
     fn run_view_test(test: fn()) {
         // Building the full view in debug mode exceeds the default test stack on Windows.
         let result = std::thread::Builder::new()
@@ -2326,8 +2908,8 @@ mod tests {
     }
 
     fn check_failed_tree_move() {
-        let mut cx = TestAppContext::single();
         let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
         let store = ProjectStore::at(root.path());
         seed_request(&store);
         cx.update(gpui_kit::init);
@@ -2339,42 +2921,61 @@ mod tests {
             })
             .unwrap();
 
+        let (project_id, request_id, original_folder) = cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let project_id = view.current().id.clone();
+                    let request_id = view.selected_id.clone().unwrap();
+                    let original_folder =
+                        view.current().request_parent_folder(&request_id).unwrap();
+                    let collection_id = view.current().collections[0].id.clone();
+                    view.projects.push(store.create("Second project").unwrap());
+                    assert!(!view.dirty);
+
+                    let other_instance = ProjectStore::at(root.path());
+                    let mut external = other_instance.load(&project_id).unwrap();
+                    external.name = "Externally renamed".into();
+                    other_instance.save(&external).unwrap();
+
+                    view.move_request_to_collection(&request_id, &collection_id, window, cx);
+                    assert!(view.current().request_parent_folder(&request_id).is_none());
+                    (project_id, request_id, original_folder)
+                })
+            })
+            .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| {
-                let project_id = view.current().id.clone();
-                let request_id = view.selected_id.clone().unwrap();
-                let original_folder = view.current().request_parent_folder(&request_id).unwrap();
-                let collection_id = view.current().collections[0].id.clone();
-                view.projects.push(store.create("Second project").unwrap());
-                assert!(!view.dirty);
-
-                let other_instance = ProjectStore::at(root.path());
-                let mut external = other_instance.load(&project_id).unwrap();
-                external.name = "Externally renamed".into();
-                other_instance.save(&external).unwrap();
-
-                view.move_request_to_collection(&request_id, &collection_id, window, cx);
-                assert!(view.current().request_parent_folder(&request_id).is_none());
                 assert!(view.status.contains("modified on disk"));
                 assert!(view.dirty, "The in-memory move still needs to be saved");
-
                 view.switch_project(1, window, cx);
-                assert_eq!(view.active_project, 0);
-                assert!(view.dirty);
-                let disk = other_instance.load(&project_id).unwrap();
-                assert_eq!(disk.name, "Externally renamed");
-                assert_eq!(
-                    disk.request_parent_folder(&request_id),
-                    Some(original_folder)
-                );
             });
         })
         .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.active_project, 0);
+            assert!(v.dirty);
+        })
+        .unwrap();
+
+        let other_instance = ProjectStore::at(root.path());
+        let disk = other_instance.load(&project_id).unwrap();
+        assert_eq!(disk.name, "Externally renamed");
+        assert_eq!(
+            disk.request_parent_folder(&request_id),
+            Some(original_folder)
+        );
     }
 
     fn check_project_switch() {
-        let mut cx = TestAppContext::single();
         let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
         let store = ProjectStore::at(root.path());
         seed_request(&store);
         let other_instance = ProjectStore::at(root.path());
@@ -2406,6 +3007,14 @@ mod tests {
             view.update(cx, |view, cx| {
                 assert!(view.dirty);
                 view.switch_project(1, window, cx);
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
                 assert_eq!(view.active_project, 1);
                 assert!(!view.dirty);
                 view.switch_project(0, window, cx);
@@ -2424,13 +3033,20 @@ mod tests {
             view.update(cx, |view, cx| {
                 assert!(view.dirty);
                 view.switch_project(1, window, cx);
-                assert_eq!(view.active_project, 0);
-                assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
-                assert_eq!(view.url.read(cx).value().as_ref(), draft_url);
-                assert!(view.dirty);
-                assert!(view.status_is_error);
-                assert!(view.status.contains("modified on disk"));
             });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.active_project, 0);
+            assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
+            assert_eq!(view.url.read(cx).value().as_ref(), draft_url);
+            assert!(view.dirty);
+            assert!(view.status_is_error);
+            assert!(view.status.contains("modified on disk"));
         })
         .unwrap();
         let disk = other_instance.load(&project_id).unwrap();
@@ -2612,10 +3228,12 @@ mod tests {
                 assert!(confirm.read(cx).replace_summary.is_some());
 
                 // Saving without confirming (e.g. after Cancel) must never persist pasted secrets.
-                view.save(cx).unwrap();
+                assert!(view.save(None, cx));
             });
         })
         .unwrap();
+
+        drain_persistence(&mut cx, &view);
 
         let disk_json =
             std::fs::read_to_string(root.path().join(&project_id).join("project.json")).unwrap();
@@ -2988,8 +3606,8 @@ mod tests {
                     assert!(view.dirty);
                     assert!(!view.snapshot_draft_request(cx).verify_tls);
 
-                    view.save(cx).unwrap();
-                    assert!(!view.dirty);
+                    assert!(view.save(None, cx));
+                    assert!(view.dirty);
 
                     let project_id = view.current().id.clone();
                     let request_id = view.selected_id.clone().unwrap();
@@ -2997,6 +3615,13 @@ mod tests {
                 })
             })
             .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            assert!(!view.read(cx).dirty);
+        })
+        .unwrap();
 
         let disk_project = store.load(&project_id).unwrap();
         assert!(!disk_project.find_request(&request_id).unwrap().verify_tls);
@@ -3085,6 +3710,434 @@ mod tests {
                 assert_eq!(view.url.read(cx).value().as_ref(), frag_only);
                 assert_eq!(view.params_table.to_key_values(cx).len(), 8);
             });
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn async_save_does_not_clear_dirty_for_stale_revision_and_preserves_order() {
+        run_view_test(check_async_save_revision_ordering);
+    }
+
+    fn check_async_save_revision_ordering() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        let (project_id, request_id) = cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.persistence
+                        .set_simulated_delay(std::time::Duration::from_millis(60));
+                    view.url.update(cx, |input, cx| {
+                        input.replace_all("https://example.com/rev1", window, cx);
+                    });
+                    (view.current().id.clone(), view.selected_id.clone().unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                assert!(view.save(Some(window), cx));
+
+                // Edit revision 2 while revision 1 is in flight on the background worker.
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("https://example.com/rev2", window, cx);
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            assert!(view.read(cx).dirty);
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        // Revision 1 finished, but revision 2 has not been saved yet, so dirty must remain true.
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                assert!(view.save(Some(window), cx));
+
+                // Edit revision 3 before rev2 commits to verify monotonic ordering.
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("https://example.com/rev3", window, cx);
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.save(Some(window), cx));
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert!(!v.dirty);
+            assert!(!v.status_is_error);
+        })
+        .unwrap();
+
+        let disk = store.load(&project_id).unwrap();
+        assert_eq!(
+            disk.find_request(&request_id).unwrap().url,
+            "https://example.com/rev3"
+        );
+    }
+
+    #[test]
+    fn async_save_failure_keeps_dirty_blocks_switches_and_recovers_on_retry() {
+        run_view_test(check_async_save_failure_and_retry);
+    }
+
+    fn check_async_save_failure_and_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        let (project_id, request_id, second_req_id) = cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    let second = ApiRequest::new("GET", "Second", "https://example.com/second");
+                    let second_id = second.id.clone();
+                    view.projects[0].collections[0].requests.push(second);
+                    view.projects.push(store.create("Other").unwrap());
+                    let project_id = view.current().id.clone();
+                    let request_id = view.selected_id.clone().unwrap();
+                    view.url.update(cx, |input, cx| {
+                        input.replace_all("https://example.com/initial", window, cx);
+                    });
+                    (project_id, request_id, second_id)
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.save(Some(window), cx));
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        // Simulate an external save conflict, then edit and attempt tab + project switches.
+        let external = ProjectStore::at(root.path());
+        let mut ext_proj = external.load(&project_id).unwrap();
+        ext_proj.name = "External Edit".into();
+        external.save(&ext_proj).unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("https://example.com/local-retry", window, cx);
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.save_with_toast(window, cx);
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.dirty);
+                assert!(view.status_is_error);
+                assert!(view.status.contains("modified on disk"));
+
+                view.open_request(second_req_id.clone(), window, cx);
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.selected_id.as_deref(), Some(request_id.as_str()));
+                assert!(view.dirty);
+                assert!(view.status.contains("Cannot switch tab"));
+
+                // Refresh store hash after user inspects/resolves conflict and retry save.
+                let latest = store.load(&project_id).unwrap();
+                assert_eq!(latest.name, "External Edit");
+                view.projects[0].name = "Merged Name".into();
+                view.switch_project(1, window, cx);
+            });
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.active_project, 1);
+            assert!(!v.dirty);
+            assert!(!v.status_is_error);
+        })
+        .unwrap();
+
+        let saved = store.load(&project_id).unwrap();
+        assert_eq!(saved.name, "Merged Name");
+        assert_eq!(
+            saved.find_request(&request_id).unwrap().url,
+            "https://example.com/local-retry"
+        );
+    }
+
+    #[test]
+    fn environments_override_base_variables_persist_across_reload_and_switch_via_palette() {
+        run_view_test(check_environments_override_and_palette_switch);
+    }
+
+    fn check_environments_override_and_palette_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let store = ProjectStore::at(root.path());
+
+        let mut project = store.create("Env Project").unwrap();
+        project
+            .variables
+            .insert("base_url".into(), "https://base.example".into());
+
+        let mut local_env = fastman_core::model::Environment::new("local");
+        local_env
+            .variables
+            .insert("base_url".into(), "https://local.example".into());
+        let local_id = local_env.id.clone();
+
+        let mut prod_env = fastman_core::model::Environment::new("prod");
+        prod_env
+            .variables
+            .insert("base_url".into(), "https://prod.example".into());
+        let prod_id = prod_env.id.clone();
+
+        project.environments = vec![local_env, prod_env];
+        project.active_environment = Some(local_id);
+        project.collections[0]
+            .requests
+            .push(ApiRequest::new("GET", "Items", "{{base_url}}/items"));
+        let project_id = project.id.clone();
+        store.save(&project).unwrap();
+
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(
+                view.read(cx).template_inspection.url_preview,
+                "https://local.example/items"
+            );
+            let entries = crate::command_palette::build_catalog(view.read(cx));
+            assert!(entries.iter().any(|entry| {
+                entry.section == crate::command_palette::PaletteSection::Environments
+                    && entry.target
+                        == crate::command_palette::PaletteTarget::Environment {
+                            id: Some(prod_id.clone()),
+                        }
+            }));
+
+            let weak = view.downgrade();
+            crate::command_palette::execute_palette_target(
+                crate::command_palette::PaletteTarget::Environment {
+                    id: Some(prod_id.clone()),
+                },
+                &weak,
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        cx.update_window(window, |_, _, cx| {
+            let v = view.read(cx);
+            assert!(!v.dirty);
+            assert_eq!(
+                v.current().active_environment.as_deref(),
+                Some(prod_id.as_str())
+            );
+            assert_eq!(
+                v.template_inspection.url_preview,
+                "https://prod.example/items"
+            );
+        })
+        .unwrap();
+
+        let reloaded = store.load(&project_id).unwrap();
+        assert_eq!(
+            reloaded.active_environment.as_deref(),
+            Some(prod_id.as_str())
+        );
+    }
+
+    #[test]
+    fn secret_variables_mask_in_preview_redact_in_curl_and_never_persist_plaintext() {
+        run_view_test(check_secret_variables_masking_and_redaction);
+    }
+
+    fn check_secret_variables_masking_and_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        let secret_store = std::sync::Arc::new(MemorySecretStore::new());
+
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        WorkspaceView::with_store_and_secrets(
+                            store.clone(),
+                            secret_store.clone(),
+                            window,
+                            cx,
+                        )
+                        .unwrap()
+                    })
+                })
+            })
+            .unwrap();
+
+        let (project_id, key_ref) = cx
+            .update_window(window, |_, window, cx| {
+                let proj = view.read(cx).current().clone();
+                let project_id = proj.id.clone();
+                let sheet =
+                    cx.new(|cx| VariablesSheetView::new(&proj, &Default::default(), window, cx));
+                assert!(sheet.read(cx).build_submission(cx).is_ok());
+
+                let key_ref = fastman_core::secrets::make_keychain_key(&project_id, "base");
+                let mut secret_variables = std::collections::BTreeMap::new();
+                secret_variables.insert(
+                    "custom_x".to_owned(),
+                    fastman_core::model::SecretRef::Keychain {
+                        key: key_ref.clone(),
+                    },
+                );
+                let mut secret_plan = fastman_core::secrets::SecretChangePlan::default();
+                secret_plan
+                    .writes
+                    .push((key_ref.clone(), "canary_keychain_value_999".to_owned()));
+                let submission = VariablesSubmission {
+                    variables: std::collections::BTreeMap::new(),
+                    secret_variables,
+                    environments: Vec::new(),
+                    active_environment: None,
+                    secret_plan,
+                };
+                view.update(cx, |view, cx| {
+                    view.save_variables_and_environments(submission, sheet, window, cx);
+                });
+                (project_id, key_ref)
+            })
+            .unwrap();
+
+        drain_persistence(&mut cx, &view);
+
+        assert_eq!(
+            secret_store.get(&key_ref).unwrap().as_deref(),
+            Some("canary_keychain_value_999")
+        );
+        let disk_json =
+            std::fs::read_to_string(root.path().join(&project_id).join("project.json")).unwrap();
+        assert!(!disk_json.contains("canary_keychain_value_999"));
+        assert!(disk_json.contains("custom_x"));
+        assert!(disk_json.contains("keychain"));
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.dirty);
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("https://api.example/v1?x={{custom_x}}", window, cx);
+                });
+                view.append_header_preset(
+                    "Authorization",
+                    "Bearer raw_canary_token_123",
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            let v = view.read(cx);
+            assert_eq!(
+                v.template_inspection.url_preview,
+                "https://api.example/v1?x=••••"
+            );
+            assert!(!v.draft_sensitive_findings.is_empty());
+
+            let req = v.snapshot_draft_request(cx);
+            let redacted = curl::to_curl_export_with_secrets(
+                &req,
+                &v.resolved_variables.values,
+                &v.resolved_variables.secret_names,
+                true,
+            )
+            .unwrap();
+            assert!(!redacted.command.contains("canary_keychain_value_999"));
+            assert!(!redacted.command.contains("raw_canary_token_123"));
+
+            let full = curl::to_curl_export_with_secrets(
+                &req,
+                &v.resolved_variables.values,
+                &v.resolved_variables.secret_names,
+                false,
+            )
+            .unwrap();
+            assert!(full.command.contains("canary_keychain_value_999"));
+            assert!(full.command.contains("raw_canary_token_123"));
+
+            view.update(cx, |view, cx| {
+                view.sanitize_active_draft_credentials(window, cx);
+            });
+            let after = view.read(cx);
+            assert!(after.draft_sensitive_findings.is_empty());
+            assert_eq!(after.auth_kind, AuthKind::Bearer);
+            assert_eq!(after.auth_token.read(cx).value(), "raw_canary_token_123");
         })
         .unwrap();
     }

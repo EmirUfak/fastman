@@ -4,10 +4,12 @@ mod command_palette;
 mod explorer;
 mod import_view;
 mod kv_editor;
+mod persistence;
 mod request_editor;
 mod response_body_view;
 mod response_view;
 mod theme;
+mod variables_sheet;
 mod workspace;
 
 use gpui_kit::*;

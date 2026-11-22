@@ -615,8 +615,13 @@ impl WorkspaceView {
                 let has_sensitive = self.dirty
                     || !self.auth_kind.is_none()
                     || self.current_request().is_some_and(|req| {
-                        fastman_core::curl::to_curl_export(req, &self.current().variables, true)
-                            .is_ok_and(|res| res.had_secrets || res.had_variables)
+                        fastman_core::curl::to_curl_export_with_secrets(
+                            req,
+                            &self.resolved_variables.values,
+                            &self.resolved_variables.secret_names,
+                            true,
+                        )
+                        .is_ok_and(|res| res.had_secrets || res.had_variables)
                     });
                 Button::new("copy-curl")
                     .outline()
@@ -730,8 +735,11 @@ impl WorkspaceView {
 
         let show_url_assist = curl_in_url || show_resolved_url || has_missing_vars;
         let url_assist_bar = show_url_assist.then(|| {
-            let missing_summary =
-                format_missing_vars_summary(&tmpl.missing_variables, tmpl.unclosed);
+            let missing_summary = format_missing_vars_summary(
+                &tmpl.missing_variables,
+                &tmpl.unresolved_secrets,
+                tmpl.unclosed,
+            );
             let mono_font = cx.theme().mono_font_family.clone();
             div()
                 .px_3()
@@ -813,6 +821,53 @@ impl WorkspaceView {
                 })
         });
 
+        let draft_secret_banner = (!self.draft_sensitive_findings.is_empty()).then(|| {
+            let summary = fastman_core::security::summarize_sensitive_findings(
+                &self.draft_sensitive_findings,
+            );
+            let warn = cx.theme().warning;
+            div()
+                .px_3()
+                .pb_2()
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .w_full()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(warn.opacity(0.45))
+                        .bg(warn.opacity(0.10))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(11.5))
+                        .child(svg_icon("icons/triangle-alert.svg").xsmall().text_color(warn))
+                        .child(div().flex_1().min_w_0().truncate().child(format!(
+                            "Plaintext credential in draft ({summary}). Move to session Auth or use a Secret variable."
+                        )))
+                        .child(
+                            Button::new("sanitize-draft-secrets")
+                                .xsmall()
+                                .outline()
+                                .label("Move to Auth / Strip")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.sanitize_active_draft_credentials(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("open-draft-secret-vars")
+                                .xsmall()
+                                .ghost()
+                                .label("Secret Variables")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.open_variables_sheet(window, cx);
+                                })),
+                        ),
+                )
+        });
+
         div()
             .size_full()
             .flex()
@@ -821,6 +876,7 @@ impl WorkspaceView {
             .child(tab_strip)
             .child(url_bar)
             .when_some(url_assist_bar, |el, bar| el.child(bar))
+            .when_some(draft_secret_banner, |el, banner| el.child(banner))
             .child(section_tabs)
             .child(
                 div()
@@ -1032,7 +1088,7 @@ impl WorkspaceView {
                                     .xsmall()
                                     .text_color(cx.theme().success),
                             )
-                            .child("Session-only: Auth fields stay in memory and are excluded from saved project JSON (avoid putting secrets inside saved {{variables}})."),
+                            .child("Session-only: Auth fields stay in memory and are excluded from saved project JSON. Use Secret Variables (OS keychain or Env ref) for reusable credentials."),
                     )
                     .into_any_element()
             }
@@ -1417,15 +1473,37 @@ impl WorkspaceView {
     }
 }
 
-fn format_missing_vars_summary(missing: &[String], unclosed: bool) -> String {
+fn format_missing_vars_summary(
+    missing: &[String],
+    unresolved_secrets: &[(String, String)],
+    unclosed: bool,
+) -> String {
     let mut parts = Vec::new();
-    if !missing.is_empty() {
-        let shown: Vec<String> = missing
+    if !unresolved_secrets.is_empty() {
+        let shown: Vec<String> = unresolved_secrets
+            .iter()
+            .take(2)
+            .map(|(name, reason)| format!("{{{{{name}}}}} ({reason})"))
+            .collect();
+        let extra = unresolved_secrets.len().saturating_sub(2);
+        let list = if extra > 0 {
+            format!("{} (+{extra} more)", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        parts.push(format!("Unresolved secret: {list}"));
+    }
+    let plain_missing: Vec<&String> = missing
+        .iter()
+        .filter(|name| !unresolved_secrets.iter().any(|(s, _)| s == *name))
+        .collect();
+    if !plain_missing.is_empty() {
+        let shown: Vec<String> = plain_missing
             .iter()
             .take(3)
             .map(|name| format!("{{{{{name}}}}}"))
             .collect();
-        let extra = missing.len().saturating_sub(3);
+        let extra = plain_missing.len().saturating_sub(3);
         let list = if extra > 0 {
             format!("{} (+{extra} more)", shown.join(", "))
         } else {

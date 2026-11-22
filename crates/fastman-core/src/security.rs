@@ -1,6 +1,6 @@
 //! Shared security validation, credential classification, sanitization, and hashing helpers.
 
-use crate::model::{ApiRequest, Auth, KeyValue};
+use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
@@ -149,6 +149,96 @@ pub fn is_sensitive_var_name(name: &str) -> bool {
         )
 }
 
+/// Returns `true` when `raw` contains only safe auth scheme prefixes and `{{variable}}`
+/// template placeholders with no inline secret literals.
+pub fn is_pure_template_secret_value(raw: &str) -> bool {
+    let mut rest = raw.trim();
+    for prefix in ["bearer ", "basic ", "token ", "apikey ", "digest "] {
+        if rest.len() >= prefix.len() && rest[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            rest = rest[prefix.len()..].trim_start();
+            break;
+        }
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    let mut saw_var = false;
+    while !rest.is_empty() {
+        let Some(open) = rest.find("{{") else {
+            return saw_var && rest.chars().all(|c| c.is_whitespace() || c == ':');
+        };
+        if !rest[..open].chars().all(|c| c.is_whitespace() || c == ':') {
+            return false;
+        }
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            return false;
+        };
+        if after_open[..close].trim().is_empty() {
+            return false;
+        }
+        saw_var = true;
+        rest = &after_open[close + 2..];
+    }
+    saw_var
+}
+
+const MAX_JSON_WALK_DEPTH: usize = 64;
+
+fn walk_json_secrets(
+    value: &mut serde_json::Value,
+    depth: usize,
+    on_secret: &mut impl FnMut(&str, &mut String),
+) {
+    if depth >= MAX_JSON_WALK_DEPTH {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if let serde_json::Value::String(s) = v {
+                    if is_sensitive_param_name(k)
+                        && !s.trim().is_empty()
+                        && !is_pure_template_secret_value(s)
+                    {
+                        on_secret(k.trim(), s);
+                    }
+                } else {
+                    walk_json_secrets(v, depth + 1, on_secret);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_json_secrets(item, depth + 1, on_secret);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace plaintext secret string fields in a JSON payload with `<REDACTED>`.
+/// Returns `Some(redacted_json)` when at least one field changed.
+pub fn redact_json_secrets(raw: &str) -> Option<String> {
+    let mut root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let mut changed = false;
+    walk_json_secrets(&mut root, 0, &mut |_, s| {
+        if s != "<REDACTED>" {
+            *s = "<REDACTED>".to_owned();
+            changed = true;
+        }
+    });
+    if !changed {
+        return None;
+    }
+    let trimmed = raw.trim_start();
+    if trimmed.contains('\n') {
+        serde_json::to_string_pretty(&root).ok()
+    } else {
+        serde_json::to_string(&root).ok()
+    }
+}
+
 fn is_api_key_header_name(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     matches!(
@@ -233,7 +323,10 @@ pub fn collect_sensitive_request_findings(
     out: &mut Vec<SensitiveFieldFinding>,
 ) {
     for header in &request.headers {
-        if is_sensitive_header_name(&header.key) && !header.value.trim().is_empty() {
+        if is_sensitive_header_name(&header.key)
+            && !header.value.trim().is_empty()
+            && !is_pure_template_secret_value(&header.value)
+        {
             out.push(SensitiveFieldFinding {
                 request_name: request.name.clone(),
                 location: "header".to_owned(),
@@ -242,7 +335,10 @@ pub fn collect_sensitive_request_findings(
         }
     }
     for param in &request.params {
-        if is_sensitive_param_name(&param.key) && !param.value.trim().is_empty() {
+        if is_sensitive_param_name(&param.key)
+            && !param.value.trim().is_empty()
+            && !is_pure_template_secret_value(&param.value)
+        {
             out.push(SensitiveFieldFinding {
                 request_name: request.name.clone(),
                 location: "query param".to_owned(),
@@ -250,21 +346,30 @@ pub fn collect_sensitive_request_findings(
             });
         }
     }
-    if let Some((_, username, _)) = strip_url_userinfo(&request.url)
-        && !username.is_empty()
-    {
-        out.push(SensitiveFieldFinding {
-            request_name: request.name.clone(),
-            location: "URL userinfo".to_owned(),
-            field_name: username,
-        });
+    if let Some((_, username, password)) = strip_url_userinfo(&request.url) {
+        let user_safe = username.is_empty() || is_pure_template_secret_value(&username);
+        let pass_safe = password.is_empty() || is_pure_template_secret_value(&password);
+        if (!username.is_empty() || !password.is_empty()) && (!user_safe || !pass_safe) {
+            out.push(SensitiveFieldFinding {
+                request_name: request.name.clone(),
+                location: "URL userinfo".to_owned(),
+                field_name: if username.is_empty() {
+                    "password".to_owned()
+                } else {
+                    username
+                },
+            });
+        }
     }
     if let Some((_, query, _)) = split_url_parts(&request.url) {
         for part in query.split('&').filter(|s| !s.is_empty()) {
             let (raw_k, raw_v) = part.split_once('=').unwrap_or((part, ""));
             let key = percent_decode(raw_k);
             let value = percent_decode(raw_v);
-            if is_sensitive_param_name(&key) && !value.trim().is_empty() {
+            if is_sensitive_param_name(&key)
+                && !value.trim().is_empty()
+                && !is_pure_template_secret_value(&value)
+            {
                 out.push(SensitiveFieldFinding {
                     request_name: request.name.clone(),
                     location: "URL query".to_owned(),
@@ -272,6 +377,34 @@ pub fn collect_sensitive_request_findings(
                 });
             }
         }
+    }
+    match &request.body {
+        HttpBody::FormUrlEncoded(rows) => {
+            for row in rows {
+                if is_sensitive_param_name(&row.key)
+                    && !row.value.trim().is_empty()
+                    && !is_pure_template_secret_value(&row.value)
+                {
+                    out.push(SensitiveFieldFinding {
+                        request_name: request.name.clone(),
+                        location: "form field".to_owned(),
+                        field_name: row.key.trim().to_owned(),
+                    });
+                }
+            }
+        }
+        HttpBody::Json(raw) => {
+            if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                walk_json_secrets(&mut parsed, 0, &mut |field_name, _| {
+                    out.push(SensitiveFieldFinding {
+                        request_name: request.name.clone(),
+                        location: "JSON body field".to_owned(),
+                        field_name: field_name.to_owned(),
+                    });
+                });
+            }
+        }
+        HttpBody::None | HttpBody::Text(_) => {}
     }
 }
 
@@ -283,28 +416,35 @@ pub struct SanitizeSummary {
 
 /// Move recognized credentials (Authorization Bearer/Basic, API keys, URL userinfo)
 /// into session-only `request.auth` (when `request.auth == Auth::None`) and strip
-/// all remaining sensitive headers/query params so they are not persisted in plaintext.
+/// all remaining sensitive headers/query/body fields so they are not persisted in plaintext.
 pub fn sanitize_request_credentials(request: &mut ApiRequest) -> SanitizeSummary {
     let mut summary = SanitizeSummary::default();
 
-    // 1. Strip URL userinfo, optionally promoting to Auth::Basic.
+    // 1. Strip plaintext URL userinfo, optionally promoting to Auth::Basic.
     if let Some((cleaned_url, user, pass)) = strip_url_userinfo(&request.url) {
-        request.url = cleaned_url;
-        if matches!(request.auth, Auth::None) && (!user.is_empty() || !pass.is_empty()) {
-            request.auth = Auth::Basic {
-                username: user,
-                password: pass,
-            };
-            summary.moved_to_session_auth += 1;
-        } else {
-            summary.stripped_fields += 1;
+        let user_safe = user.is_empty() || is_pure_template_secret_value(&user);
+        let pass_safe = pass.is_empty() || is_pure_template_secret_value(&pass);
+        if (!user.is_empty() || !pass.is_empty()) && (!user_safe || !pass_safe) {
+            request.url = cleaned_url;
+            if matches!(request.auth, Auth::None) {
+                request.auth = Auth::Basic {
+                    username: user,
+                    password: pass,
+                };
+                summary.moved_to_session_auth += 1;
+            } else {
+                summary.stripped_fields += 1;
+            }
         }
     }
 
-    // 2. Headers: promote first recognized auth header when Auth::None, strip all sensitive headers.
+    // 2. Headers: promote first recognized auth header when Auth::None, strip all non-template sensitive headers.
     let mut kept_headers = Vec::with_capacity(request.headers.len());
     for header in request.headers.drain(..) {
-        if is_sensitive_header_name(&header.key) && !header.value.trim().is_empty() {
+        if is_sensitive_header_name(&header.key)
+            && !header.value.trim().is_empty()
+            && !is_pure_template_secret_value(&header.value)
+        {
             if matches!(request.auth, Auth::None)
                 && let Some(extracted) = try_extract_auth_from_header(&header.key, &header.value)
             {
@@ -319,10 +459,13 @@ pub fn sanitize_request_credentials(request: &mut ApiRequest) -> SanitizeSummary
     }
     request.headers = kept_headers;
 
-    // 3. Params: promote recognized API key param when Auth::None, strip all sensitive params.
+    // 3. Params: promote recognized API key param when Auth::None, strip remaining non-template sensitive params.
     let mut kept_params = Vec::with_capacity(request.params.len());
     for param in request.params.drain(..) {
-        if is_sensitive_param_name(&param.key) && !param.value.trim().is_empty() {
+        if is_sensitive_param_name(&param.key)
+            && !param.value.trim().is_empty()
+            && !is_pure_template_secret_value(&param.value)
+        {
             if matches!(request.auth, Auth::None) && is_api_key_param_name(&param.key) {
                 request.auth = Auth::ApiKeyQuery {
                     name: param.key.trim().to_owned(),
@@ -348,7 +491,10 @@ pub fn sanitize_request_credentials(request: &mut ApiRequest) -> SanitizeSummary
             let (raw_k, raw_v) = part.split_once('=').unwrap_or((part, ""));
             let key = percent_decode(raw_k);
             let value = percent_decode(raw_v);
-            if is_sensitive_param_name(&key) && !value.trim().is_empty() {
+            if is_sensitive_param_name(&key)
+                && !value.trim().is_empty()
+                && !is_pure_template_secret_value(&value)
+            {
                 changed = true;
                 if matches!(request.auth, Auth::None) && is_api_key_param_name(&key) {
                     request.auth = Auth::ApiKeyQuery {
@@ -375,6 +521,35 @@ pub fn sanitize_request_credentials(request: &mut ApiRequest) -> SanitizeSummary
             }
             request.url = rebuilt;
         }
+    }
+
+    // 5. Request body fields.
+    match &mut request.body {
+        HttpBody::FormUrlEncoded(rows) => {
+            rows.retain(|row| {
+                let sensitive = is_sensitive_param_name(&row.key)
+                    && !row.value.trim().is_empty()
+                    && !is_pure_template_secret_value(&row.value);
+                if sensitive {
+                    summary.stripped_fields += 1;
+                }
+                !sensitive
+            });
+        }
+        HttpBody::Json(raw) => {
+            if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                let mut changed = false;
+                walk_json_secrets(&mut parsed, 0, &mut |_, value| {
+                    value.clear();
+                    changed = true;
+                    summary.stripped_fields += 1;
+                });
+                if changed && let Ok(updated) = serde_json::to_string_pretty(&parsed) {
+                    *raw = updated;
+                }
+            }
+        }
+        HttpBody::None | HttpBody::Text(_) => {}
     }
 
     summary
@@ -848,5 +1023,75 @@ mod tests {
         assert_eq!(empty_q_clean, "https://api.example.com/search#top");
         assert!(empty_q_pairs.is_empty());
         assert!(split_url_query("https://api.example.com/page#sec?not=query").is_none());
+    }
+
+    #[test]
+    fn template_secret_references_stay_intact_while_json_and_form_literals_sanitize() {
+        let mut req = ApiRequest::new("POST", "Login", "https://api.example.com/auth");
+        req.headers
+            .push(KeyValue::new("Authorization", "Bearer {{api_token}}"));
+        req.headers
+            .push(KeyValue::new("X-Raw-Secret", "hardcoded-secret"));
+        req.params
+            .push(KeyValue::new("access_token", "{{query_tok}}"));
+        req.body = HttpBody::Json(
+            r#"{"user":"alice","password":"pw_canary","nested":{"api_key":"{{safe_key}}","client_secret":"sec_canary"}}"#.into(),
+        );
+
+        let mut findings = Vec::new();
+        collect_sensitive_request_findings(&req, &mut findings);
+        assert_eq!(findings.len(), 3);
+        let found_names: Vec<&str> = findings.iter().map(|f| f.field_name.as_str()).collect();
+        assert!(found_names.contains(&"X-Raw-Secret"));
+        assert!(found_names.contains(&"password"));
+        assert!(found_names.contains(&"client_secret"));
+
+        let redacted = match &req.body {
+            HttpBody::Json(raw) => redact_json_secrets(raw).unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(!redacted.contains("pw_canary"));
+        assert!(!redacted.contains("sec_canary"));
+        assert!(redacted.contains("{{safe_key}}"));
+        assert!(redacted.contains("<REDACTED>"));
+
+        let summary = sanitize_request_credentials(&mut req);
+        assert_eq!(summary.moved_to_session_auth, 0);
+        assert_eq!(summary.stripped_fields, 3);
+        assert_eq!(
+            req.headers,
+            vec![KeyValue::new("Authorization", "Bearer {{api_token}}")]
+        );
+        assert_eq!(
+            req.params,
+            vec![KeyValue::new("access_token", "{{query_tok}}")]
+        );
+        if let HttpBody::Json(raw) = &req.body {
+            assert!(!raw.contains("pw_canary"));
+            assert!(!raw.contains("sec_canary"));
+            assert!(raw.contains("{{safe_key}}"));
+        } else {
+            panic!("expected JSON body");
+        }
+
+        let mut form_req = ApiRequest::new("POST", "Form", "https://api.example.com/token");
+        form_req.body = HttpBody::FormUrlEncoded(vec![
+            KeyValue::new("grant_type", "client_credentials"),
+            KeyValue::new("client_secret", "form_secret_canary"),
+            KeyValue::new("token", "{{runtime_token}}"),
+        ]);
+        let mut form_findings = Vec::new();
+        collect_sensitive_request_findings(&form_req, &mut form_findings);
+        assert_eq!(form_findings.len(), 1);
+        assert_eq!(form_findings[0].location, "form field");
+        let form_summary = sanitize_request_credentials(&mut form_req);
+        assert_eq!(form_summary.stripped_fields, 1);
+        assert_eq!(
+            form_req.body,
+            HttpBody::FormUrlEncoded(vec![
+                KeyValue::new("grant_type", "client_credentials"),
+                KeyValue::new("token", "{{runtime_token}}"),
+            ])
+        );
     }
 }
