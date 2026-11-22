@@ -197,24 +197,13 @@ impl ProjectStore {
         if !dir.is_dir() {
             bail!("Read {}: project directory not found", path.display());
         }
-        let _lock = if dir_needs_lock_or_recovery(&dir) {
-            let lock = DirLockGuard::acquire(&dir)?;
-            recover_project_files_locked(&lock, &id_str)?;
-            Some(lock)
-        } else {
-            None
-        };
-        self.read_and_track_project(&path, &id_str)
+        self.try_load_project_dir(&dir, &id_str)?
+            .with_context(|| format!("Read {}: project file not found", path.display()))
     }
 
     fn try_load_project_dir(&self, dir: &Path, id_str: &str) -> Result<Option<Project>> {
-        let _lock = if dir_needs_lock_or_recovery(dir) {
-            let lock = DirLockGuard::acquire(dir)?;
-            recover_project_files_locked(&lock, id_str)?;
-            Some(lock)
-        } else {
-            None
-        };
+        let lock = DirLockGuard::acquire(dir)?;
+        recover_project_files_locked(&lock, id_str)?;
         let path = dir.join("project.json");
         if !path.exists() {
             return Ok(None);
@@ -540,24 +529,6 @@ fn stale_lock_snapshot(path: &Path, stale_age: Duration) -> Option<(SystemTime, 
         return Some((modified, token));
     }
     None
-}
-
-/// Returns true if a project directory has an active lock, backup, or orphaned temp file.
-fn dir_needs_lock_or_recovery(dir: &Path) -> bool {
-    if dir.join(".save.lock").exists() || dir.join("project.json.previous").exists() {
-        return true;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return true;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if s.starts_with('.') && s.ends_with(".tmp") {
-            return true;
-        }
-    }
-    false
 }
 
 /// Clean up orphaned temp files and recover interrupted `project.json.previous` backups
@@ -946,6 +917,27 @@ mod tests {
         assert!(!active_tmp.exists());
         assert!(!backup.exists());
         assert!(project_dir.join("project.json").exists());
+    }
+
+    #[test]
+    fn load_and_list_clean_orphans_without_creating_a_project() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        let id = Uuid::new_v4().to_string();
+        let dir = root.path().join(&id);
+        fs::create_dir(&dir).unwrap();
+        let orphan = dir.join(".interrupted.tmp");
+
+        fs::write(&orphan, b"incomplete project").unwrap();
+        let error = store.load(&id).unwrap_err();
+        assert!(error.to_string().contains("project file not found"));
+        assert!(!orphan.exists());
+
+        fs::write(&orphan, b"incomplete project").unwrap();
+        let (projects, warnings) = store.list_resilient().unwrap();
+        assert!(projects.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]
