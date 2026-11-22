@@ -15,8 +15,10 @@ use uuid::Uuid;
 
 pub const MAX_PROJECT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WORKSPACE_BYTES: usize = 64 * 1024;
-const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_LOCK_FILE_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -176,15 +178,9 @@ impl ProjectStore {
                 continue;
             }
             let dir = entry.path();
-            if let Err(err) = recover_project_files(&dir, &id_str) {
-                warnings.push(format!("Recovery notice for {id_str}: {err:#}"));
-            }
-            let path = dir.join("project.json");
-            if !path.exists() {
-                continue;
-            }
-            match self.load(&id_str) {
-                Ok(project) => projects.push(project),
+            match self.try_load_project_dir(&dir, &id_str) {
+                Ok(Some(project)) => projects.push(project),
+                Ok(None) => {}
                 Err(err) => warnings.push(format!("Failed to load project {id_str}: {err:#}")),
             }
         }
@@ -196,9 +192,27 @@ impl ProjectStore {
         let id = Uuid::parse_str(id).context("Invalid project ID")?;
         let id_str = id.to_string();
         let dir = self.root.join(&id_str);
-        recover_project_files(&dir, &id_str)?;
         let path = dir.join("project.json");
-        let bytes = read_bounded(&path, MAX_PROJECT_BYTES)?;
+        if !dir.is_dir() {
+            bail!("Read {}: project directory not found", path.display());
+        }
+        let lock = DirLockGuard::acquire(&dir)?;
+        recover_project_files_locked(&lock, &id_str)?;
+        self.read_and_track_project(&path, &id_str)
+    }
+
+    fn try_load_project_dir(&self, dir: &Path, id_str: &str) -> Result<Option<Project>> {
+        let lock = DirLockGuard::acquire(dir)?;
+        recover_project_files_locked(&lock, id_str)?;
+        let path = dir.join("project.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_and_track_project(&path, id_str).map(Some)
+    }
+
+    fn read_and_track_project(&self, path: &Path, id_str: &str) -> Result<Project> {
+        let bytes = read_bounded(path, MAX_PROJECT_BYTES)?;
         let project: Project = serde_json::from_slice(&bytes).context("Decode project JSON")?;
         validate_project(&project)?;
         if project.id != id_str {
@@ -206,7 +220,7 @@ impl ProjectStore {
         }
         let digest = sha256(&bytes);
         if let Ok(mut map) = self.known_hashes.lock() {
-            map.insert(id_str, digest);
+            map.insert(id_str.to_owned(), digest);
         }
         Ok(project)
     }
@@ -219,8 +233,8 @@ impl ProjectStore {
         let dir = self.root.join(&id_str);
         ensure_private_dir(&dir)?;
 
-        let _lock = DirLockGuard::acquire(&dir)?;
-        recover_project_files(&dir, &id_str)?;
+        let lock = DirLockGuard::acquire(&dir)?;
+        recover_project_files_locked(&lock, &id_str)?;
 
         let dest = dir.join("project.json");
         if dest.exists() {
@@ -277,10 +291,10 @@ impl ProjectStore {
         temp.disarm();
         enforce_private_file_perms(&dest);
         sync_directory(&dir);
-
         if let Ok(mut map) = self.known_hashes.lock() {
             map.insert(id_str, new_digest);
         }
+        drop(lock);
         Ok(())
     }
 }
@@ -390,13 +404,23 @@ impl Drop for TempFileGuard {
 }
 
 struct DirLockGuard {
+    dir: PathBuf,
     path: PathBuf,
+    token: String,
 }
 
 impl DirLockGuard {
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn acquire(dir: &Path) -> Result<Self> {
+        Self::acquire_with_options(dir, LOCK_WAIT_TIMEOUT, STALE_LOCK_AGE)
+    }
+
+    fn acquire_with_options(dir: &Path, timeout: Duration, stale_age: Duration) -> Result<Self> {
         let lock_path = dir.join(".save.lock");
-        let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
@@ -407,18 +431,30 @@ impl DirLockGuard {
             }
             match opts.open(&lock_path) {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "pid={}", std::process::id());
-                    return Ok(Self { path: lock_path });
+                    let token = Uuid::new_v4().to_string();
+                    let payload = format!("pid={}\ntoken={token}\n", std::process::id());
+                    let _ = file
+                        .write_all(payload.as_bytes())
+                        .and_then(|()| file.flush());
+                    return Ok(Self {
+                        dir: dir.to_path_buf(),
+                        path: lock_path,
+                        token,
+                    });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Ok(meta) = fs::metadata(&lock_path)
-                        && let Ok(modified) = meta.modified()
-                        && SystemTime::now()
-                            .duration_since(modified)
-                            .is_ok_and(|age| age > STALE_LOCK_AGE)
+                    if let Some((expected_modified, expected_token)) =
+                        stale_lock_snapshot(&lock_path, stale_age)
                     {
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
+                        // Re-verify lock identity right before removal to narrow TOCTOU with a concurrent reaper.
+                        let still_same = fs::metadata(&lock_path)
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|m| m == expected_modified)
+                            && read_lock_info(&lock_path).and_then(|(_, t)| t) == expected_token;
+                        if still_same {
+                            let _ = fs::remove_file(&lock_path);
+                            continue;
+                        }
                     }
                     if Instant::now() >= deadline {
                         bail!(
@@ -426,7 +462,18 @@ impl DirLockGuard {
                             dir.display()
                         );
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                // On Windows, opening a path marked delete-pending (unlinked while another thread
+                // holds a metadata/read handle) raises PermissionDenied briefly until closed.
+                Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "Timed out waiting for project save lock at {}",
+                            dir.display()
+                        );
+                    }
+                    thread::sleep(LOCK_RETRY_INTERVAL);
                 }
                 Err(err) => {
                     return Err(err).context("Acquire project save lock");
@@ -438,12 +485,56 @@ impl DirLockGuard {
 
 impl Drop for DirLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some((_, Some(token))) = read_lock_info(&self.path)
+            && token == self.token
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
-/// Clean up orphaned temp files and recover interrupted `project.json.previous` backups.
-fn recover_project_files(dir: &Path, expected_id: &str) -> Result<()> {
+fn read_lock_info(path: &Path) -> Option<(Option<u32>, Option<String>)> {
+    let bytes = read_bounded(path, MAX_LOCK_FILE_BYTES).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut pid = None;
+    let mut token = None;
+    for line in text.lines() {
+        if let Some(raw_pid) = line.strip_prefix("pid=") {
+            pid = raw_pid.trim().parse::<u32>().ok();
+        } else if let Some(raw_token) = line.strip_prefix("token=") {
+            let trimmed = raw_token.trim();
+            if !trimmed.is_empty() {
+                token = Some(trimmed.to_owned());
+            }
+        }
+    }
+    Some((pid, token))
+}
+
+fn stale_lock_snapshot(path: &Path, stale_age: Duration) -> Option<(SystemTime, Option<String>)> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age > stale_age {
+        let (_, token) = read_lock_info(path).unwrap_or((None, None));
+        return Some((modified, token));
+    }
+    // Windows and macOS rely solely on `stale_age` to avoid unsafe FFI or subprocess spawning.
+    #[cfg(target_os = "linux")]
+    if age >= Duration::from_millis(200)
+        && let Some((Some(pid), token)) = read_lock_info(path)
+        && pid != std::process::id()
+        && Path::new("/proc").is_dir()
+        && !Path::new(&format!("/proc/{pid}")).exists()
+    {
+        return Some((modified, token));
+    }
+    None
+}
+
+/// Clean up orphaned temp files and recover interrupted `project.json.previous` backups
+/// while holding the directory save lock.
+fn recover_project_files_locked(lock: &DirLockGuard, expected_id: &str) -> Result<()> {
+    let dir = lock.dir();
     if !dir.exists() {
         return Ok(());
     }
@@ -468,18 +559,21 @@ fn recover_project_files(dir: &Path, expected_id: &str) -> Result<()> {
         if backup_valid {
             fs::rename(&backup, &dest).context("Recover interrupted project backup")?;
             enforce_private_file_perms(&dest);
+            sync_directory(dir);
         }
         return Ok(());
     }
 
     if is_valid_project_file(&dest, expected_id) {
         let _ = fs::remove_file(&backup);
+        sync_directory(dir);
     } else if backup_valid {
         let corrupt = dir.join("project.json.corrupt");
         let _ = fs::remove_file(&corrupt);
-        let _ = fs::rename(&dest, &corrupt);
+        fs::rename(&dest, &corrupt).context("Quarantine corrupt project.json")?;
         fs::rename(&backup, &dest).context("Restore backup over corrupt project.json")?;
         enforce_private_file_perms(&dest);
+        sync_directory(dir);
     }
     Ok(())
 }
@@ -617,9 +711,15 @@ mod tests {
         let error = second.save(&project).unwrap_err();
         assert!(error.to_string().contains("waiting for project save lock"));
         assert!(project_dir.join(".save.lock").exists());
-        assert_eq!(first.load(&project.id).unwrap().name, "Original");
+        let load_err = first.load(&project.id).unwrap_err();
+        assert!(
+            load_err
+                .to_string()
+                .contains("waiting for project save lock")
+        );
 
         drop(lock);
+        assert_eq!(first.load(&project.id).unwrap().name, "Original");
         second.save(&project).unwrap();
         assert_eq!(first.load(&project.id).unwrap().name, "Updated");
     }
@@ -730,5 +830,151 @@ mod tests {
             fs::metadata(&p_file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn locked_writer_temp_and_backup_survive_concurrent_load_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let project = store.create("Locked").unwrap();
+        let project_dir = dir.path().join(&project.id);
+        let project_bytes = fs::read(project_dir.join("project.json")).unwrap();
+
+        let lock = DirLockGuard::acquire(&project_dir).unwrap();
+        let active_tmp = project_dir.join(".active-save.tmp");
+        let backup = project_dir.join("project.json.previous");
+        fs::write(&active_tmp, b"in-flight").unwrap();
+        fs::write(&backup, &project_bytes).unwrap();
+
+        let load_err = store.load(&project.id).unwrap_err();
+        assert!(
+            load_err
+                .to_string()
+                .contains("waiting for project save lock"),
+            "{load_err:#}"
+        );
+
+        let (listed, warnings) = store.list_resilient().unwrap();
+        assert!(listed.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(active_tmp.exists());
+        assert!(backup.exists());
+
+        drop(lock);
+
+        let (listed, warnings) = store.list_resilient().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Locked");
+        assert!(warnings.is_empty());
+        assert!(!active_tmp.exists());
+        assert!(!backup.exists());
+        assert!(project_dir.join("project.json").exists());
+    }
+
+    #[test]
+    fn concurrent_save_load_and_list_resilient_stress() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer_store = ProjectStore::at(dir.path());
+        let mut project = writer_store.create("Init").unwrap();
+        let project_id = project.id.clone();
+        let project_dir = dir.path().join(&project_id);
+        let done = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let store = ProjectStore::at(dir.path());
+                let id = project_id.clone();
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let loaded = store.load(&id).unwrap();
+                        assert!(
+                            loaded.name == "Init" || loaded.name.starts_with("Rev "),
+                            "unexpected name {}",
+                            loaded.name
+                        );
+                        let (listed, warnings) = store.list_resilient().unwrap();
+                        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+                        assert_eq!(listed.len(), 1);
+                        assert!(
+                            listed[0].name == "Init" || listed[0].name.starts_with("Rev "),
+                            "unexpected listed name {}",
+                            listed[0].name
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for i in 1..=25 {
+            project.name = format!("Rev {i}");
+            writer_store.save(&project).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let results: Vec<_> = readers.into_iter().map(|handle| handle.join()).collect();
+        for res in results {
+            res.unwrap();
+        }
+
+        let files: Vec<_> = fs::read_dir(&project_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["project.json"]);
+    }
+
+    #[test]
+    fn recovers_corrupt_project_from_valid_previous_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let project = store.create("Healthy").unwrap();
+        let project_dir = dir.path().join(&project.id);
+        let dest = project_dir.join("project.json");
+        let backup = project_dir.join("project.json.previous");
+        let orphan_tmp = project_dir.join(".orphan.tmp");
+
+        fs::copy(&dest, &backup).unwrap();
+        fs::write(&dest, b"{truncated").unwrap();
+        fs::write(&orphan_tmp, b"partial").unwrap();
+
+        let loaded = store.load(&project.id).unwrap();
+        assert_eq!(loaded.name, "Healthy");
+        assert!(dest.exists());
+        assert!(project_dir.join("project.json.corrupt").exists());
+        assert!(!backup.exists());
+        assert!(!orphan_tmp.exists());
+    }
+
+    #[test]
+    fn stale_lock_is_reaped_and_old_guard_drop_preserves_new_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let old_guard = DirLockGuard::acquire_with_options(
+            &project_dir,
+            LOCK_WAIT_TIMEOUT,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let new_guard = DirLockGuard::acquire_with_options(
+            &project_dir,
+            LOCK_WAIT_TIMEOUT,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let new_token = new_guard.token.clone();
+
+        drop(old_guard);
+        let lock_path = project_dir.join(".save.lock");
+        assert!(lock_path.exists());
+        let (_, current_token) = read_lock_info(&lock_path).unwrap();
+        assert_eq!(current_token.as_deref(), Some(new_token.as_str()));
+
+        drop(new_guard);
+        assert!(!lock_path.exists());
     }
 }

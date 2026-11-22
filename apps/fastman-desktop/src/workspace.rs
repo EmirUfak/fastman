@@ -621,23 +621,21 @@ impl WorkspaceView {
 
     pub(super) fn extract_url_query_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw_url = self.url.read(cx).value().to_string();
-        let Some((base, query)) = raw_url.split_once('?') else {
+        let Some((cleaned_url, pairs)) = fastman_core::security::split_url_query(&raw_url) else {
             return;
         };
-        let query = query.split('#').next().unwrap_or(query);
-        for part in query.split('&').filter(|s| !s.is_empty()) {
-            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+        for param in pairs {
             self.params_table.append_pair(
-                k,
-                v,
+                &param.key,
+                &param.value,
                 window,
                 cx,
                 Self::kv_change_handler(KvTableKind::Params),
             );
         }
         self.suppress_dirty = true;
-        self.last_url = base.to_owned();
-        Self::set_input(&self.url, base, window, cx);
+        self.last_url = cleaned_url.clone();
+        Self::set_input(&self.url, &cleaned_url, window, cx);
         self.suppress_dirty = false;
         self.refresh_kv_counts(cx);
         self.mark_dirty(cx);
@@ -3030,6 +3028,63 @@ mod tests {
                 .expect("curl -k should stage confirmation");
             assert_eq!(confirm.read(cx).report.unsupported_flags, vec!["-k"]);
             assert!(confirm.read(cx).report.request.verify_tls);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn extract_url_query_params_decodes_and_preserves_fragment() {
+        run_view_test(check_extract_url_query_params);
+    }
+
+    fn check_extract_url_query_params() {
+        use fastman_core::model::KeyValue;
+
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let target_url = "https://api.example.com/search?q=hello%20world&expr=a%2Bb&tag=a&tag=b&empty=&flag&tpl={{var}}&uni=caf%C3%A9#top";
+                view.url
+                    .update(cx, |input, cx| input.replace_all(target_url, window, cx));
+                view.extract_url_query_params(window, cx);
+
+                assert_eq!(
+                    view.url.read(cx).value().as_ref(),
+                    "https://api.example.com/search#top"
+                );
+                assert_eq!(
+                    view.params_table.to_key_values(cx),
+                    vec![
+                        KeyValue::new("q", "hello world"),
+                        KeyValue::new("expr", "a+b"),
+                        KeyValue::new("tag", "a"),
+                        KeyValue::new("tag", "b"),
+                        KeyValue::new("empty", ""),
+                        KeyValue::new("flag", ""),
+                        KeyValue::new("tpl", "{{var}}"),
+                        KeyValue::new("uni", "café"),
+                    ]
+                );
+
+                let frag_only = "https://api.example.com/page#sec?not=query";
+                view.url
+                    .update(cx, |input, cx| input.replace_all(frag_only, window, cx));
+                view.extract_url_query_params(window, cx);
+                assert_eq!(view.url.read(cx).value().as_ref(), frag_only);
+                assert_eq!(view.params_table.to_key_values(cx).len(), 8);
+            });
         })
         .unwrap();
     }

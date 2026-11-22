@@ -4,8 +4,9 @@
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::security::{
     has_non_port_scheme, is_sensitive_header_name, is_sensitive_param_name, is_sensitive_var_name,
-    is_valid_header_name, is_valid_http_method, percent_decode, percent_encode, redact_url_secrets,
-    try_extract_auth_from_header, validate_template_or_http_url,
+    is_valid_header_name, is_valid_http_method, parse_urlencoded_pairs, percent_encode,
+    redact_url_secrets, split_url_query, try_extract_auth_from_header,
+    validate_template_or_http_url,
 };
 use crate::template::{self, MAX_INTERPOLATED_BYTES};
 use anyhow::{Result, bail};
@@ -66,8 +67,8 @@ pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
     let mut force_get = false;
     let mut url: Option<String> = None;
     let mut headers: Vec<KeyValue> = Vec::new();
-    let mut body_parts: Vec<String> = Vec::new();
-    let mut urlencoded_parts: Vec<KeyValue> = Vec::new();
+    let mut data_entries: Vec<DataEntry> = Vec::new();
+    let mut saw_data_flag = false;
     let mut auth = Auth::None;
     let mut unsupported_flags: Vec<String> = Vec::new();
 
@@ -117,14 +118,47 @@ pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
             auth = Auth::Bearer {
                 token: rest.trim().to_owned(),
             };
-        } else if let Some(rest) = match_exact_flag(tok, &tokens, &mut idx, "--data-urlencode") {
-            if let Some((k, v)) = rest.split_once('=') {
-                urlencoded_parts.push(KeyValue::new(k, v));
-            } else {
-                urlencoded_parts.push(KeyValue::new(rest, ""));
+        } else if let Some((kind, val)) = match_data_flag(tok, &tokens, &mut idx)? {
+            saw_data_flag = true;
+            match kind {
+                DataFlagKind::Data(label) => {
+                    if val.starts_with('@') {
+                        push_unique_flag(&mut unsupported_flags, format!("{label} @file"));
+                    } else {
+                        data_entries.push(DataEntry::Raw(val));
+                    }
+                }
+                DataFlagKind::DataBinary => {
+                    if val.starts_with('@') {
+                        push_unique_flag(&mut unsupported_flags, "--data-binary @file".to_owned());
+                    } else {
+                        data_entries.push(DataEntry::Raw(val));
+                    }
+                }
+                DataFlagKind::DataRaw => {
+                    data_entries.push(DataEntry::Raw(val));
+                }
+                DataFlagKind::DataUrlEncode => {
+                    let eq_pos = val.find('=');
+                    let at_pos = val.find('@');
+                    if at_pos.is_some_and(|at| eq_pos.is_none_or(|eq| at < eq)) {
+                        push_unique_flag(
+                            &mut unsupported_flags,
+                            "--data-urlencode @file".to_owned(),
+                        );
+                    } else if let Some(eq) = eq_pos {
+                        let name = &val[..eq];
+                        let content = &val[eq + 1..];
+                        if name.is_empty() {
+                            data_entries.push(DataEntry::UrlEncodedRaw(content.to_owned()));
+                        } else {
+                            data_entries.push(DataEntry::UrlEncoded(KeyValue::new(name, content)));
+                        }
+                    } else {
+                        data_entries.push(DataEntry::UrlEncoded(KeyValue::new(val, "")));
+                    }
+                }
             }
-        } else if let Some(rest) = match_data_flag(tok, &tokens, &mut idx) {
-            body_parts.push(rest);
         } else if let Some(rest) = match_exact_flag(tok, &tokens, &mut idx, "--url") {
             url = Some(rest);
         } else if tok == "-G" || tok == "--get" {
@@ -134,12 +168,8 @@ pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
         } else if tok == "-g" || tok == "--globoff" {
             // Fastman never interprets cURL URL globbing syntax (`{a,b}`, `[1-9]`).
         } else if tok.starts_with('-') {
-            if let Some(flag_name) = sanitize_unsupported_flag(tok)
-                && !unsupported_flags
-                    .iter()
-                    .any(|existing| existing == flag_name)
-            {
-                unsupported_flags.push(flag_name.to_owned());
+            if let Some(flag_name) = sanitize_unsupported_flag(tok) {
+                push_unique_flag(&mut unsupported_flags, flag_name.to_owned());
             }
             // Skip known value-taking flags that aren't mapped yet so their args don't become the URL.
             if takes_separate_value(tok) && idx + 1 < tokens.len() {
@@ -157,13 +187,13 @@ pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
         .ok_or_else(|| anyhow::anyhow!("No URL found in cURL command"))?;
     validate_template_or_http_url(&raw_url)?;
 
-    let (base_url, mut params) = split_query_params(&raw_url);
-    let has_body = !body_parts.is_empty() || !urlencoded_parts.is_empty();
+    let (base_url, mut params) =
+        split_url_query(&raw_url).unwrap_or_else(|| (raw_url.clone(), Vec::new()));
     let method = if force_get {
         "GET".to_owned()
     } else {
         explicit_method.unwrap_or_else(|| {
-            if has_body {
+            if saw_data_flag {
                 "POST".to_owned()
             } else {
                 "GET".to_owned()
@@ -175,37 +205,68 @@ pub fn parse_curl_report(input: &str) -> Result<CurlParseReport> {
     }
 
     let mut body = HttpBody::None;
-    if force_get && (!body_parts.is_empty() || !urlencoded_parts.is_empty()) {
-        for part in &body_parts {
-            params.extend(parse_urlencoded_pairs(part));
-        }
-        params.extend(urlencoded_parts);
-    } else if !urlencoded_parts.is_empty() {
-        for part in &body_parts {
-            urlencoded_parts.extend(parse_urlencoded_pairs(part));
-        }
-        body = HttpBody::FormUrlEncoded(urlencoded_parts);
-    } else if !body_parts.is_empty() {
-        let joined = body_parts.join("&");
-        let is_form = headers.iter().any(|h| {
-            h.key.eq_ignore_ascii_case("content-type")
-                && h.value
-                    .to_ascii_lowercase()
-                    .contains("application/x-www-form-urlencoded")
-        });
-        let is_json_header = headers.iter().any(|h| {
-            h.key.eq_ignore_ascii_case("content-type")
-                && h.value.to_ascii_lowercase().contains("json")
-        });
-        if is_form {
-            body = HttpBody::FormUrlEncoded(parse_urlencoded_pairs(&joined));
-        } else if is_json_header
-            || joined.trim_start().starts_with('{')
-            || joined.trim_start().starts_with('[')
-        {
-            body = HttpBody::Json(joined);
+    if !data_entries.is_empty() {
+        if force_get {
+            for entry in data_entries {
+                match entry {
+                    DataEntry::Raw(s) => params.extend(parse_urlencoded_pairs(&s)),
+                    DataEntry::UrlEncoded(kv) => params.push(kv),
+                    DataEntry::UrlEncodedRaw(s) => params.push(KeyValue::new(s, "")),
+                }
+            }
         } else {
-            body = HttpBody::Text(joined);
+            let explicit_ct = headers
+                .iter()
+                .rev()
+                .find(|h| h.key.eq_ignore_ascii_case("content-type"))
+                .map(|h| h.value.to_ascii_lowercase());
+            let is_form = explicit_ct
+                .as_deref()
+                .is_some_and(|ct| ct.contains("application/x-www-form-urlencoded"));
+            let is_json_header = explicit_ct.as_deref().is_some_and(|ct| ct.contains("json"));
+            let has_urlencode = data_entries
+                .iter()
+                .any(|e| matches!(e, DataEntry::UrlEncoded(_) | DataEntry::UrlEncodedRaw(_)));
+            let has_unnamed_urlencode = data_entries
+                .iter()
+                .any(|e| matches!(e, DataEntry::UrlEncodedRaw(_)));
+
+            if (has_urlencode || is_form) && !has_unnamed_urlencode {
+                let mut pairs = Vec::new();
+                for entry in data_entries {
+                    match entry {
+                        DataEntry::Raw(s) => pairs.extend(parse_urlencoded_pairs(&s)),
+                        DataEntry::UrlEncoded(kv) => pairs.push(kv),
+                        DataEntry::UrlEncodedRaw(_) => unreachable!(),
+                    }
+                }
+                body = HttpBody::FormUrlEncoded(pairs);
+            } else {
+                let joined = data_entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        DataEntry::Raw(s) => s,
+                        DataEntry::UrlEncoded(kv) => {
+                            if kv.value.is_empty() {
+                                percent_encode(&kv.key)
+                            } else {
+                                format!("{}={}", percent_encode(&kv.key), percent_encode(&kv.value))
+                            }
+                        }
+                        DataEntry::UrlEncodedRaw(s) => percent_encode(&s),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&");
+                if is_json_header
+                    || (explicit_ct.is_none()
+                        && (joined.trim_start().starts_with('{')
+                            || joined.trim_start().starts_with('[')))
+                {
+                    body = HttpBody::Json(joined);
+                } else {
+                    body = HttpBody::Text(joined);
+                }
+            }
         }
     }
 
@@ -310,10 +371,12 @@ pub fn to_curl_export(
         let (base_and_query, frag) = full_url
             .split_once('#')
             .map_or((full_url.as_str(), None), |(b, f)| (b, Some(f)));
-        let sep = if base_and_query.contains('?') {
-            '&'
+        let sep = if !base_and_query.contains('?') {
+            "?"
+        } else if base_and_query.ends_with(['?', '&']) {
+            ""
         } else {
-            '?'
+            "&"
         };
         let encoded: Vec<String> = query_pairs
             .iter()
@@ -546,6 +609,7 @@ fn normalize_url(raw: &str) -> String {
 }
 
 fn derive_request_name(url: &str) -> String {
+    let url = url.split('#').next().unwrap_or(url);
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let clean = without_scheme.trim_end_matches('/');
     if let Some((_, path)) = clean.split_once('/')
@@ -557,25 +621,6 @@ fn derive_request_name(url: &str) -> String {
         }
     }
     clean.to_owned()
-}
-
-fn split_query_params(raw_url: &str) -> (String, Vec<KeyValue>) {
-    let Some((base, query)) = raw_url.split_once('?') else {
-        return (raw_url.to_owned(), Vec::new());
-    };
-    let query_no_frag = query.split('#').next().unwrap_or(query);
-    (base.to_owned(), parse_urlencoded_pairs(query_no_frag))
-}
-
-fn parse_urlencoded_pairs(query: &str) -> Vec<KeyValue> {
-    query
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let (k, v) = part.split_once('=').unwrap_or((part, ""));
-            KeyValue::new(percent_decode(k), percent_decode(v))
-        })
-        .collect()
 }
 
 fn match_flag(
@@ -616,24 +661,65 @@ fn match_exact_flag(tok: &str, tokens: &[String], idx: &mut usize, long: &str) -
         .map(str::to_owned)
 }
 
-fn match_data_flag(tok: &str, tokens: &[String], idx: &mut usize) -> Option<String> {
-    for flag in [
-        "-d",
-        "--data",
-        "--data-raw",
-        "--data-binary",
-        "--data-ascii",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataFlagKind {
+    Data(&'static str),
+    DataRaw,
+    DataBinary,
+    DataUrlEncode,
+}
+
+enum DataEntry {
+    Raw(String),
+    UrlEncoded(KeyValue),
+    UrlEncodedRaw(String),
+}
+
+fn push_unique_flag(list: &mut Vec<String>, flag: String) {
+    if !list.iter().any(|existing| existing == &flag) {
+        list.push(flag);
+    }
+}
+
+fn match_data_flag(
+    tok: &str,
+    tokens: &[String],
+    idx: &mut usize,
+) -> Result<Option<(DataFlagKind, String)>> {
+    for (flag, kind) in [
+        ("--data", DataFlagKind::Data("--data")),
+        ("--data-ascii", DataFlagKind::Data("--data-ascii")),
+        ("--data-raw", DataFlagKind::DataRaw),
+        ("--data-binary", DataFlagKind::DataBinary),
+        ("--data-urlencode", DataFlagKind::DataUrlEncode),
     ] {
-        if let Some(val) = match_exact_flag(tok, tokens, idx, flag) {
-            return Some(val);
+        if tok == flag {
+            if *idx + 1 < tokens.len() {
+                *idx += 1;
+                return Ok(Some((kind, tokens[*idx].clone())));
+            }
+            bail!("Missing value for cURL flag {flag}");
         }
+        if let Some(val) = tok
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Ok(Some((kind, val.to_owned())));
+        }
+    }
+    if tok == "-d" {
+        if *idx + 1 < tokens.len() {
+            *idx += 1;
+            return Ok(Some((DataFlagKind::Data("-d"), tokens[*idx].clone())));
+        }
+        bail!("Missing value for cURL flag -d");
     }
     if let Some(rest) = tok.strip_prefix("-d")
         && !rest.is_empty()
     {
-        return Some(rest.to_owned());
+        return Ok(Some((DataFlagKind::Data("-d"), rest.to_owned())));
     }
-    None
+    Ok(None)
 }
 
 fn is_short_value_flag(short: &str) -> bool {
@@ -1011,5 +1097,172 @@ mod tests {
         // Supported `-g` alone emits no unsupported warnings.
         let clean = parse_curl_report("curl -g --url 'https://{{host}}/items'").unwrap();
         assert!(clean.unsupported_flags.is_empty());
+    }
+
+    #[test]
+    fn parse_curl_data_raw_preserves_leading_at_as_literal() {
+        for (cmd, expected_body) in [
+            (
+                "curl --data-raw '@literal' https://example.com/items",
+                "@literal",
+            ),
+            (
+                "curl --data-raw='@/etc/passwd' https://example.com/items",
+                "@/etc/passwd",
+            ),
+            (
+                "curl --data-raw $'@line1\\nline2' https://example.com/items",
+                "@line1\nline2",
+            ),
+        ] {
+            let report = parse_curl_report(cmd).unwrap();
+            assert_eq!(report.request.method, "POST");
+            assert_eq!(report.request.body, HttpBody::Text(expected_body.into()));
+            assert!(
+                report.unsupported_flags.is_empty(),
+                "unexpected unsupported flags for {cmd}: {:?}",
+                report.unsupported_flags
+            );
+        }
+    }
+
+    #[test]
+    fn parse_curl_reports_file_backed_data_flags_without_leaking_paths() {
+        for (cmd, expected_flag) in [
+            (
+                "curl -d @secret.json https://example.com/upload",
+                "-d @file",
+            ),
+            ("curl -d@secret.json https://example.com/upload", "-d @file"),
+            (
+                "curl --data @secret.json https://example.com/upload",
+                "--data @file",
+            ),
+            (
+                "curl --data=@secret.json https://example.com/upload",
+                "--data @file",
+            ),
+            (
+                "curl --data-ascii @secret.json https://example.com/upload",
+                "--data-ascii @file",
+            ),
+            (
+                "curl --data-binary @secret.bin https://example.com/upload",
+                "--data-binary @file",
+            ),
+            (
+                "curl --data-urlencode @secret.txt https://example.com/upload",
+                "--data-urlencode @file",
+            ),
+            (
+                "curl --data-urlencode payload@secret.txt https://example.com/upload",
+                "--data-urlencode @file",
+            ),
+            (
+                "curl --data-urlencode 'payload@file=1.txt' https://example.com/upload",
+                "--data-urlencode @file",
+            ),
+        ] {
+            let report = parse_curl_report(cmd).unwrap();
+            assert_eq!(report.request.method, "POST", "{cmd}");
+            assert_eq!(report.request.body, HttpBody::None, "{cmd}");
+            assert_eq!(report.unsupported_flags, vec![expected_flag], "{cmd}");
+            let joined = report.unsupported_flags.join(" ");
+            assert!(!joined.contains("secret"), "{cmd}: {joined}");
+            assert!(!joined.contains("file=1.txt"), "{cmd}: {joined}");
+        }
+
+        let inline = parse_curl_report(
+            "curl --data-urlencode 'email=alice@example.com' https://example.com/register",
+        )
+        .unwrap();
+        assert_eq!(inline.request.method, "POST");
+        assert_eq!(
+            inline.request.body,
+            HttpBody::FormUrlEncoded(vec![KeyValue::new("email", "alice@example.com")])
+        );
+        assert!(inline.unsupported_flags.is_empty());
+    }
+
+    #[test]
+    fn parse_curl_preserves_order_newlines_and_content_type_across_mixed_data_flags() {
+        let mixed_post = parse_curl_report(
+            "curl -d 'a=1' --data-urlencode 'b=hello world' --data-raw 'c=@val' https://example.com/form",
+        )
+        .unwrap();
+        assert_eq!(mixed_post.request.method, "POST");
+        assert_eq!(
+            mixed_post.request.body,
+            HttpBody::FormUrlEncoded(vec![
+                KeyValue::new("a", "1"),
+                KeyValue::new("b", "hello world"),
+                KeyValue::new("c", "@val"),
+            ])
+        );
+
+        let mixed_get = parse_curl_report(
+            "curl -G --data-urlencode 'first=a b' -d 'second=c%2Bd' --data-raw 'third=@ok' https://example.com/search",
+        )
+        .unwrap();
+        assert_eq!(mixed_get.request.method, "GET");
+        assert_eq!(mixed_get.request.body, HttpBody::None);
+        assert_eq!(
+            mixed_get.request.params,
+            vec![
+                KeyValue::new("first", "a b"),
+                KeyValue::new("second", "c+d"),
+                KeyValue::new("third", "@ok"),
+            ]
+        );
+
+        let binary_nl =
+            parse_curl_report("curl --data-binary $'line1\\r\\nline2' https://example.com/bin")
+                .unwrap();
+        assert_eq!(
+            binary_nl.request.body,
+            HttpBody::Text("line1\r\nline2".into())
+        );
+
+        let short_eq = parse_curl_report("curl -d=foo https://example.com/x").unwrap();
+        assert_eq!(short_eq.request.body, HttpBody::Text("=foo".into()));
+
+        let explicit_text = parse_curl_report(
+            "curl -H 'Content-Type: text/plain' -d '{\"not\":\"json\"}' https://example.com/txt",
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_text.request.body,
+            HttpBody::Text("{\"not\":\"json\"}".into())
+        );
+
+        let multi_form = parse_curl_report(
+            "curl -H 'Content-Type: application/x-www-form-urlencoded' -d 'a=1' -d 'b=2%2B3' https://example.com/f",
+        )
+        .unwrap();
+        assert_eq!(
+            multi_form.request.body,
+            HttpBody::FormUrlEncoded(vec![KeyValue::new("a", "1"), KeyValue::new("b", "2+3"),])
+        );
+
+        assert!(parse_curl_report("curl https://example.com -d").is_err());
+
+        let frag_req =
+            parse_curl("curl 'https://example.com/p?q=hello%20world&expr=a%2Bb#sec'").unwrap();
+        assert_eq!(frag_req.url, "https://example.com/p#sec");
+        assert_eq!(frag_req.name, "/p");
+        assert_eq!(
+            frag_req.params,
+            vec![
+                KeyValue::new("q", "hello world"),
+                KeyValue::new("expr", "a+b"),
+            ]
+        );
+        let exported = to_curl(&frag_req, &BTreeMap::new()).unwrap();
+        assert!(
+            exported.contains("https://example.com/p?q=hello%20world&expr=a%2Bb#sec"),
+            "{exported}"
+        );
+        assert!(!exported.contains("%2520"));
+        assert!(!exported.contains("%252B"));
     }
 }

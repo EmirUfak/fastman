@@ -166,6 +166,11 @@ impl HttpEngine {
             ));
         }
 
+        if request
+            .params
+            .iter()
+            .any(|item| item.enabled && !item.key.trim().is_empty())
+            || matches!(request.auth, Auth::ApiKeyQuery { .. })
         {
             let mut pairs = url.query_pairs_mut();
             for item in &request.params {
@@ -712,5 +717,79 @@ mod tests {
 
         origin_task.await.unwrap();
         target_task.abort();
+    }
+
+    #[tokio::test]
+    async fn extracted_query_params_roundtrip_over_http_without_double_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            for _ in 0..2 {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).await.unwrap();
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let first_line = raw.lines().next().unwrap_or("").to_owned();
+                request_lines.push(first_line);
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+            }
+            request_lines
+        });
+
+        let raw_url = format!(
+            "http://{addr}/search?q=hello%20world&q=second&expr=a%2Bb&raw=x%26y%3Dz&uni=caf%C3%A9&tpl={{{{var}}}}&empty=&flag#results"
+        );
+        let (cleaned_url, params) = crate::security::split_url_query(&raw_url).unwrap();
+        assert_eq!(cleaned_url, format!("http://{addr}/search#results"));
+
+        let mut req1 = ApiRequest::new("GET", "Roundtrip query", cleaned_url);
+        req1.params = params;
+        let vars = BTreeMap::from([("var".to_owned(), "a&b+c".to_owned())]);
+        let engine = HttpEngine::new().unwrap();
+        let resp1 = engine.send(&req1, &vars).await.unwrap();
+        assert_eq!(resp1.status, 200);
+
+        let req2 = ApiRequest::new(
+            "GET",
+            "Key-only bare query",
+            format!("http://{addr}/bare?flag"),
+        );
+        let resp2 = engine.send(&req2, &BTreeMap::new()).await.unwrap();
+        assert_eq!(resp2.status, 200);
+
+        let lines = task.await.unwrap();
+        let line1 = &lines[0];
+        assert!(!line1.contains("%2520"), "double-encoded space: {line1}");
+        assert!(!line1.contains("%252B"), "double-encoded plus: {line1}");
+        assert!(!line1.contains("%2526"), "double-encoded amp: {line1}");
+        assert!(!line1.contains("%253D"), "double-encoded eq: {line1}");
+
+        let target = line1.split_whitespace().nth(1).unwrap();
+        let (_, query_str) = target.split_once('?').unwrap();
+        let decoded = crate::security::parse_urlencoded_pairs(query_str);
+        assert_eq!(
+            decoded,
+            vec![
+                KeyValue::new("q", "hello world"),
+                KeyValue::new("q", "second"),
+                KeyValue::new("expr", "a+b"),
+                KeyValue::new("raw", "x&y=z"),
+                KeyValue::new("uni", "café"),
+                KeyValue::new("tpl", "a&b+c"),
+                KeyValue::new("empty", ""),
+                KeyValue::new("flag", ""),
+            ]
+        );
+
+        assert!(
+            lines[1].starts_with("GET /bare?flag HTTP/"),
+            "bare key-only query mutated: {}",
+            lines[1]
+        );
     }
 }

@@ -841,7 +841,7 @@ impl WorkspaceView {
 
         match self.section {
             0 => {
-                let has_query = self.url.read(cx).value().contains('?');
+                let has_query = fastman_core::security::has_url_query(&self.url.read(cx).value());
                 div()
                     .size_full()
                     .flex()

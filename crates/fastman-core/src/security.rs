@@ -1,6 +1,6 @@
 //! Shared security validation, credential classification, sanitization, and hashing helpers.
 
-use crate::model::{ApiRequest, Auth};
+use crate::model::{ApiRequest, Auth, KeyValue};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
@@ -471,6 +471,15 @@ fn escape_control_char(ch: char, out: &mut String) {
     }
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -482,10 +491,8 @@ pub fn percent_decode(input: &str) -> String {
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                    && let Ok(byte) = u8::from_str_radix(hex, 16)
-                {
-                    out.push(byte);
+                if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
                     i += 3;
                     continue;
                 }
@@ -499,6 +506,34 @@ pub fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Returns `true` when `raw` has a URL query component (`?` before any `#fragment`).
+pub fn has_url_query(raw: &str) -> bool {
+    split_url_parts(raw).is_some()
+}
+
+/// Parse `application/x-www-form-urlencoded` pairs with percent-decoding (`+` and `%XX`).
+pub fn parse_urlencoded_pairs(query: &str) -> Vec<KeyValue> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            KeyValue::new(percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+/// Extract and percent-decode query parameters from `raw_url`, returning the cleaned URL
+/// with any `#fragment` preserved.
+pub fn split_url_query(raw_url: &str) -> Option<(String, Vec<KeyValue>)> {
+    let (base, query, frag) = split_url_parts(raw_url)?;
+    let cleaned = match frag {
+        Some(f) => format!("{base}#{f}"),
+        None => base.to_owned(),
+    };
+    Some((cleaned, parse_urlencoded_pairs(query)))
 }
 
 pub fn percent_encode(input: &str) -> String {
@@ -773,5 +808,45 @@ mod tests {
             sanitize_terminal_body("line1\r\nline2\rspoof\x1b[2J\t!"),
             "line1\nline2\\rspoof\\u{1b}[2J\t!"
         );
+    }
+
+    #[test]
+    fn url_query_parsing_decodes_and_preserves_fragments_and_edge_cases() {
+        assert_eq!(percent_decode("hello+world%20%2B%2b"), "hello world ++");
+        assert_eq!(percent_decode("%26%3D%2F"), "&=/");
+        assert_eq!(percent_decode("caf%C3%A9%20%F0%9F%9A%80"), "café 🚀");
+        assert_eq!(percent_decode("{{var}}"), "{{var}}");
+        assert_eq!(percent_decode("%ZZ%2%"), "%ZZ%2%");
+        assert_eq!(percent_decode("%+1"), "% 1");
+
+        assert!(has_url_query("https://example.com/p?a=1"));
+        assert!(has_url_query("https://example.com/p?#frag"));
+        assert!(has_url_query("{{base}}/x?a=1#frag"));
+        assert!(!has_url_query("https://example.com/p#sec?not=query"));
+        assert!(!has_url_query("https://example.com/p"));
+
+        let url = "https://api.example.com/search?q=hello%20world&q=second&expr=a%2Bb&raw=x%26y%3Dz&uni=caf%C3%A9&tpl={{var}}&b64=abc==&empty=&flag#results";
+        let (cleaned, pairs) = split_url_query(url).unwrap();
+        assert_eq!(cleaned, "https://api.example.com/search#results");
+        assert_eq!(
+            pairs,
+            vec![
+                KeyValue::new("q", "hello world"),
+                KeyValue::new("q", "second"),
+                KeyValue::new("expr", "a+b"),
+                KeyValue::new("raw", "x&y=z"),
+                KeyValue::new("uni", "café"),
+                KeyValue::new("tpl", "{{var}}"),
+                KeyValue::new("b64", "abc=="),
+                KeyValue::new("empty", ""),
+                KeyValue::new("flag", ""),
+            ]
+        );
+
+        let (empty_q_clean, empty_q_pairs) =
+            split_url_query("https://api.example.com/search?#top").unwrap();
+        assert_eq!(empty_q_clean, "https://api.example.com/search#top");
+        assert!(empty_q_pairs.is_empty());
+        assert!(split_url_query("https://api.example.com/page#sec?not=query").is_none());
     }
 }
