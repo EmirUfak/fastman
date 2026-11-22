@@ -2,7 +2,7 @@
 
 **A native, local-first API client for building and sending HTTP requests, written in Rust with GPUI Kit.**
 
-> Status: **v0.2.1**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
+> Status: **v0.3.0**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
 
 ![Fastman desktop workbench](assets/screenshot.png)
 
@@ -23,8 +23,7 @@ Prebuilt binaries are published on [GitHub Releases](https://github.com/EmirUfak
 | Windows x86_64 | Yes | Portable executables; no installer. |
 | Linux, macOS | No | Build from source; see [Platform support](#platform-support). |
 
-- **v0.2.1** ships only the desktop app, as `fastman-desktop-v0.2.1-windows-x86_64.exe`. To get the CLI for this release, build it from source.
-- **Releases from the [release workflow](.github/workflows/release.yml)** ship `fastman-<tag>-x86_64-pc-windows-msvc.zip`. It contains `fastman-desktop.exe`, `fastman-cli.exe`, `LICENSE`, and `README.md`, along with a `.sha256` checksum file.
+- **Releases from the [release workflow](.github/workflows/release.yml) (`v0.3.0+`)** ship `fastman-<tag>-x86_64-pc-windows-msvc.zip`. It contains `fastman-desktop.exe`, `fastman-cli.exe`, `LICENSE`, and `README.md`, along with a `.sha256` checksum file. (`v0.2.1` shipped only the desktop executable.)
 - **The binaries are not code-signed**, so Windows SmartScreen may warn you the first time you run them. You can check the download against the published SHA-256 checksum when one is provided:
 
   ```powershell
@@ -76,33 +75,34 @@ The CLI works only with the default workspace. From a source checkout, run:
 cargo run -p fastman-cli -- --help
 cargo run -p fastman-cli -- list
 cargo run -p fastman-cli -- import-collection ./my_collection.json
-cargo run -p fastman-cli -- send <project-uuid> <request-uuid>
+cargo run -p fastman-cli -- send [--raw] [--env <name-or-id>] <project-uuid> <request-uuid>
 ```
 
 Importing a collection creates a new project and never runs any requests or scripts. If the collection contains secrets, you must pass either `--strip-secrets` or `--allow-plaintext-secrets`. Terminal control characters in output are escaped unless you pass `send --raw`.
 
 ### Where data is stored
 
-Each project is a JSON file (`schema_version = 1`) in the OS local data directory, or in `FASTMAN_HOME` if that is set. `Auth` credentials are kept in memory only and are never written to disk. **Custom headers, query params, bodies, and variable values *are* saved to disk**, so don't put secrets in them. See [SECURITY.md](SECURITY.md#security-model--known-caveats).
+Each project is a JSON file (`schema_version = 1`) in the OS local data directory, or in `FASTMAN_HOME` if that is set. `Auth` credentials are kept in memory only, `Secret` variables are stored in the OS credential store (Windows Credential Manager, macOS Keychain, or Linux `secret-tool`), and `Env` variables read process environment variables at runtime. **Custom headers, query params, bodies, and plain variable values *are* saved to disk**, so don't put secrets in them. See [SECURITY.md](SECURITY.md#security-model--known-caveats).
 
 ## Features
 
 | Area | Desktop | CLI |
 |---|---|---|
-| Workspaces and projects | Create and switch | Default workspace only (`list`) |
-| Explorer | Nested folders, search, context menus, drag-and-drop | — |
-| Request editor | Method, URL with variable highlighting, params, headers, auth, body (JSON validation and formatting), timeout, project variables, per-request TLS verification opt-out | — |
+| Workspaces and projects | Create and switch; project environments and typed `Plain` / `Secret` / `Env` variables | Default workspace only (`list`, `send --env`) |
+| Explorer | Virtualized nested folders, search, context menus, drag-and-drop | — |
+| Request editor | Method, URL with variable highlighting, params, headers, auth, body (JSON validation and formatting), timeout, per-request TLS verification opt-out | — |
 | Request execution | Async, cancellable; same-origin redirects only (max 10); 100–300,000 ms timeout; 2 MiB response cap | `send` |
-| Response viewer | Status, TTFB/download/total timing, size, final URL, searchable pretty or raw body, headers, cookies | Escaped text output |
+| Response viewer | Status, TTFB/download/total timing, size, final URL, searchable pretty or raw body, headers, cookies, persistent panel placement | Status, TTFB/download/total timing, escaped text output |
+| Command palette | `Ctrl+K` / `Cmd+K` fuzzy search across requests, folders, projects, workspaces, environments, and actions | — |
 | Collection v2.1 JSON import (subset) | Yes | `import-collection` |
-| cURL import | Yes | — |
+| cURL import | Yes (file `@path` arguments rejected safely) | — |
 | Copy as cURL (redacted by default) | Yes | — |
 
 ## Current limitations
 
 The following are **not implemented yet**:
 
-- **Requests:** separate environments; OAuth 2.0, Digest, and AWS SigV4 auth; multipart and binary uploads; proxy and client-certificate configuration.
+- **Requests:** OAuth 2.0, Digest, and AWS SigV4 auth; multipart and binary uploads; proxy and client-certificate configuration.
 - **Protocols:** GraphQL tooling, WebSocket, gRPC, and SSE.
 - **Automation:** request tests and assertions. Fastman will never run JavaScript. A collection runner is also missing.
 - **Data:** collection export, request history, and streaming for large responses.

@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-Fastman is currently in pre-1.0 development (`0.2.x`). Security fixes target the latest `0.2.x` release on the default branch.
+Fastman is currently in pre-1.0 development (`0.3.x`). Security fixes target the latest `0.3.x` release on the default branch.
 
 | Version | Supported |
 |---|---|
-| 0.2.x | Yes |
-| < 0.2.0 | No |
+| 0.3.x | Yes |
+| < 0.3.0 | No |
 
 ## Reporting a Vulnerability
 

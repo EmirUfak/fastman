@@ -7,17 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
 ### Added
 - URL template variable highlighting with resolved-value inspection and unresolved-variable warnings.
 - Safe cURL paste with a staged import confirmation that reports unsupported flags.
 - Fuzzy command palette (`Ctrl+K` / `Cmd+K`) and persistent response panel placement.
+- Project environments (base variables plus per-environment overrides) with header and command-palette switching, scoped variable editing, and CLI `--env <name-or-id>`.
+- Typed `Plain`, `Secret` (OS credential store: Windows Credential Manager, macOS Keychain, Linux `secret-tool`), and `Env` variables with masked previews, plaintext draft warnings, and secret redaction across exports and backups.
 - Explicit per-request TLS verification opt-out with visible warnings, and TTFB / download / total response timing in desktop and CLI.
 - Issue template contact link for private vulnerability reports, and a release checklist.
 - Shared Cargo check aliases in `.cargo/config.toml` (`fmt-check`, `test-core`, `lint-core`, `check-all`, `test-all`, `lint-all`) used by local checks, the PR template, and CI.
+- Storage scale and explorer viewport benchmark suites.
 
 ### Changed
+- Desktop project and UI settings saves run off the UI thread via a coalesced background persistence worker.
+- Explorer tree rendering is virtualized over flattened visible rows with zero-allocation ASCII case-insensitive filtering and lazy context-menu target resolution.
 - CI and release builds target Windows; tagged releases publish a Windows x86_64 archive with SHA-256 checksum. CI also checks the declared MSRV (Rust 1.100).
 - README reorganized around download, quick start, platform support, and current limitations; contributing workflow and security reporting process clarified.
+
+### Fixed
+- Coordinated storage `load`, `list_resilient`, and `save` under per-project directory locks with lock-token verification and single-pass recovery.
+- Preserved URL query percent-decoding, literal `+`/`%2B`, empty values, and `#fragment` suffixes across editor extraction, `HttpEngine`, and cURL export.
+- Differentiated cURL data flags (`-d`/`--data`/`--data-ascii`, `--data-raw`, `--data-binary`, `--data-urlencode`) and reported `@file` arguments as unsupported without leaking local paths or reading files.
 
 ## [0.2.1] - 2026-11-21
 
@@ -61,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation & CI**:
   - Architecture, build, testing/benchmarking, security model, schema format, roadmap, and GitHub Actions CI for headless core and CLI.
 
-[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/EmirUfak/fastman/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/EmirUfak/fastman/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/EmirUfak/fastman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/EmirUfak/fastman/releases/tag/v0.1.0
