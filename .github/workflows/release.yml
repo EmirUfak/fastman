@@ -22,6 +22,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "windows-x86_64"
+          cache-on-failure: true
       - name: Format
         run: cargo fmt-check
       - name: Clippy workspace
@@ -55,7 +58,53 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $tagVersion = $tag -replace '^v', ''
           $exeName = "fastman-desktop-$tag-windows-x86_64.exe"
+          $hash = (Get-Content "dist/$exeName.sha256" -Raw).Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0].Trim()
+          $notesFile = "dist/release-notes.md"
+          $hasNotes = $false
+          if (Test-Path "CHANGELOG.md") {
+            $lines = Get-Content "CHANGELOG.md" -Encoding utf8
+            $escaped = [regex]::Escape($tagVersion)
+            $inSection = $false
+            $section = [System.Collections.Generic.List[string]]::new()
+            $compareUrl = $null
+            foreach ($line in $lines) {
+              if (-not $inSection) {
+                if ($line -match "^## \[$escaped\](?:\s|$)") {
+                  $inSection = $true
+                }
+                continue
+              }
+              if ($line -match '^## \[' -or $line -match '^\[[^\]]+\]:\s') {
+                break
+              }
+              $section.Add($line)
+            }
+            foreach ($line in $lines) {
+              if ($line -match "^\[$escaped\]:\s+(\S+)") {
+                $compareUrl = $Matches[1]
+                break
+              }
+            }
+            $body = ($section -join "`n").Trim()
+            if ($body) {
+              $notes = @(
+                $body,
+                "",
+                "### Windows Binary",
+                "Unsigned portable Windows x86_64 executable (Windows SmartScreen may warn on first run).",
+                "",
+                "- ``$exeName`` — SHA-256: ``$hash``"
+              )
+              if ($compareUrl) {
+                $notes += ""
+                $notes += "**Full Changelog**: $compareUrl"
+              }
+              ($notes -join "`n") | Out-File -FilePath $notesFile -Encoding utf8
+              $hasNotes = $true
+            }
+          }
           $ErrorActionPreference = "Continue"
           & gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
@@ -65,9 +114,13 @@ jobs:
               "release", "create", $tag,
               "dist/$exeName",
               "dist/$exeName.sha256",
-              "--title", "Fastman $tag",
-              "--generate-notes"
+              "--title", "Fastman $tag"
             )
+            if ($hasNotes) {
+              $ghArgs += @("--notes-file", $notesFile)
+            } else {
+              $ghArgs += "--generate-notes"
+            }
             if ($tag -match '-') {
               $ghArgs += "--prerelease"
             }

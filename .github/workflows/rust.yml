@@ -3,7 +3,25 @@ name: Rust checks
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/release.yml"
+      - ".github/dependabot.yml"
+      - ".gitignore"
+      - ".gitattributes"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/release.yml"
+      - ".github/dependabot.yml"
+      - ".gitignore"
+      - ".gitattributes"
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
@@ -27,6 +45,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "windows-x86_64"
+          cache-on-failure: true
       - name: Format
         run: cargo fmt-check
       - name: Verify core stays GUI-free
