@@ -40,6 +40,8 @@ pub enum HttpError {
 pub struct HttpResponse {
     pub status: u16,
     pub reason: String,
+    pub ttfb_ms: u128,
+    pub download_ms: u128,
     pub elapsed_ms: u128,
     pub final_url: String,
     pub headers: Vec<(String, String)>,
@@ -121,7 +123,7 @@ pub struct HttpEngine {
 }
 
 impl HttpEngine {
-    pub fn new() -> Result<Self, HttpError> {
+    fn build_client(verify_tls: bool) -> Result<Client, reqwest::Error> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             let Some(initial) = attempt.previous().first() else {
                 return attempt.stop();
@@ -132,7 +134,15 @@ impl HttpEngine {
                 RedirectDecision::TooMany => attempt.error("too many redirects"),
             }
         });
-        let client = Client::builder().referer(false).redirect(policy).build()?;
+        let mut builder = Client::builder().referer(false).redirect(policy);
+        if !verify_tls {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        builder.build()
+    }
+
+    pub fn new() -> Result<Self, HttpError> {
+        let client = Self::build_client(true)?;
         Ok(Self { client })
     }
 
@@ -221,8 +231,14 @@ impl HttpEngine {
 
         let has_content_type = header_map.contains_key(CONTENT_TYPE);
         let timeout = Duration::from_millis(request.timeout_ms.clamp(100, 300_000));
-        let mut builder = self
-            .client
+        let insecure_client;
+        let client = if request.verify_tls {
+            &self.client
+        } else {
+            insecure_client = Self::build_client(false)?;
+            &insecure_client
+        };
+        let mut builder = client
             .request(method, url)
             .timeout(timeout)
             .headers(header_map);
@@ -270,6 +286,10 @@ impl HttpEngine {
         };
         let started = Instant::now();
         let mut response = builder.send().await.map_err(sanitize_reqwest_error)?;
+        let headers_received = Instant::now();
+        let ttfb_ms = headers_received
+            .saturating_duration_since(started)
+            .as_millis();
         let status = response.status();
         let final_url = response.url().to_string();
         let headers = response
@@ -292,6 +312,11 @@ impl HttpEngine {
                 break;
             }
         }
+        let body_finished = Instant::now();
+        let download_ms = body_finished
+            .saturating_duration_since(headers_received)
+            .as_millis();
+        let elapsed_ms = body_finished.saturating_duration_since(started).as_millis();
         let bytes_received = received.len();
         let body = String::from_utf8(received).unwrap_or_else(|e| {
             format!(
@@ -303,7 +328,9 @@ impl HttpEngine {
         Ok(HttpResponse {
             status: status.as_u16(),
             reason: status.canonical_reason().unwrap_or("").to_owned(),
-            elapsed_ms: started.elapsed().as_millis(),
+            ttfb_ms,
+            download_ms,
+            elapsed_ms,
             final_url,
             headers,
             body,
@@ -565,5 +592,125 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "done");
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_timing_splits_ttfb_and_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            conn.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            conn.write_all(b"payload").await.unwrap();
+            conn.flush().await.unwrap();
+        });
+
+        let request = ApiRequest::new("GET", "Timing test", format!("http://{addr}/timed"));
+        let response = HttpEngine::new()
+            .unwrap()
+            .send(&request, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "payload");
+        assert!(response.ttfb_ms >= 20, "ttfb_ms={}", response.ttfb_ms);
+        assert!(
+            response.download_ms >= 20,
+            "download_ms={}",
+            response.download_ms
+        );
+        assert!(response.ttfb_ms <= response.elapsed_ms);
+        assert!(response.download_ms <= response.elapsed_ms);
+        assert!(response.ttfb_ms + response.download_ms <= response.elapsed_ms);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_verify_defaults_strict_and_opt_out_preserves_redirect_policy() {
+        assert!(ApiRequest::new("GET", "Default TLS", "https://example.com").verify_tls);
+        assert!(
+            crate::curl::parse_curl("curl -k https://example.com")
+                .unwrap()
+                .verify_tls
+        );
+
+        let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let tls_task = tokio::spawn(async move {
+            let (mut conn, _) = tls_listener.accept().await.unwrap();
+            let _ = conn.write_all(b"not-tls").await;
+        });
+
+        let strict_req = ApiRequest::new("GET", "Strict TLS", format!("https://{tls_addr}/ping"));
+        assert!(strict_req.verify_tls);
+        let err = HttpEngine::new()
+            .unwrap()
+            .send(&strict_req, &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Transport(_)));
+        tls_task.await.unwrap();
+
+        // Opt-out client still succeeds on plain HTTP and blocks cross-origin redirects.
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_bg = Arc::clone(&target_hits);
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            while let Ok((mut conn, _)) = target.accept().await {
+                target_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf).await;
+                let _ = conn
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut c1, _) = origin.accept().await.unwrap();
+            let mut b1 = [0u8; 4096];
+            let _ = c1.read(&mut b1).await.unwrap();
+            c1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+
+            let (mut c2, _) = origin.accept().await.unwrap();
+            let mut b2 = [0u8; 4096];
+            let _ = c2.read(&mut b2).await.unwrap();
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            c2.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let engine = HttpEngine::new().unwrap();
+        let mut ok_req = ApiRequest::new("GET", "Opt-out ok", format!("http://{origin_addr}/ok"));
+        ok_req.verify_tls = false;
+        let ok_resp = engine.send(&ok_req, &BTreeMap::new()).await.unwrap();
+        assert_eq!(ok_resp.status, 200);
+        assert_eq!(ok_resp.body, "ok");
+
+        let mut redir_req = ApiRequest::new(
+            "GET",
+            "Opt-out redirect",
+            format!("http://{origin_addr}/redirect"),
+        );
+        redir_req.verify_tls = false;
+        let redir_resp = engine.send(&redir_req, &BTreeMap::new()).await.unwrap();
+        assert_eq!(redir_resp.status, 302);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+
+        origin_task.await.unwrap();
+        target_task.abort();
     }
 }

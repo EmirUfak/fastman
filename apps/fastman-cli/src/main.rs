@@ -111,6 +111,9 @@ async fn main() -> Result<()> {
             let request = project
                 .find_request(&request_id)
                 .context("Request not found")?;
+            if !request.verify_tls {
+                eprintln!("Warning: TLS certificate verification is disabled for this request.");
+            }
             let result = HttpEngine::new()?.send(request, &project.variables).await?;
             let body_out = if raw_output {
                 result.body
@@ -118,10 +121,12 @@ async fn main() -> Result<()> {
                 sanitize_terminal_body(&result.body)
             };
             println!(
-                "HTTP {} {} · {} ms · {} bytes{}\n{}",
+                "HTTP {} {} · {} ms (TTFB {} ms · download {} ms) · {} bytes{}\n{}",
                 result.status,
                 sanitize_terminal_line(&result.reason),
                 result.elapsed_ms,
+                result.ttfb_ms,
+                result.download_ms,
                 result.bytes_received,
                 if result.truncated { " (truncated)" } else { "" },
                 body_out

@@ -364,11 +364,24 @@ pub(super) fn format_duration(ms: u128) -> String {
     }
 }
 
+pub(super) fn format_timing_breakdown(
+    ttfb_ms: u128,
+    download_ms: u128,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "TTFB {} · Download {} · Total {}",
+        format_duration(ttfb_ms),
+        format_duration(download_ms),
+        format_duration(elapsed_ms),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PrecomputedResponse {
     status: u16,
     reason: SharedString,
-    elapsed_label: SharedString,
+    timing_label: SharedString,
     size_label: SharedString,
     truncated: bool,
     final_url: SharedString,
@@ -484,7 +497,11 @@ impl ResponseCacheEntry {
             response: Some(PrecomputedResponse {
                 status: response.status,
                 reason: SharedString::from(response.reason),
-                elapsed_label: SharedString::from(format_duration(response.elapsed_ms)),
+                timing_label: SharedString::from(format_timing_breakdown(
+                    response.ttfb_ms,
+                    response.download_ms,
+                    response.elapsed_ms,
+                )),
                 size_label: SharedString::from(format_bytes(response.bytes_received)),
                 truncated: response.truncated,
                 final_url: SharedString::from(response.final_url),
@@ -683,7 +700,7 @@ impl WorkspaceView {
                                 bar.child(status_badge(resp.status, &resp.reason, cx))
                                     .child(meta_pill(
                                         Some("icons/clock.svg"),
-                                        resp.elapsed_label.clone(),
+                                        resp.timing_label.clone(),
                                         cx,
                                     ))
                                     .child(meta_pill(None, resp.size_label.clone(), cx))
@@ -1427,5 +1444,38 @@ mod tests {
         cache.retain(|id| id == "c");
         assert!(cache.get("a").is_none());
         assert!(cache.get("c").is_some());
+    }
+
+    #[::core::prelude::v1::test]
+    fn timing_breakdown_formats_ttfb_download_and_total() {
+        assert_eq!(
+            format_timing_breakdown(42, 8, 50),
+            "TTFB 42 ms · Download 8 ms · Total 50 ms"
+        );
+        assert_eq!(
+            format_timing_breakdown(250, 1250, 1500),
+            "TTFB 250 ms · Download 1.25 s · Total 1.50 s"
+        );
+
+        let entry = ResponseCacheEntry::from_response(
+            HttpResponse {
+                status: 200,
+                reason: "OK".into(),
+                ttfb_ms: 15,
+                download_ms: 5,
+                elapsed_ms: 20,
+                final_url: "https://api.example.com/health".into(),
+                headers: Vec::new(),
+                body: "ok".into(),
+                bytes_received: 2,
+                truncated: false,
+            },
+            SharedString::new_static("GET"),
+            SharedString::new_static("https://api.example.com/health"),
+        );
+        assert_eq!(
+            entry.response.unwrap().timing_label.as_ref(),
+            "TTFB 15 ms · Download 5 ms · Total 20 ms"
+        );
     }
 }

@@ -271,6 +271,7 @@ impl WorkspaceView {
                     || !self.body_kind.is_none()
                     || !self.auth_kind.is_none()
                     || self.timeout.read(cx).value().trim() != "30000"
+                    || !self.verify_tls
             },
             |req| self.non_url_draft_differs_from_saved(req, cx),
         );
@@ -286,6 +287,7 @@ impl WorkspaceView {
             || snap.body != saved.body
             || snap.auth != saved.auth
             || self.timeout.read(cx).value().trim() != saved.timeout_ms.to_string()
+            || snap.verify_tls != saved.verify_tls
     }
 
     fn restore_url_state(
@@ -334,6 +336,9 @@ impl WorkspaceView {
         }
         if self.timeout.read(cx).value().trim() != "30000" {
             items.push("timeout");
+        }
+        if !self.verify_tls {
+            items.push("TLS setting");
         }
         (!items.is_empty()).then(|| {
             format!(

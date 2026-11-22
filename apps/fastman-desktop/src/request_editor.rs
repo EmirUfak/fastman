@@ -14,6 +14,7 @@ use gpui_kit::component::{
     },
     input::{Editor, Input, InputState, InputToken},
     menu::{DropdownMenu as _, PopupMenuItem},
+    switch::Switch,
     tab::{Tab, TabBar},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -123,6 +124,7 @@ pub(super) struct RequestDraft {
     body: HttpBody,
     auth: Auth,
     timeout_ms: u64,
+    verify_tls: bool,
 }
 
 impl RequestDraft {
@@ -137,6 +139,7 @@ impl RequestDraft {
         request.body = self.body;
         request.auth = self.auth;
         request.timeout_ms = self.timeout_ms;
+        request.verify_tls = self.verify_tls;
     }
 }
 
@@ -178,6 +181,7 @@ impl WorkspaceView {
         req.body = body;
         req.auth = auth;
         req.timeout_ms = timeout_ms;
+        req.verify_tls = self.verify_tls;
         req
     }
 
@@ -199,6 +203,7 @@ impl WorkspaceView {
             body: snap.body,
             auth: snap.auth,
             timeout_ms,
+            verify_tls: snap.verify_tls,
         })
     }
 
@@ -552,7 +557,35 @@ impl WorkspaceView {
                                     .child(pill_label),
                             )
                         },
-                    ),
+                    )
+                    .when(!self.verify_tls, |el| {
+                        let warn = cx.theme().warning;
+                        el.child(
+                            div()
+                                .id("url-tls-disabled-badge")
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .mr_1()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(warn.opacity(0.45))
+                                .bg(warn.opacity(0.16))
+                                .text_color(warn)
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.section = 5;
+                                    cx.notify();
+                                }))
+                                .child(svg_icon("icons/triangle-alert.svg").xsmall())
+                                .child("TLS off"),
+                        )
+                    }),
             )
             .child(if in_flight {
                 Button::new("cancel")
@@ -688,7 +721,10 @@ impl WorkspaceView {
                     .child(
                         Tab::new()
                             .prefix(tab_icon("icons/settings.svg"))
-                            .label("Settings"),
+                            .label("Settings")
+                            .when(!self.verify_tls, |t| {
+                                t.suffix(dot_indicator(cx.theme().warning))
+                            }),
                     ),
             );
 
@@ -1256,18 +1292,70 @@ impl WorkspaceView {
                                 .flex()
                                 .items_center()
                                 .justify_between()
+                                .gap_3()
                                 .text_size(px(12.))
-                                .child(div().text_color(muted_fg).child("TLS Certificate Verification"))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child("TLS Certificate Verification"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(muted_fg)
+                                                .child(if self.verify_tls {
+                                                    "Verify server TLS certificates (recommended)."
+                                                } else {
+                                                    "Disabled for this request — dev/local self-signed certs only."
+                                                }),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_1()
-                                        .text_color(cx.theme().success)
-                                        .child(svg_icon("icons/shield-check.svg").xsmall())
-                                        .child("Enabled"),
+                                        .gap_2p5()
+                                        .flex_shrink_0()
+                                        .child(if self.verify_tls {
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_color(cx.theme().success)
+                                                .child(svg_icon("icons/shield-check.svg").xsmall())
+                                                .child("Enabled")
+                                        } else {
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_color(cx.theme().warning)
+                                                .child(svg_icon("icons/triangle-alert.svg").xsmall())
+                                                .child("Disabled")
+                                        })
+                                        .child(
+                                            Switch::new("request-verify-tls")
+                                                .checked(self.verify_tls)
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.toggle_verify_tls(cx);
+                                                })),
+                                        ),
                                 ),
                         )
+                        .when(!self.verify_tls, |el| {
+                            el.child(
+                                Alert::warning(
+                                    "tls-disabled-warning",
+                                    "TLS certificate verification is disabled for this request. Use only for local development or self-signed certificates—never against production endpoints or untrusted networks.",
+                                )
+                                .title("Insecure TLS (Dev Only)"),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()

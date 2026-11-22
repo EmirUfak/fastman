@@ -73,12 +73,18 @@ pub struct ApiRequest {
     pub body: HttpBody,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub verify_tls: bool,
     #[serde(skip)]
     pub auth: Auth,
 }
 
 fn default_timeout() -> u64 {
     30_000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ApiRequest {
@@ -92,6 +98,7 @@ impl ApiRequest {
             headers: vec![],
             body: HttpBody::None,
             timeout_ms: default_timeout(),
+            verify_tls: default_true(),
             auth: Auth::None,
         }
     }
@@ -1012,5 +1019,25 @@ mod tests {
 
         assert!(project.delete_collection(&first_id));
         assert_eq!(project.collections.len(), 1);
+    }
+
+    #[test]
+    fn verify_tls_defaults_true_for_new_and_legacy_json_and_roundtrips_false() {
+        let mut req = ApiRequest::new("GET", "TLS", "https://example.com");
+        assert!(req.verify_tls);
+
+        let legacy_json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "Legacy",
+            "method": "GET",
+            "url": "https://example.com"
+        }"#;
+        let legacy: ApiRequest = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.verify_tls);
+
+        req.verify_tls = false;
+        let serialized = serde_json::to_string(&req).unwrap();
+        let roundtrip: ApiRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(!roundtrip.verify_tls);
     }
 }

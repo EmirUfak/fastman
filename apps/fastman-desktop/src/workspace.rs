@@ -160,6 +160,7 @@ pub struct WorkspaceView {
     pub(super) method: String,
     pub(super) body_kind: BodyKind,
     pub(super) auth_kind: AuthKind,
+    pub(super) verify_tls: bool,
     pub(super) section: usize,
     pub(super) url: Entity<InputState>,
     pub(super) request_name: Entity<InputState>,
@@ -378,6 +379,7 @@ impl WorkspaceView {
             method: "GET".into(),
             body_kind: BodyKind::None,
             auth_kind: AuthKind::None,
+            verify_tls: true,
             section: 0,
             url,
             request_name,
@@ -457,6 +459,11 @@ impl WorkspaceView {
         }
         self.refresh_template_inspection(cx);
         cx.notify();
+    }
+
+    pub(super) fn toggle_verify_tls(&mut self, cx: &mut Context<Self>) {
+        self.verify_tls = !self.verify_tls;
+        self.mark_dirty(cx);
     }
 
     pub(super) fn refresh_template_inspection(&mut self, cx: &mut Context<Self>) {
@@ -762,6 +769,7 @@ impl WorkspaceView {
             }
         };
         Self::set_input(&self.timeout, request.timeout_ms.to_string(), window, cx);
+        self.verify_tls = request.verify_tls;
         self.auth_kind = AuthKind::from_auth(&request.auth);
         for field in [
             &self.auth_user,
@@ -797,6 +805,7 @@ impl WorkspaceView {
             self.method = "GET".into();
             self.auth_kind = AuthKind::None;
             self.body_kind = BodyKind::None;
+            self.verify_tls = true;
             self.last_url.clear();
             for field in [
                 &self.url,
@@ -2150,6 +2159,30 @@ impl Render for WorkspaceView {
                     .items_center()
                     .gap_3()
                     .flex_shrink_0()
+                    .when(self.selected_id.is_some() && !self.verify_tls, |row| {
+                        let warn = cx.theme().warning;
+                        row.child(
+                            div()
+                                .id("status-tls-warning")
+                                .cursor_pointer()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(warn.opacity(0.16))
+                                .text_color(warn)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.section = 5;
+                                    cx.notify();
+                                }))
+                                .child(svg_icon("icons/triangle-alert.svg").xsmall())
+                                .child("TLS verification off (dev)"),
+                        )
+                    })
                     .child(format!("{req_count} requests · {var_count} variables"))
                     .child(
                         div()
@@ -2923,6 +2956,80 @@ mod tests {
                     .map(|p| p.row),
                 Some(target_proj_idx)
             );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_tls_defaults_true_and_persists_through_draft_and_reload() {
+        run_view_test(check_verify_tls_persistence);
+    }
+
+    fn check_verify_tls_persistence() {
+        let mut cx = TestAppContext::single();
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(root.path());
+        seed_request(&store);
+        cx.update(gpui_kit::init);
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        let (project_id, request_id) = cx
+            .update_window(window, |_, _, cx| {
+                view.update(cx, |view, cx| {
+                    assert!(view.verify_tls);
+                    assert!(!view.dirty);
+
+                    view.toggle_verify_tls(cx);
+                    assert!(!view.verify_tls);
+                    assert!(view.dirty);
+                    assert!(!view.snapshot_draft_request(cx).verify_tls);
+
+                    view.save(cx).unwrap();
+                    assert!(!view.dirty);
+
+                    let project_id = view.current().id.clone();
+                    let request_id = view.selected_id.clone().unwrap();
+                    (project_id, request_id)
+                })
+            })
+            .unwrap();
+
+        let disk_project = store.load(&project_id).unwrap();
+        assert!(!disk_project.find_request(&request_id).unwrap().verify_tls);
+
+        let (window2, view2) = cx
+            .update(|cx| {
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                })
+            })
+            .unwrap();
+
+        cx.update_window(window2, |_, window, cx| {
+            view2.update(cx, |view, cx| {
+                assert!(!view.verify_tls);
+                view.url.update(cx, |input, cx| {
+                    input.replace_all("curl -k https://example.com/secure", window, cx);
+                });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window2, |_, _, cx| {
+            let v = view2.read(cx);
+            let confirm = v
+                .active_curl_confirm
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .expect("curl -k should stage confirmation");
+            assert_eq!(confirm.read(cx).report.unsupported_flags, vec!["-k"]);
+            assert!(confirm.read(cx).report.request.verify_tls);
         })
         .unwrap();
     }

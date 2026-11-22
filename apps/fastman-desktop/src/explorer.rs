@@ -392,10 +392,10 @@ impl WorkspaceView {
         requests: &[ApiRequest],
         depth: f32,
         ancestors: &[String],
-        query: &str,
         cx: &mut Context<Self>,
         out: &mut Vec<AnyElement>,
     ) {
+        let query = self.explorer_filter_lower.as_str();
         for folder in folders {
             self.render_folder(folder, depth, ancestors, query, cx, out);
         }
@@ -416,7 +416,6 @@ impl WorkspaceView {
                     &collection.requests,
                     0.,
                     &[],
-                    query,
                     cx,
                     &mut out,
                 );
@@ -599,7 +598,6 @@ impl WorkspaceView {
                     &collection.requests,
                     1.,
                     &[],
-                    query,
                     cx,
                     &mut out,
                 );
@@ -954,7 +952,6 @@ impl WorkspaceView {
                 &folder.requests,
                 depth + 1.,
                 &next_ancestors,
-                query,
                 cx,
                 out,
             );
