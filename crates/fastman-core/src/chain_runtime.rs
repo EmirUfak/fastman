@@ -14,7 +14,7 @@ struct RunCapture {
     captured: CapturedValue,
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainRunError {
     #[error("selected environment does not exist in this project")]
     UnknownEnvironment,

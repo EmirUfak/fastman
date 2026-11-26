@@ -13,7 +13,7 @@ pub struct CapturedValue {
     pub sensitive: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CaptureFailure {
     #[error(transparent)]
     Assertion(#[from] AssertionFailure),
@@ -26,7 +26,7 @@ pub enum CaptureFailure {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CaptureError {
     #[error("required value is missing")]
     MissingValue,

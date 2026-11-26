@@ -160,12 +160,14 @@ impl HttpEngine {
         verify_tls: bool,
         session: Option<&ChainSession>,
     ) -> Result<Client, reqwest::Error> {
-        let policy = reqwest::redirect::Policy::custom(|attempt| {
+        let chain = session.is_some();
+        let policy = reqwest::redirect::Policy::custom(move |attempt| {
             let Some(initial) = attempt.previous().first() else {
                 return attempt.stop();
             };
             match evaluate_redirect(initial, attempt.url(), attempt.previous().len()) {
                 RedirectDecision::Follow => attempt.follow(),
+                RedirectDecision::Stop if chain => attempt.error("blocked chain redirect"),
                 RedirectDecision::Stop => attempt.stop(),
                 RedirectDecision::TooMany => attempt.error("too many redirects"),
             }
@@ -998,21 +1000,16 @@ mod tests {
             };
             request.body = HttpBody::Text("secret-body".into());
 
-            let response = HttpEngine::for_chain(
+            let error = HttpEngine::for_chain(
                 &format!("http://{origin_addr}"),
                 &[format!("http://{target_addr}")],
             )
             .unwrap()
             .send(&request, &BTreeMap::new())
             .await
-            .unwrap();
+            .unwrap_err();
 
-            assert_eq!(response.status, status);
-            assert!(
-                response
-                    .final_url
-                    .starts_with(&format!("http://{origin_addr}"))
-            );
+            assert!(matches!(error, HttpError::Transport(error) if error.is_redirect()));
             assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 
             origin_task.await.unwrap();

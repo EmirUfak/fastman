@@ -1,11 +1,17 @@
 use crate::captures::{MAX_CAPTURE_NAME_BYTES, MAX_CAPTURES};
 use crate::security::is_valid_http_method;
 use crate::template::inspect_request;
-use crate::{ChainRunContext, ChainRunError, HttpEngine, Project, SecretStore};
+use crate::{
+    CaptureFailure, ChainRunContext, ChainRunError, HttpEngine, HttpError, Project, SecretStore,
+};
 use std::collections::BTreeSet;
+use std::future::{Future, pending};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::{Instant, sleep_until};
 
-const MAX_CHAIN_STEPS: usize = 128;
+pub const MAX_CHAIN_STEPS: usize = 128;
+const MAX_RUN_TIME: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
 pub enum ChainExecutionError {
@@ -21,13 +27,51 @@ pub enum ChainExecutionError {
     Session,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainStepOutcome {
     Passed { status: u16 },
     RequestFailed,
     CheckFailed(ChainRunError),
     Disabled,
     Skipped,
+}
+
+pub struct ChainRunOptions<'a> {
+    pub primary_origin: &'a str,
+    pub trusted_origins: &'a [String],
+    /// Budget for the whole run, capped at five minutes. Zero expires immediately.
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainFailure {
+    Transport,
+    Assertion,
+    Capture,
+    Policy,
+    RequestTimeout,
+    RunTimeout,
+    Cancelled,
+}
+
+/// Metadata-only preview. Server-controlled text is always withheld, including
+/// previously unknown credentials in response bodies and headers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChainResponsePreview {
+    pub status: u16,
+    pub bytes_received: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainStepReport {
+    pub outcome: ChainStepOutcome,
+    pub failure: Option<ChainFailure>,
+    pub elapsed: Duration,
+    pub response: Option<ChainResponsePreview>,
+    /// Indices into the step's configured capture rules. No values are retained.
+    pub captures: Vec<usize>,
 }
 
 /// Execute a project chain in definition order. Outcomes align with step indices.
@@ -41,6 +85,60 @@ pub async fn run_chain(
     primary_origin: &str,
     trusted_origins: &[String],
 ) -> Result<Vec<ChainStepOutcome>, ChainExecutionError> {
+    Ok(run_chain_with_report(
+        project,
+        chain_id,
+        env_id,
+        secret_store,
+        ChainRunOptions {
+            primary_origin,
+            trusted_origins,
+            timeout: MAX_RUN_TIME,
+        },
+        pending(),
+    )
+    .await?
+    .into_iter()
+    .map(|step| step.outcome)
+    .collect())
+}
+
+/// Outcomes align with definition indices. Resolving `cancel` stops the active
+/// request and skips subsequent enabled steps. Dropping the run future also
+/// releases its session. Neither action can undo server-side effects.
+pub async fn run_chain_with_report(
+    project: &Project,
+    chain_id: &str,
+    env_id: Option<&str>,
+    secret_store: &dyn SecretStore,
+    options: ChainRunOptions<'_>,
+    cancel: impl Future<Output = ()>,
+) -> Result<Vec<ChainStepReport>, ChainExecutionError> {
+    run_chain_with_progress(
+        project,
+        chain_id,
+        env_id,
+        secret_store,
+        options,
+        cancel,
+        |_| {},
+    )
+    .await
+}
+
+/// Report each finished step in order, including disabled and skipped steps.
+pub async fn run_chain_with_progress(
+    project: &Project,
+    chain_id: &str,
+    env_id: Option<&str>,
+    secret_store: &dyn SecretStore,
+    options: ChainRunOptions<'_>,
+    cancel: impl Future<Output = ()>,
+    mut progress: impl FnMut(&ChainStepReport),
+) -> Result<Vec<ChainStepReport>, ChainExecutionError> {
+    let deadline = Instant::now() + options.timeout.min(MAX_RUN_TIME);
+    let deadline_timer = sleep_until(deadline);
+    tokio::pin!(cancel, deadline_timer);
     let mut matches = project.chains.iter().filter(|chain| chain.id == chain_id);
     let chain = matches.next().ok_or(ChainExecutionError::UnknownChain)?;
     if matches.next().is_some() {
@@ -50,7 +148,7 @@ pub async fn run_chain(
         return Err(ChainExecutionError::InvalidLength);
     }
     let mut context = ChainRunContext::new(project, env_id, secret_store)?;
-    let engine = HttpEngine::for_chain(primary_origin, trusted_origins)
+    let engine = HttpEngine::for_chain(options.primary_origin, options.trusted_origins)
         .map_err(|_| ChainExecutionError::Session)?;
     let mut available = context.resolved_variables().values;
     let mut step_ids = BTreeSet::new();
@@ -80,7 +178,11 @@ pub async fn run_chain(
         let url = engine
             .resolve_url(request, &available, &Default::default())
             .map_err(|_| invalid("invalid or unapproved request destination"))?;
-        plan.push((step.clone(), request.clone(), Some(url.origin())));
+        plan.push((
+            step.clone(),
+            request.clone(),
+            Some(url.origin().ascii_serialization()),
+        ));
         let mut names = BTreeSet::new();
         for rule in &step.captures {
             if rule.name.is_empty()
@@ -105,34 +207,111 @@ pub async fn run_chain(
     let mut stopped = false;
     let mut outcomes = Vec::with_capacity(plan.len());
     for (step, request, origin) in plan {
+        let started = Instant::now();
+        let mut failure = None;
+        let mut preview = None;
+        let mut captures = Vec::new();
         let outcome = match origin {
             None => ChainStepOutcome::Disabled,
             Some(_) if stopped => ChainStepOutcome::Skipped,
             Some(origin) => {
-                let resolved = context.resolved_variables();
-                match engine.resolve_url(&request, &resolved.values, &resolved.unresolved_secrets) {
-                    Ok(url) if url.origin() == origin => {
-                        match engine.send_with_secrets(&request, &resolved).await {
-                            Ok(response) => match context.apply_step_response(&step, &response) {
-                                Ok(()) => ChainStepOutcome::Passed {
+                let send = async {
+                    if Instant::now() >= deadline {
+                        return Err(ChainFailure::RunTimeout);
+                    }
+                    send_step(&engine, &context, &request, &origin).await
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = &mut cancel => Err(ChainFailure::Cancelled),
+                    () = &mut deadline_timer => Err(ChainFailure::RunTimeout),
+                    result = send => result,
+                };
+                match result {
+                    Ok(response) => {
+                        preview = Some(ChainResponsePreview {
+                            status: response.status,
+                            bytes_received: response.bytes_received,
+                            truncated: response.truncated,
+                        });
+                        let checked = context.apply_step_response(&step, &response);
+                        match checked {
+                            _ if Instant::now() >= deadline => {
+                                failure = Some(ChainFailure::RunTimeout);
+                                ChainStepOutcome::RequestFailed
+                            }
+                            Ok(()) => {
+                                captures.extend(step.captures.iter().enumerate().filter_map(
+                                    |(index, rule)| {
+                                        (context.capture_origin(&rule.name)
+                                            == Some(step.id.as_str()))
+                                        .then_some(index)
+                                    },
+                                ));
+                                ChainStepOutcome::Passed {
                                     status: response.status,
-                                },
-                                Err(error) => ChainStepOutcome::CheckFailed(error),
-                            },
-                            Err(_) => ChainStepOutcome::RequestFailed,
+                                }
+                            }
+                            Err(error) => {
+                                failure = Some(match &error {
+                                    ChainRunError::Capture(CaptureFailure::Assertion(_)) => {
+                                        ChainFailure::Assertion
+                                    }
+                                    _ => ChainFailure::Capture,
+                                });
+                                ChainStepOutcome::CheckFailed(error)
+                            }
                         }
                     }
-                    _ => ChainStepOutcome::RequestFailed,
+                    Err(reason) => {
+                        failure = Some(reason);
+                        ChainStepOutcome::RequestFailed
+                    }
                 }
             }
         };
-        stopped |= matches!(
+        stopped |= failure.is_some();
+        let report = ChainStepReport {
+            elapsed: if matches!(
+                outcome,
+                ChainStepOutcome::Disabled | ChainStepOutcome::Skipped
+            ) {
+                Duration::ZERO
+            } else {
+                started.elapsed()
+            },
             outcome,
-            ChainStepOutcome::CheckFailed(_) | ChainStepOutcome::RequestFailed
-        );
-        outcomes.push(outcome);
+            failure,
+            response: preview,
+            captures,
+        };
+        progress(&report);
+        outcomes.push(report);
     }
     Ok(outcomes)
+}
+
+async fn send_step(
+    engine: &HttpEngine,
+    context: &ChainRunContext,
+    request: &crate::ApiRequest,
+    origin: &str,
+) -> Result<crate::HttpResponse, ChainFailure> {
+    let resolved = context.resolved_variables();
+    let url = engine
+        .resolve_url(request, &resolved.values, &resolved.unresolved_secrets)
+        .map_err(|_| ChainFailure::Policy)?;
+    if url.origin().ascii_serialization() != origin {
+        return Err(ChainFailure::Policy);
+    }
+    engine
+        .send_with_secrets(request, &resolved)
+        .await
+        .map_err(|error| match error {
+            HttpError::Transport(error) if error.is_timeout() => ChainFailure::RequestTimeout,
+            HttpError::Transport(error) if !error.is_redirect() => ChainFailure::Transport,
+            _ => ChainFailure::Policy,
+        })
 }
 
 #[cfg(test)]
@@ -144,6 +323,134 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn two_step_project(origin: &str, timeout_ms: u64) -> Project {
+        let mut project = Project::new("API");
+        let mut request =
+            ApiRequest::new("GET", "Fixture", format!("{origin}/?key=fixture-secret"));
+        request.timeout_ms = timeout_ms;
+        let steps = (0..2)
+            .map(|index| ChainStep {
+                id: index.to_string(),
+                request_id: request.id.clone(),
+                enabled: true,
+                assertions: vec![],
+                captures: vec![],
+            })
+            .collect();
+        project.collections[0].requests.push(request);
+        project.chains.push(RequestChain {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            steps,
+        });
+        project
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadlines_close_the_active_response_and_skip_the_next_step() {
+        for (expected, timeout_ms, budget) in [
+            (ChainFailure::Cancelled, 5_000, Duration::from_secs(5)),
+            (ChainFailure::RunTimeout, 5_000, Duration::from_millis(250)),
+            (ChainFailure::RequestTimeout, 250, Duration::from_secs(5)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let project = two_step_project(&origin, timeout_ms);
+            let (sent, received) = tokio::sync::oneshot::channel();
+            let server = async {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(conn.read_u8().await.unwrap());
+                }
+                conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nfixture-secret")
+                    .await
+                    .unwrap();
+                sent.send(()).unwrap();
+                assert_eq!(conn.read(&mut [0]).await.unwrap(), 0);
+            };
+            let cancel_run = expected == ChainFailure::Cancelled;
+            let cancel = async {
+                received.await.unwrap();
+                if !cancel_run {
+                    pending::<()>().await;
+                }
+            };
+            let store = MemorySecretStore::new();
+            let run = run_chain_with_report(
+                &project,
+                "fixture",
+                None,
+                &store,
+                ChainRunOptions {
+                    primary_origin: &origin,
+                    trusted_origins: &[],
+                    timeout: budget,
+                },
+                cancel,
+            );
+            let (report, ()) =
+                tokio::time::timeout(Duration::from_secs(6), async { tokio::join!(run, server) })
+                    .await
+                    .unwrap();
+            let report = report.unwrap();
+            assert!(!format!("{report:?}").contains("fixture-secret"));
+            assert_eq!(report[0].failure, Some(expected));
+            assert_eq!(report[1].outcome, ChainStepOutcome::Skipped);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_response_keeps_only_metadata_after_partial_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut project = two_step_project(&origin, 5_000);
+        project.chains[0].steps[1]
+            .assertions
+            .push(AssertionRule::Status { expected: 204 });
+        let server = tokio::spawn(async move {
+            for body in [String::new(), "fixture-secret".repeat(200_000)] {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(conn.read_u8().await.unwrap());
+                }
+                conn.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nSet-Cookie: token=fixture-secret\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+                // The client may close as soon as it reaches the response cap.
+                let _ = conn.write_all(body.as_bytes()).await;
+            }
+        });
+        let report = run_chain_with_report(
+            &project,
+            "fixture",
+            None,
+            &MemorySecretStore::new(),
+            ChainRunOptions {
+                primary_origin: &origin,
+                trusted_origins: &[],
+                timeout: Duration::from_secs(5),
+            },
+            pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report[0].outcome, ChainStepOutcome::Passed { status: 200 });
+        assert_eq!(report[1].failure, Some(ChainFailure::Assertion));
+        assert_eq!(
+            report[1].response,
+            Some(ChainResponsePreview {
+                status: 200,
+                bytes_received: 2 * 1024 * 1024,
+                truncated: true,
+            })
+        );
+        assert!(!format!("{report:?}").contains("fixture-secret"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn validates_then_runs_in_order_and_stops_on_failed_assertion() {

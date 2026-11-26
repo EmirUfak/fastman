@@ -281,6 +281,7 @@ impl WorkspaceView {
                     ),
             )
             .child(div().h(px(1.)).bg(border))
+            .child(crate::chain_sheet::explorer_button(self, cx))
             .child({
                 let header_view = cx.weak_entity();
                 div()

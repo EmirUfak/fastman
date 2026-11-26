@@ -2087,6 +2087,9 @@ impl WorkspaceView {
     }
 
     fn delete_request_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chain_blocks_delete(|request_id| request_id == id, window, cx) {
+            return;
+        }
         if self.selected_id.as_deref() == Some(id) {
             self.cancel(cx);
         } else if self.editor_dirty
@@ -2192,6 +2195,15 @@ impl WorkspaceView {
     }
 
     fn delete_folder_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(folder) = self.current().find_folder(id)
+            && self.chain_blocks_delete(
+                |request_id| folder.find_request(request_id).is_some(),
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         if self.projects[self.active_project].delete_folder(id) {
             self.reconcile_after_container_delete("Folder deleted", window, cx);
         }
@@ -2224,13 +2236,115 @@ impl WorkspaceView {
     }
 
     fn delete_collection_now(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(collection) = self.current().find_collection(id)
+            && self.chain_blocks_delete(
+                |request_id| collection.find_request(request_id).is_some(),
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         if self.projects[self.active_project].delete_collection(id) {
             self.reconcile_after_container_delete("Collection deleted", window, cx);
         }
     }
 
+    fn chain_blocks_delete(
+        &self,
+        removes_request: impl Fn(&str) -> bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(chain) = self.current().chains.iter().find(|chain| {
+            chain
+                .steps
+                .iter()
+                .any(|step| removes_request(&step.request_id))
+        }) else {
+            return false;
+        };
+        window.push_notification(
+            Notification::error(format!(
+                "Remove the referenced step from chain “{}” first.",
+                chain.name
+            )),
+            cx,
+        );
+        true
+    }
+
     pub(super) fn open_variables_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         crate::variables_sheet::open_variables_sheet(self, window, cx);
+    }
+
+    pub(super) fn save_chain_definition(
+        &mut self,
+        project_id: &str,
+        chain_id: &str,
+        chain: Option<fastman_core::RequestChain>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.current().id == project_id,
+            "The active project changed"
+        );
+        if self.editor_dirty {
+            self.apply_editor(cx)
+                .context("Apply the current request editor")?;
+        }
+        let project = &mut self.projects[self.active_project];
+        if let Some(chain) = chain {
+            anyhow::ensure!(
+                chain
+                    .steps
+                    .iter()
+                    .all(|step| project.find_request(&step.request_id).is_some()),
+                "A step references a missing request"
+            );
+            if let Some(existing) = project.chains.iter_mut().find(|item| item.id == chain_id) {
+                *existing = chain;
+            } else {
+                project.chains.push(chain);
+            }
+        } else {
+            project.chains.retain(|item| item.id != chain_id);
+        }
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        self.bump_project_revision(project_id);
+        self.sync_dirty();
+        self.save(Some(window), cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub(super) fn chain_run_snapshot(
+        &mut self,
+        project_id: &str,
+        chain: fastman_core::RequestChain,
+        cx: &mut Context<Self>,
+    ) -> Result<(Project, Arc<dyn SecretStore>, tokio::runtime::Handle)> {
+        anyhow::ensure!(
+            self.current().id == project_id,
+            "The active project changed"
+        );
+        if self.editor_dirty {
+            self.apply_editor(cx)
+                .context("Apply the current request editor")?;
+        }
+        self.ensure_http_runtime()?;
+        let mut project = self.current().clone();
+        project.chains = vec![chain];
+        Ok((
+            project,
+            Arc::clone(&self.secret_store),
+            self.runtime
+                .as_ref()
+                .expect("runtime initialized")
+                .handle()
+                .clone(),
+        ))
     }
 
     pub(super) fn save_variables_and_environments(
@@ -3131,6 +3245,75 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn chain_edits_persist_and_referenced_requests_cannot_be_deleted() {
+        run_view_test(|| {
+            let root = tempfile::tempdir().unwrap();
+            let store = ProjectStore::at(root.path());
+            seed_request(&store);
+            let mut cx = TestAppContext::single();
+            cx.update(gpui_kit::init);
+            let (window, view) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                        cx.new(|cx| WorkspaceView::with_store(store.clone(), window, cx).unwrap())
+                    })
+                })
+                .unwrap();
+            let (project_id, mut chain) = cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        let project_id = view.current().id.clone();
+                        let request = view.current().first_request_id().unwrap();
+                        let mut chain = fastman_core::RequestChain::new("Workflow");
+                        chain.steps.push(fastman_core::ChainStep::new(&request));
+                        view.save_chain_definition(
+                            &project_id,
+                            &chain.id,
+                            Some(chain.clone()),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                        view.delete_request_now(&request, window, cx);
+                        assert!(view.current().find_request(&request).is_some());
+                        (project_id, chain)
+                    })
+                })
+                .unwrap();
+            drain_persistence(&mut cx, &view);
+            assert_eq!(store.load(&project_id).unwrap().chains, [chain.clone()]);
+
+            chain.name = "Updated workflow".into();
+            chain.steps[0].enabled = false;
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.save_chain_definition(
+                        &project_id,
+                        &chain.id,
+                        Some(chain.clone()),
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                })
+            })
+            .unwrap();
+            drain_persistence(&mut cx, &view);
+            assert_eq!(store.load(&project_id).unwrap().chains, [chain.clone()]);
+
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.save_chain_definition(&project_id, &chain.id, None, window, cx)
+                        .unwrap();
+                })
+            })
+            .unwrap();
+            drain_persistence(&mut cx, &view);
+            assert!(store.load(&project_id).unwrap().chains.is_empty());
+        });
     }
 
     fn run_view_test(test: fn()) {

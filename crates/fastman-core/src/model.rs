@@ -319,6 +319,16 @@ pub struct RequestChain {
     pub steps: Vec<ChainStep>,
 }
 
+impl RequestChain {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            name: name.into(),
+            steps: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainStep {
     pub id: String,
@@ -329,6 +339,18 @@ pub struct ChainStep {
     pub assertions: Vec<AssertionRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<CaptureRule>,
+}
+
+impl ChainStep {
+    pub fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            request_id: request_id.into(),
+            enabled: true,
+            assertions: Vec::new(),
+            captures: Vec::new(),
+        }
+    }
 }
 
 /// A named value to extract from a response after assertions pass.

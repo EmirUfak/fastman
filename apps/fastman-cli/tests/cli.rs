@@ -1,10 +1,149 @@
-use fastman_core::{ApiRequest, Environment, KeyValue, ProjectStore, SecretRef};
+use fastman_core::{
+    ApiRequest, AssertionRule, CaptureRule, CaptureSource, ChainStep, Environment, KeyValue,
+    ProjectStore, RequestChain, SecretRef,
+};
 use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
     process::Command,
 };
+
+#[test]
+fn chain_exit_codes_environment_and_redacted_summaries() {
+    let home = tempfile::tempdir().unwrap();
+    let root_store = ProjectStore::at(home.path());
+    let workspace = root_store.create_workspace("CI").unwrap();
+    let store = root_store.for_workspace(&workspace.id).unwrap();
+    let mut project = store.create("Chain fixture").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let secret = "chain-canary-secret";
+    let mut environment = Environment::new("staging");
+    environment
+        .variables
+        .insert("stage".into(), "staging".into());
+    environment.secret_variables.insert(
+        "key".into(),
+        SecretRef::Env {
+            var: "FASTMAN_TEST_CHAIN_KEY".into(),
+        },
+    );
+    project.environments.push(environment);
+    let mut request = ApiRequest::new("GET", "Fixture", format!("{origin}/{{{{stage}}}}"));
+    request.headers.push(KeyValue::new("X-Api-Key", "{{key}}"));
+    request.timeout_ms = 1000;
+    let step = ChainStep::new(&request.id);
+    project.collections[0].requests.push(request);
+    let mut passing = RequestChain::new("Passing");
+    passing.steps.push(step.clone());
+    let mut asserting = RequestChain::new("Assertion failure");
+    let mut assertion_step = step.clone();
+    assertion_step
+        .assertions
+        .push(AssertionRule::Status { expected: 204 });
+    asserting
+        .steps
+        .extend([assertion_step, ChainStep::new(&step.request_id)]);
+    let mut capturing = RequestChain::new("Capture failure");
+    let mut capture_step = step.clone();
+    capture_step.captures.push(CaptureRule {
+        name: "missing".into(),
+        source: CaptureSource::Header {
+            name: "X-Missing".into(),
+        },
+        required: true,
+        sensitive: true,
+    });
+    capturing.steps.push(capture_step);
+    project
+        .chains
+        .extend([passing.clone(), asserting.clone(), capturing.clone()]);
+    store.save(&project).unwrap();
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        for should_respond in [true, true, true, false] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "missing fixture connection"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /staging HTTP/"));
+            assert!(request.contains(&format!("x-api-key: {secret}\r\n")));
+            if should_respond {
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nSet-Cookie: token={secret}\r\nContent-Length: {}\r\n\r\n{secret}", secret.len()).unwrap();
+            }
+        }
+    });
+    let run = |chain_id: &str, env: &str, additional: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_fastman-cli"))
+            .env("FASTMAN_HOME", home.path())
+            .env("FASTMAN_TEST_CHAIN_KEY", secret)
+            .args([
+                "chain",
+                "run",
+                "--workspace",
+                &workspace.id,
+                "--project",
+                &project.id,
+                "--chain",
+                chain_id,
+                "--origin",
+                &origin,
+                "--env",
+                env,
+            ])
+            .args(additional)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        output
+    };
+    let passed = run(&passing.id, "staging", &[]);
+    assert_eq!(passed.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&passed.stdout).contains("Step 1: passed"));
+    let failed = run(&asserting.id, "staging", &["--json"]);
+    assert_eq!(failed.status.code(), Some(4));
+    let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(report["steps"][0]["failure"], "assertion");
+    assert_eq!(report["steps"][1]["state"], "skipped");
+    assert_eq!(run(&capturing.id, "staging", &[]).status.code(), Some(5));
+    assert_eq!(run(&passing.id, "staging", &[]).status.code(), Some(3));
+    assert_eq!(run(&passing.id, "missing", &[]).status.code(), Some(2));
+    server.join().unwrap();
+
+    let file = store.root().join(&project.id).join("project.json");
+    assert!(!fs::read_to_string(&file).unwrap().contains(secret));
+    let mut broken = project.clone();
+    broken.chains[0].steps[0].request_id = "missing".into();
+    fs::write(file, serde_json::to_vec(&broken).unwrap()).unwrap();
+    let invalid = run(&passing.id, "staging", &["--json"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(report["exit_code"], 2);
+    assert_eq!(report["steps"], serde_json::json!([]));
+}
 
 #[test]
 fn import_list_and_error_paths() {

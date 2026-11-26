@@ -1854,6 +1854,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "fastman-core",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

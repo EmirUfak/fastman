@@ -2,14 +2,14 @@ use crate::{http::HttpResponse, model::AssertionRule};
 use serde_json::Value;
 use thiserror::Error;
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("Response assertion at index {rule_index} failed: {reason}")]
 pub struct AssertionFailure {
     pub rule_index: usize,
     pub reason: AssertionError,
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AssertionError {
     #[error("status does not match")]
     StatusMismatch,

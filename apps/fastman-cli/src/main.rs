@@ -1,3 +1,5 @@
+mod chain;
+
 use anyhow::{Context, Result, bail};
 use fastman_core::{
     HttpEngine, OsSecretStore, ProjectStore,
@@ -8,7 +10,7 @@ use std::path::Path;
 
 fn usage() {
     eprintln!(
-        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] [--env <name-or-id>] <project-id> <request-id>\n  fastman-cli --version\n  fastman-cli --help\n\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
+        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] [--env <name-or-id>] <project-id> <request-id>\n  fastman-cli chain run --project <id> --chain <id> --origin <origin> [--workspace <id>] [--trust-origin <origin>]... [--env <name-or-id>] [--json]\n  fastman-cli --version\n  fastman-cli --help\n\nChain exit codes: 0 passed, 2 configuration/policy, 3 transport/timeout, 4 assertion, 5 capture.\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -27,6 +29,27 @@ async fn main() -> Result<()> {
     if matches!(command.as_str(), "--help" | "-h") {
         usage();
         return Ok(());
+    }
+    if command == "chain" {
+        let args: Vec<_> = args.collect();
+        let json_output = args.iter().any(|arg| arg == "--json");
+        let code = match chain::run(args.into_iter()).await {
+            Ok(code) => code,
+            Err(error) => {
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "exit_code": 2, "error": error.to_string(), "steps": [],
+                        })
+                    );
+                } else {
+                    eprintln!("Chain configuration: {error}");
+                }
+                2
+            }
+        };
+        std::process::exit(code);
     }
     let store = ProjectStore::system_default()?;
     match command.as_str() {

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chain_sheet;
 mod command_palette;
 mod explorer;
 mod import_view;

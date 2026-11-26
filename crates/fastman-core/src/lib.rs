@@ -16,7 +16,10 @@ pub mod template;
 
 pub use assertions::{AssertionError, AssertionFailure, evaluate_assertions};
 pub use captures::{CaptureError, CaptureFailure, CapturedValue, capture_step_response};
-pub use chain_runner::{ChainExecutionError, ChainStepOutcome, run_chain};
+pub use chain_runner::{
+    ChainExecutionError, ChainFailure, ChainResponsePreview, ChainRunOptions, ChainStepOutcome,
+    ChainStepReport, run_chain, run_chain_with_progress, run_chain_with_report,
+};
 pub use chain_runtime::{ChainRunContext, ChainRunError};
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{

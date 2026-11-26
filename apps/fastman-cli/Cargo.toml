@@ -12,6 +12,7 @@ categories.workspace = true
 fastman-core = { path = "../../crates/fastman-core" }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
