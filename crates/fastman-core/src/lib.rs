@@ -3,6 +3,7 @@
 
 pub mod assertions;
 pub mod captures;
+pub mod chain_runner;
 pub mod chain_runtime;
 pub mod curl;
 pub mod http;
@@ -15,6 +16,7 @@ pub mod template;
 
 pub use assertions::{AssertionError, AssertionFailure, evaluate_assertions};
 pub use captures::{CaptureError, CaptureFailure, CapturedValue, capture_step_response};
+pub use chain_runner::{ChainExecutionError, ChainStepOutcome, run_chain};
 pub use chain_runtime::{ChainRunContext, ChainRunError};
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{

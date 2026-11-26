@@ -172,7 +172,9 @@ impl HttpEngine {
         });
         let mut builder = Client::builder().referer(false).redirect(policy);
         if let Some(session) = session {
-            builder = builder.cookie_provider(Arc::clone(&session.cookies));
+            builder = builder
+                .cookie_provider(Arc::clone(&session.cookies))
+                .retry(reqwest::retry::never());
         }
         if !verify_tls {
             builder = builder.danger_accept_invalid_certs(true);
@@ -271,21 +273,14 @@ impl HttpEngine {
         .await
     }
 
-    async fn send_inner(
+    pub(crate) fn resolve_url(
         &self,
         request: &ApiRequest,
         variables: &BTreeMap<String, String>,
         unresolved_secrets: &BTreeMap<String, String>,
-        secret_values: &[&str],
-        redact_content: bool,
-    ) -> Result<HttpResponse, HttpError> {
-        if !is_valid_http_method(&request.method) {
-            return Err(HttpError::Method(request.method.clone()));
-        }
-        let method = Method::from_bytes(request.method.as_bytes())
-            .map_err(|_| HttpError::Method(request.method.clone()))?;
+    ) -> Result<Url, HttpError> {
         let url_text = interpolate_resolved(&request.url, variables, unresolved_secrets)?;
-        let mut url = Url::parse(&url_text).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
+        let url = Url::parse(&url_text).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
         if url.scheme() != "https" && url.scheme() != "http" {
             return Err(HttpError::InvalidUrl(
                 "Only HTTP and HTTPS are supported".into(),
@@ -301,7 +296,23 @@ impl HttpEngine {
         {
             return Err(HttpError::ChainDestination);
         }
+        Ok(url)
+    }
 
+    async fn send_inner(
+        &self,
+        request: &ApiRequest,
+        variables: &BTreeMap<String, String>,
+        unresolved_secrets: &BTreeMap<String, String>,
+        secret_values: &[&str],
+        redact_content: bool,
+    ) -> Result<HttpResponse, HttpError> {
+        if !is_valid_http_method(&request.method) {
+            return Err(HttpError::Method(request.method.clone()));
+        }
+        let method = Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| HttpError::Method(request.method.clone()))?;
+        let mut url = self.resolve_url(request, variables, unresolved_secrets)?;
         let mut query_credential = None;
         if request
             .params

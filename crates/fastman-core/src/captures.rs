@@ -3,7 +3,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub(crate) const MAX_CAPTURES: usize = 64;
-const MAX_CAPTURE_NAME_BYTES: usize = 128;
+pub(crate) const MAX_CAPTURE_NAME_BYTES: usize = 128;
 const MAX_CAPTURE_VALUE_BYTES: usize = 16 * 1024;
 
 /// Runtime-only value. Deliberately does not implement `Debug` or serialization.
