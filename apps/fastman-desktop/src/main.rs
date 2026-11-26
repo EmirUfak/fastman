@@ -71,8 +71,12 @@ fn main() {
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         theme::apply_crisp_motion(cx);
 
-        let window_bounds = cx.primary_display().map(|display| {
-            let visible = display.visible_bounds();
+        let visible = cx
+            .primary_display()
+            .or_else(|| cx.displays().into_iter().next())
+            .map(|display| display.visible_bounds())
+            .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1080.), px(720.))));
+        let window_bounds = {
             let width = (visible.size.width * 0.84)
                 .max(px(1080.))
                 .min(visible.size.width);
@@ -84,11 +88,11 @@ fn main() {
                 point(center.x - width / 2., center.y - height / 2.),
                 size(width, height),
             ))
-        });
+        };
 
         open_window(
             WindowOptions {
-                window_bounds,
+                window_bounds: Some(window_bounds),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Fastman".into()),
                     ..Default::default()

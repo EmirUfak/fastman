@@ -6,10 +6,12 @@ use crate::security::{
 };
 use reqwest::{
     Client, Method, Url,
+    cookie::{CookieStore, Jar},
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -38,6 +40,10 @@ pub enum HttpError {
     HeaderValue(String),
     #[error("API key query parameter name is empty")]
     EmptyApiKeyParam,
+    #[error("invalid chain origin")]
+    InvalidChainOrigin,
+    #[error("request destination is not allowed in this chain session")]
+    ChainDestination,
     #[error("HTTP request failed: {0}")]
     Transport(#[from] reqwest::Error),
 }
@@ -141,10 +147,19 @@ pub fn configured_env_proxy_summary() -> Option<String> {
 #[derive(Clone)]
 pub struct HttpEngine {
     client: Client,
+    session: Option<Arc<ChainSession>>,
+}
+
+struct ChainSession {
+    origins: Vec<Url>,
+    cookies: Arc<Jar>,
 }
 
 impl HttpEngine {
-    fn build_client(verify_tls: bool) -> Result<Client, reqwest::Error> {
+    fn build_client(
+        verify_tls: bool,
+        session: Option<&ChainSession>,
+    ) -> Result<Client, reqwest::Error> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             let Some(initial) = attempt.previous().first() else {
                 return attempt.stop();
@@ -156,6 +171,9 @@ impl HttpEngine {
             }
         });
         let mut builder = Client::builder().referer(false).redirect(policy);
+        if let Some(session) = session {
+            builder = builder.cookie_provider(Arc::clone(&session.cookies));
+        }
         if !verify_tls {
             builder = builder.danger_accept_invalid_certs(true);
         }
@@ -163,8 +181,46 @@ impl HttpEngine {
     }
 
     pub fn new() -> Result<Self, HttpError> {
-        let client = Self::build_client(true)?;
-        Ok(Self { client })
+        let client = Self::build_client(true, None)?;
+        Ok(Self {
+            client,
+            session: None,
+        })
+    }
+
+    /// Creates an isolated session. Create a fresh engine for each chain run.
+    /// Explicit Cookie headers override the jar for that request. Trust adds
+    /// direct request destinations; it does not allow cross-origin redirects.
+    pub fn for_chain(primary_origin: &str, trusted_origins: &[String]) -> Result<Self, HttpError> {
+        let origins = std::iter::once(primary_origin)
+            .chain(trusted_origins.iter().map(String::as_str))
+            .map(|origin| {
+                Url::parse(origin)
+                    .ok()
+                    .filter(|url| {
+                        matches!(url.scheme(), "https" | "http")
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.path() == "/"
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    .ok_or(HttpError::InvalidChainOrigin)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if origins[0].scheme() == "https" && origins.iter().any(|url| url.scheme() == "http") {
+            return Err(HttpError::InvalidChainOrigin);
+        }
+        let session = Arc::new(ChainSession {
+            origins,
+            cookies: Arc::new(Jar::default()),
+        });
+        let client = Self::build_client(true, Some(&session))?;
+        Ok(Self {
+            client,
+            session: Some(session),
+        })
     }
 
     /// The only code path that performs network I/O. Nothing is sent until
@@ -235,6 +291,16 @@ impl HttpEngine {
                 "Only HTTP and HTTPS are supported".into(),
             ));
         }
+        if let Some(session) = &self.session
+            && (!url.username().is_empty()
+                || url.password().is_some()
+                || !session
+                    .origins
+                    .iter()
+                    .any(|origin| same_origin(origin, &url)))
+        {
+            return Err(HttpError::ChainDestination);
+        }
 
         let mut query_credential = None;
         if request
@@ -303,6 +369,9 @@ impl HttpEngine {
             let name_text = interpolate_resolved(&header.key, variables, unresolved_secrets)?;
             let name = HeaderName::from_bytes(name_text.trim().as_bytes())
                 .map_err(|_| HttpError::HeaderName(header.key.clone()))?;
+            if self.session.is_some() && name == reqwest::header::HOST {
+                return Err(HttpError::ChainDestination);
+            }
             if auth_header_name.as_ref() == Some(&name) {
                 continue;
             }
@@ -329,13 +398,30 @@ impl HttpEngine {
             }
         }
 
+        if let Some(session) = &self.session {
+            if auth_header_name
+                .as_ref()
+                .is_some_and(|name| name == reqwest::header::HOST)
+            {
+                return Err(HttpError::ChainDestination);
+            }
+            if !header_map.contains_key(reqwest::header::COOKIE)
+                && let Some(cookies) = session.cookies.cookies(&url)
+                && let Ok(cookies) = cookies.to_str()
+            {
+                credentials.extend(cookies.split(';').filter_map(|pair| {
+                    pair.split_once('=')
+                        .map(|(_, value)| value.trim().to_owned())
+                }));
+            }
+        }
         let has_content_type = header_map.contains_key(CONTENT_TYPE);
         let timeout = Duration::from_millis(request.timeout_ms.clamp(100, 300_000));
         let insecure_client;
         let client = if request.verify_tls {
             &self.client
         } else {
-            insecure_client = Self::build_client(false)?;
+            insecure_client = Self::build_client(false, self.session.as_deref())?;
             &insecure_client
         };
         let mut builder = client
@@ -666,6 +752,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chain_cookies_are_scoped_and_isolated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (path, expected_cookie, set_cookie) in [
+                ("/login", None, Some("session=fixture; Path=/api")),
+                ("/api", Some("session=fixture"), None),
+                ("/outside", None, None),
+                ("/api", Some("manual=fixture"), None),
+                ("/api", None, None),
+                (
+                    "/api",
+                    Some("session=fixture"),
+                    Some("session=; Path=/api; Max-Age=0"),
+                ),
+                ("/api", None, None),
+            ] {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(conn.read_u8().await.unwrap());
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                assert!(request.starts_with(&format!("GET {path} HTTP/")));
+                assert_eq!(
+                    request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("cookie: ")),
+                    expected_cookie
+                );
+                let header =
+                    set_cookie.map_or(String::new(), |value| format!("Set-Cookie: {value}\r\n"));
+                conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let session = HttpEngine::for_chain(&origin, &[]).unwrap();
+        let isolated = HttpEngine::for_chain(&origin, &[]).unwrap();
+        for (engine, path, verify_tls, manual) in [
+            (&session, "/login", true, false),
+            (&session, "/api", false, false),
+            (&session, "/outside", true, false),
+            (&session, "/api", true, true),
+            (&isolated, "/api", true, false),
+            (&session, "/api", true, false),
+            (&session, "/api", true, false),
+        ] {
+            let mut request = ApiRequest::new("GET", "Cookie fixture", format!("{origin}{path}"));
+            request.verify_tls = verify_tls;
+            if manual {
+                request
+                    .headers
+                    .push(KeyValue::new("Cookie", "manual=fixture"));
+            }
+            engine.send(&request, &BTreeMap::new()).await.unwrap();
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn chain_cookie_domain_and_secure_rules() {
+        let session = HttpEngine::for_chain("https://api.example.com", &[]).unwrap();
+        let jar = &session.session.as_ref().unwrap().cookies;
+        let source = Url::parse("https://api.example.com/").unwrap();
+        jar.add_cookie_str("host=fixture; Secure", &source);
+        jar.add_cookie_str("domain=fixture; Domain=example.com; Secure", &source);
+        jar.add_cookie_str("foreign=fixture; Domain=other.example", &source);
+        let sibling = Url::parse("https://www.example.com/").unwrap();
+        let insecure = Url::parse("http://api.example.com/").unwrap();
+        let foreign = Url::parse("https://other.example/").unwrap();
+        assert_eq!(jar.cookies(&sibling).unwrap(), "domain=fixture");
+        assert!(jar.cookies(&insecure).is_none());
+        assert!(jar.cookies(&foreign).is_none());
+        assert!(
+            jar.cookies(&source)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("host=fixture")
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_blocks_unapproved_resolved_origin_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = format!("http://{}", listener.local_addr().unwrap());
+        let session = HttpEngine::for_chain("http://localhost", &[]).unwrap();
+        let request = ApiRequest::new("GET", "Origin fixture", "{{target}}/?token={{token}}");
+        let variables = BTreeMap::from([
+            ("target".into(), destination.clone()),
+            ("token".into(), "fixture".into()),
+        ]);
+        assert!(matches!(
+            session.send(&request, &variables).await,
+            Err(HttpError::ChainDestination)
+        ));
+        let session = HttpEngine::for_chain("http://localhost", &[destination]).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(conn.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /?token=fixture HTTP/"));
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            session.send(&request, &variables).await.unwrap().status,
+            200
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn query_credentials_reach_server_but_not_display_url() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -779,11 +987,14 @@ mod tests {
             };
             request.body = HttpBody::Text("secret-body".into());
 
-            let response = HttpEngine::new()
-                .unwrap()
-                .send(&request, &BTreeMap::new())
-                .await
-                .unwrap();
+            let response = HttpEngine::for_chain(
+                &format!("http://{origin_addr}"),
+                &[format!("http://{target_addr}")],
+            )
+            .unwrap()
+            .send(&request, &BTreeMap::new())
+            .await
+            .unwrap();
 
             assert_eq!(response.status, status);
             assert!(
