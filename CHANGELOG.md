@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-27
+
+### Added
+- **Path Variables (`:param`):** URLs with `:param` segments (for example `{{baseUrl}}/tournaments/:slug/media/days`) highlight inline in the URL bar, auto-populate a **Path Variables** table under **Params**, substitute safely with segment percent-encoding on send and **Copy as cURL**, and import Postman Collection v2.1 `url.variable` entries.
+- **Response horizontal scrolling:** Unwrapped response bodies scroll vertically with the mouse wheel and horizontally via a draggable scrollbar pinned to the top of the response body.
+- **Focused `Ctrl+F` / `Cmd+F` search:** Pressing `Ctrl+F` / `Cmd+F` opens and focuses the response body search bar when the response pane is active, or focuses the explorer search when the sidebar is active.
+
 ## [0.4.0] - 2026-11-27
 
 ### Added
@@ -99,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation & CI**:
   - Architecture, build, testing/benchmarking, security model, schema format, roadmap, and GitHub Actions CI for headless core and CLI.
 
-[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/EmirUfak/fastman/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/EmirUfak/fastman/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/EmirUfak/fastman/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/EmirUfak/fastman/compare/v0.2.1...v0.3.0

@@ -2,7 +2,7 @@
 
 **A native, local-first API client for building and sending HTTP requests, written in Rust with GPUI Kit.**
 
-> Status: **v0.4.0**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
+> Status: **v0.4.1**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
 
 ![Fastman desktop workbench](assets/screenshot.png)
 
@@ -93,7 +93,7 @@ Each project is a JSON file (`schema_version = 1`) in the OS local data director
 |---|---|---|
 | Workspaces and projects | Create and switch; project environments and typed `Plain` / `Secret` / `Env` variables | Default workspace only (`list`, `send --env`) |
 | Explorer | Virtualized nested folders, search, context menus, drag-and-drop | — |
-| Request editor | Method, URL with variable highlighting, params, headers, auth, body (JSON validation and formatting), timeout, per-request TLS verification opt-out | — |
+| Request editor | Method, URL with `{{var}}` and `:path` highlighting, query params, path variables, headers, auth, body (JSON validation and formatting), timeout, per-request TLS verification opt-out | — |
 | Request execution | Async, cancellable; same-origin redirects only (max 10); 100–300,000 ms timeout; 2 MiB response cap | `send` |
 | Request chains | Visual horizontal flow canvas, auto-linked JSON inputs, status/header/JSON/latency checks, cookie isolation, `always_run` cleanup steps | `chain list`, `chain run` (with `--json` and exit codes) |
 | Response viewer | Status, TTFB/download/total timing, size, final URL, searchable pretty or raw body, headers, cookies, persistent panel placement | Status, TTFB/download/total timing, escaped text output |
