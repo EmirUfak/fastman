@@ -2,7 +2,7 @@
 
 **A native, local-first API client for building and sending HTTP requests, written in Rust with GPUI Kit.**
 
-> Status: **v0.3.1**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
+> Status: **v0.4.0**, an early open-source preview. Expect rough edges and breaking changes before 1.0. See the [changelog](CHANGELOG.md).
 
 ![Fastman desktop workbench](assets/screenshot.png)
 
@@ -64,6 +64,7 @@ Reports from Linux and macOS builds are welcome. Please open an issue with your 
 - The header selects the active **workspace**. Use **+ Workspace** to create one. Each workspace has its own projects, and existing projects stay in **My workspace**.
 - The left panel has the project selector and a collection/folder/request explorer with search, context menus, and drag-and-drop.
 - Request tabs edit the method, URL, Params, Auth, Headers, Body, and Settings. Use **Send**, **Cancel**, and **Save**.
+- Switch to **Chains** in the header to build declarative multi-step request flows on a horizontal canvas, wire JSON fields between steps, toggle per-step cookie isolation or `always_run` cleanup steps, and add status/header/JSON/latency checks.
 - `Ctrl+K` (`Cmd+K` on macOS) opens the command palette for projects, collections, requests, and common actions.
 - Import a Collection v2.1 JSON file or paste a cURL command. Use **Copy as cURL** to export a request with secrets redacted by default.
 
@@ -76,6 +77,8 @@ cargo run -p fastman-cli -- --help
 cargo run -p fastman-cli -- list
 cargo run -p fastman-cli -- import-collection ./my_collection.json
 cargo run -p fastman-cli -- send [--raw] [--env <name-or-id>] <project-uuid> <request-uuid>
+cargo run -p fastman-cli -- chain list --project <project-uuid> [--json]
+cargo run -p fastman-cli -- chain run --project <project-uuid> --chain <chain-uuid> --origin <https://api.example.com> [--env <name-or-id>] [--json]
 ```
 
 Importing a collection creates a new project and never runs any requests or scripts. If the collection contains secrets, you must pass either `--strip-secrets` or `--allow-plaintext-secrets`. Terminal control characters in output are escaped unless you pass `send --raw`.
@@ -92,6 +95,7 @@ Each project is a JSON file (`schema_version = 1`) in the OS local data director
 | Explorer | Virtualized nested folders, search, context menus, drag-and-drop | — |
 | Request editor | Method, URL with variable highlighting, params, headers, auth, body (JSON validation and formatting), timeout, per-request TLS verification opt-out | — |
 | Request execution | Async, cancellable; same-origin redirects only (max 10); 100–300,000 ms timeout; 2 MiB response cap | `send` |
+| Request chains | Visual horizontal flow canvas, auto-linked JSON inputs, status/header/JSON/latency checks, cookie isolation, `always_run` cleanup steps | `chain list`, `chain run` (with `--json` and exit codes) |
 | Response viewer | Status, TTFB/download/total timing, size, final URL, searchable pretty or raw body, headers, cookies, persistent panel placement | Status, TTFB/download/total timing, escaped text output |
 | Command palette | `Ctrl+K` / `Cmd+K` fuzzy search across requests, folders, projects, workspaces, environments, and actions | — |
 | Collection v2.1 JSON import (subset) | Yes | `import-collection` |
@@ -104,7 +108,7 @@ The following are **not implemented yet**:
 
 - **Requests:** OAuth 2.0, Digest, and AWS SigV4 auth; multipart and binary uploads; proxy and client-certificate configuration.
 - **Protocols:** GraphQL tooling, WebSocket, gRPC, and SSE.
-- **Automation:** request tests and assertions. Fastman will never run JavaScript. A collection runner is also missing.
+- **Automation:** scripted tests and full collection runners. Fastman supports declarative request chains with checks and captures, and will never execute JavaScript.
 - **Data:** collection export, request history, and streaming for large responses.
 - **Distribution:** installers, code signing, prebuilt CLI binaries, and Linux/macOS binaries.
 

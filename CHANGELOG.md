@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+### Added
+- **Declarative Request Chains (`fastman-core`, `fastman-cli`, `fastman-desktop`):**
+  - Sequential multi-step chain execution with strict origin authorization (`primary_origin` + optional `trusted_origins`), per-run isolated cookie jars, and per-step `isolate_cookies` opt-out.
+  - Declarative response checks (`Status`, `Header`, `JsonField`, `Latency`) and redacted captures (`Status`, `Header`, `JsonField`, and auto-linked `LinkedJsonField`) that pass values into later steps as `{{variable}}`, Bearer token, or Basic auth credentials without leaking secrets in logs or reports.
+  - Cleanup steps via `ChainStep.always_run`, which still execute after an earlier request or check failure while preserving the original failure exit code.
+  - Desktop **Chains** flow editor with a GPU-accelerated horizontal canvas, proportional zoom, orthogonal data-flow wires, and a resizable 2-column bottom step inspector (`Inputs` + `Outputs` and inline `Checks`).
+  - CLI subcommands `fastman-cli chain list` and `fastman-cli chain run` with `--env`, `--origin`, `--trusted-origin`, `--json`, and structured exit codes.
+  - Local Bun + Express Docker test API (`tools/test-api/`) for end-to-end verification of `HttpOnly` cookie sessions, cookie isolation, linked tokens, and CRUD cleanup chains.
+
+### Fixed
+- Guarded chain navigation and request-tab switching when a chain run is active or has unsaved changes.
+- Validated chain step IDs against empty or duplicate identifiers before execution.
+
 ## [0.3.1] - 2026-11-22
 
 ### Changed
@@ -84,7 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation & CI**:
   - Architecture, build, testing/benchmarking, security model, schema format, roadmap, and GitHub Actions CI for headless core and CLI.
 
-[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/EmirUfak/fastman/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/EmirUfak/fastman/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/EmirUfak/fastman/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/EmirUfak/fastman/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/EmirUfak/fastman/compare/v0.2.0...v0.2.1
