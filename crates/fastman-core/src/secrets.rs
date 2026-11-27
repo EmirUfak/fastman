@@ -2,26 +2,37 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     sync::{Arc, Mutex},
 };
-use thiserror::Error;
 use uuid::Uuid;
 
 pub const MAX_SECRET_VALUE_BYTES: usize = 2048;
 const MAX_SECRET_KEY_BYTES: usize = 256;
 const MAX_ENV_VAR_NAME_BYTES: usize = 128;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretStoreError {
-    #[error("OS credential store unavailable: {0}")]
     Unavailable(String),
-    #[error("Secret value exceeds maximum allowed size ({0} bytes)")]
     TooLarge(usize),
-    #[error("Invalid secret reference key: {0}")]
     InvalidKey(String),
-    #[error("Credential store operation failed: {0}")]
     Backend(String),
 }
+
+impl fmt::Display for SecretStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(msg) => write!(f, "OS credential store unavailable: {msg}"),
+            Self::TooLarge(max) => {
+                write!(f, "Secret value exceeds maximum allowed size ({max} bytes)")
+            }
+            Self::InvalidKey(msg) => write!(f, "Invalid secret reference key: {msg}"),
+            Self::Backend(msg) => write!(f, "Credential store operation failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SecretStoreError {}
 
 pub trait SecretStore: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError>;

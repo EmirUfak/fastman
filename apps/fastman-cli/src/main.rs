@@ -10,12 +10,12 @@ use std::path::Path;
 
 fn usage() {
     eprintln!(
-        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] [--env <name-or-id>] <project-id> <request-id>\n  fastman-cli chain run --project <id> --chain <id> --origin <origin> [--workspace <id>] [--trust-origin <origin>]... [--env <name-or-id>] [--json]\n  fastman-cli --version\n  fastman-cli --help\n\nChain exit codes: 0 passed, 2 configuration/policy, 3 transport/timeout, 4 assertion, 5 capture.\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
+        "Fastman CLI v{}\n\n  fastman-cli list\n  fastman-cli import-collection [--strip-secrets | --allow-plaintext-secrets] <export.json>\n  fastman-cli send [--raw] [--env <name-or-id>] <project-id> <request-id>\n  fastman-cli chain list --project <id> [--workspace <id>] [--json]\n  fastman-cli chain run --project <id> --chain <id> --origin <origin> [--workspace <id>] [--trust-origin <origin>]... [--env <name-or-id>] [--json]\n  fastman-cli --version\n  fastman-cli --help\n\nChain exit codes: 0 passed, 2 configuration/policy, 3 transport/timeout, 4 assertion, 5 capture.\nProject data: FASTMAN_HOME or the OS local data directory /fastman",
         env!("CARGO_PKG_VERSION")
     );
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {

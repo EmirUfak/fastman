@@ -588,6 +588,7 @@ fn expand_template_for_curl(
             )
         },
     )
+    .map(std::borrow::Cow::into_owned)
 }
 
 /// Quote a string safely for POSIX shells. Uses ANSI-C `$'...'` quoting when control

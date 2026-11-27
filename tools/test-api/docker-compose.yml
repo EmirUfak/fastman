@@ -1,0 +1,11 @@
+services:
+  fastman-test-api:
+    build: .
+    container_name: fastman-test-api
+    ports:
+      - "127.0.0.1:4010:4010"
+    environment:
+      PORT: "4010"
+      TEST_USER: "demo"
+      TEST_PASS: "secret"
+    restart: unless-stopped

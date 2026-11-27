@@ -1,0 +1,14 @@
+{
+  "name": "fastman-test-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "express": "^5.1.0"
+  }
+}

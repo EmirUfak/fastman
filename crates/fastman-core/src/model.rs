@@ -339,6 +339,14 @@ pub struct ChainStep {
     pub assertions: Vec<AssertionRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<CaptureRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<ChainInput>,
+    /// Use a private cookie jar for this node, including its redirects.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolate_cookies: bool,
+    /// Run this step even if an earlier step failed (e.g., cleanup/delete), unless cancelled or timed out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_run: bool,
 }
 
 impl ChainStep {
@@ -349,8 +357,28 @@ impl ChainStep {
             enabled: true,
             assertions: Vec::new(),
             captures: Vec::new(),
+            inputs: Vec::new(),
+            isolate_cookies: false,
+            always_run: false,
         }
     }
+}
+
+/// Bind an earlier node's output to this step only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainInput {
+    pub source_step_id: String,
+    pub capture_name: String,
+    pub target: ChainInputTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChainInputTarget {
+    Variable { name: String },
+    BearerToken,
+    BasicUsername,
+    BasicPassword,
 }
 
 /// A named value to extract from a response after assertions pass.
@@ -374,6 +402,10 @@ pub enum CaptureSource {
     },
     /// RFC 6901 JSON Pointer. An empty pointer selects the root.
     JsonField {
+        pointer: String,
+    },
+    /// A JSON field managed by a downstream visual input link.
+    LinkedJsonField {
         pointer: String,
     },
 }

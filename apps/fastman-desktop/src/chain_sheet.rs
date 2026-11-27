@@ -1,27 +1,42 @@
+mod canvas;
+mod inspector;
+mod rules;
+
 use crate::WorkspaceView;
+use crate::theme::{dot_indicator, svg_icon};
 use fastman_core::{
-    CaptureSource, ChainRunOptions, ChainStep, ChainStepOutcome, ChainStepReport, Folder, Project,
-    RequestChain, chain_runner::MAX_CHAIN_STEPS, run_chain_with_progress,
+    CaptureRule, CaptureSource, ChainInput, ChainInputTarget, ChainRunOptions, ChainStep,
+    ChainStepOutcome, ChainStepReport, Folder, Project, RequestChain,
+    chain_runner::{MAX_CHAIN_STEPS, run_chain_observed},
+    validate_chain_inputs,
 };
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::{
-    ActiveTheme as _, IndexPath, Sizable as _, WindowExt as _,
+    ActiveTheme as _, IndexPath, Sizable as _,
     button::{Button, ButtonVariants as _},
-    input::{Editor, EditorState, Input, InputState},
+    input::{Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
-    select::{SearchableVec, Select, SelectItem, SelectState},
+    resizable::{resizable_panel, v_resizable},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use gpui_kit::{base::Disableable as _, prelude::FluentBuilder as _};
-use std::time::Duration;
+use rules::{Rule, input};
+use std::{collections::BTreeMap, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
-struct Choice {
-    id: String,
-    label: SharedString,
+pub(super) struct RequestChoice {
+    pub(super) id: String,
+    pub(super) label: SharedString,
+    pub(super) name: SharedString,
+    pub(super) method: SharedString,
+    pub(super) url_preview: SharedString,
+    pub(super) origin: Option<String>,
+    pub(super) variables: Vec<String>,
 }
 
-impl SelectItem for Choice {
+impl SelectItem for RequestChoice {
     type Value = String;
     fn title(&self) -> SharedString {
         self.label.clone()
@@ -31,61 +46,161 @@ impl SelectItem for Choice {
     }
 }
 
-type Selector = Entity<SelectState<SearchableVec<Choice>>>;
-
-struct StepDraft {
-    step: ChainStep,
-    assertions: Entity<EditorState>,
-    captures: Entity<EditorState>,
+#[derive(Clone)]
+pub(super) struct EnvChoice {
+    pub(super) id: String,
+    pub(super) label: SharedString,
 }
 
-impl StepDraft {
-    fn new(step: ChainStep, window: &mut Window, cx: &mut App) -> Self {
-        let assertions = cx.new(|cx| {
-            let mut editor = EditorState::new(window, cx);
-            editor.set_value(
-                serde_json::to_string_pretty(&step.assertions).unwrap(),
-                window,
-                cx,
-            );
-            editor
-        });
-        let captures = cx.new(|cx| {
-            let mut editor = EditorState::new(window, cx);
-            editor.set_value(
-                serde_json::to_string_pretty(&step.captures).unwrap(),
-                window,
-                cx,
-            );
-            editor
-        });
+impl SelectItem for EnvChoice {
+    type Value = String;
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+    fn value(&self) -> &String {
+        &self.id
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct StepRequestKey {
+    pub(super) step_id: String,
+    pub(super) request_id: String,
+}
+
+impl StepRequestKey {
+    pub(super) fn new(step_id: impl Into<String>, request_id: impl Into<String>) -> Self {
         Self {
-            step,
-            assertions,
-            captures,
+            step_id: step_id.into(),
+            request_id: request_id.into(),
         }
     }
 }
 
-struct ChainSheet {
+#[derive(Clone)]
+pub(super) struct ResponseField {
+    pub(super) step_id: String,
+    pub(super) request_id: String,
+    pub(super) pointer: String,
+}
+
+fn json_fields(value: &serde_json::Value, path: &str, fields: &mut Vec<String>) {
+    if fields.len() >= 128 || path.len() > 512 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                json_fields(
+                    value,
+                    &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
+                    fields,
+                );
+                if fields.len() >= 128 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                json_fields(value, &format!("{path}/{index}"), fields);
+                if fields.len() >= 128 {
+                    break;
+                }
+            }
+        }
+        _ => fields.push(path.to_owned()),
+    }
+}
+
+type RequestSelector = Entity<SelectState<SearchableVec<RequestChoice>>>;
+type EnvSelector = Entity<SelectState<SearchableVec<EnvChoice>>>;
+
+struct StepDraft {
+    step: ChainStep,
+    assertions: Vec<Rule>,
+    captures: Vec<Rule>,
+    inputs: Vec<InputDraft>,
+}
+
+impl StepDraft {
+    fn new(mut step: ChainStep, window: &mut Window, cx: &mut App) -> Self {
+        let assertions = std::mem::take(&mut step.assertions)
+            .into_iter()
+            .map(|rule| Rule::from_assertion(rule, window, cx))
+            .collect();
+        let (linked, manual): (Vec<_>, Vec<_>) = std::mem::take(&mut step.captures)
+            .into_iter()
+            .partition(|rule| matches!(rule.source, CaptureSource::LinkedJsonField { .. }));
+        step.captures = linked;
+        let captures = manual
+            .into_iter()
+            .map(|rule| Rule::from_capture(rule, window, cx))
+            .collect();
+        let inputs = std::mem::take(&mut step.inputs)
+            .into_iter()
+            .map(|binding| InputDraft::new(binding, window, cx))
+            .collect();
+        Self {
+            step,
+            assertions,
+            captures,
+            inputs,
+        }
+    }
+}
+
+pub(super) struct InputDraft {
+    pub(super) binding: ChainInput,
+    pub(super) variable: Entity<InputState>,
+}
+
+impl InputDraft {
+    pub(super) fn new(binding: ChainInput, window: &mut Window, cx: &mut App) -> Self {
+        let name = match &binding.target {
+            ChainInputTarget::Variable { name } => name.clone(),
+            _ => binding.capture_name.clone(),
+        };
+        Self {
+            binding,
+            variable: input("Request variable name", name, window, cx),
+        }
+    }
+
+    fn build(&self, cx: &App) -> ChainInput {
+        let mut binding = self.binding.clone();
+        if let ChainInputTarget::Variable { name } = &mut binding.target {
+            *name = self.variable.read(cx).value().trim().to_owned();
+        }
+        binding
+    }
+}
+
+pub(super) struct ChainSheet {
     workspace: WeakEntity<WorkspaceView>,
     project_id: String,
     chain_id: String,
     saved: bool,
+    original: RequestChain,
     confirming_delete: bool,
+    confirming_discard: bool,
     name: Entity<InputState>,
-    requests: Vec<Choice>,
-    request: Selector,
+    requests: Vec<RequestChoice>,
+    request: RequestSelector,
     steps: Vec<StepDraft>,
     selected: Option<usize>,
-    environment: Selector,
+    environment: EnvSelector,
     origin: Entity<InputState>,
     trusted: Entity<InputState>,
-    reports: Vec<ChainStepReport>,
-    run_definition: Option<RequestChain>,
+    show_run_settings: bool,
+    canvas: Entity<canvas::ChainCanvas>,
+    pub(super) reports: Vec<ChainStepReport>,
+    pub(super) response_fields: BTreeMap<StepRequestKey, Vec<String>>,
+    pub(super) run_definition: Option<RequestChain>,
     cancel: Option<oneshot::Sender<()>>,
-    running: bool,
+    pub(super) running: bool,
     error: Option<String>,
+    _request_subscription: Subscription,
 }
 
 impl ChainSheet {
@@ -106,13 +221,51 @@ impl ChainSheet {
                 &mut requests,
             );
         }
-        let request =
-            cx.new(|cx| SelectState::new(SearchableVec::new(requests.clone()), None, window, cx));
-        let mut environments = vec![Choice {
+        let detected_origin = chain
+            .steps
+            .iter()
+            .filter(|step| step.enabled)
+            .find_map(|step| {
+                requests
+                    .iter()
+                    .find(|choice| choice.id == step.request_id)
+                    .and_then(|choice| choice.origin.clone())
+            })
+            .or_else(|| requests.iter().find_map(|choice| choice.origin.clone()))
+            .unwrap_or_default();
+
+        let first_request = chain.steps.first().and_then(|step| {
+            requests
+                .iter()
+                .position(|request| request.id == step.request_id)
+        });
+        let request = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(requests.clone()),
+                first_request.map(|index| IndexPath::default().row(index)),
+                window,
+                cx,
+            )
+        });
+        let request_subscription =
+            cx.subscribe_in(&request, window, |view, request, event, window, cx| {
+                if matches!(event, SelectEvent::Confirm(_))
+                    && !view.running
+                    && let Some(index) = view.selected
+                    && let Some(id) = request.read(cx).selected_value().cloned()
+                    && let Some(step) = view.steps.get_mut(index)
+                {
+                    step.step.request_id = id.clone();
+                    view.maybe_prefill_origin(&id, window, cx);
+                    view.clear_results(cx);
+                }
+            });
+        let original = chain.clone();
+        let mut environments = vec![EnvChoice {
             id: String::new(),
             label: "Base variables".into(),
         }];
-        environments.extend(project.environments.iter().map(|env| Choice {
+        environments.extend(project.environments.iter().map(|env| EnvChoice {
             id: env.id.clone(),
             label: env.name.clone().into(),
         }));
@@ -134,43 +287,83 @@ impl ChainSheet {
             input.set_value(chain.name, window, cx);
             input
         });
+        let origin = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("https://api.example.com");
+            if !detected_origin.is_empty() {
+                input.set_value(detected_origin, window, cx);
+            }
+            input
+        });
         let steps: Vec<_> = chain
             .steps
             .into_iter()
             .map(|step| StepDraft::new(step, window, cx))
             .collect();
         let selected = (!steps.is_empty()).then_some(0);
+        let sheet_entity = cx.entity();
+        let canvas = cx.new(|cx| canvas::ChainCanvas::new(sheet_entity, cx));
         Self {
             workspace,
             project_id: project.id.clone(),
             chain_id: chain.id,
             saved,
+            original,
             confirming_delete: false,
+            confirming_discard: false,
             name,
             requests,
             request,
             steps,
             selected,
             environment,
-            origin: cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com")),
+            origin,
             trusted: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Optional, space-separated origins")
             }),
+            show_run_settings: false,
+            canvas,
             reports: Vec::new(),
+            response_fields: BTreeMap::new(),
             run_definition: None,
             cancel: None,
             running: false,
             error: None,
+            _request_subscription: request_subscription,
+        }
+    }
+
+    fn maybe_prefill_origin(
+        &mut self,
+        request_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.origin.read(cx).value().trim().is_empty() {
+            return;
+        }
+        if let Some(detected) = self
+            .requests
+            .iter()
+            .find(|choice| choice.id == request_id)
+            .and_then(|choice| choice.origin.clone())
+        {
+            self.origin.update(cx, |input, cx| {
+                input.set_value(detected, window, cx);
+            });
         }
     }
 
     fn build(&self, cx: &App) -> Result<RequestChain, String> {
+        self.build_prefix(self.steps.len(), cx)
+    }
+
+    fn build_prefix(&self, count: usize, cx: &App) -> Result<RequestChain, String> {
         let name = self.name.read(cx).value().trim().to_owned();
         if name.is_empty() {
             return Err("Enter a chain name.".into());
         }
         let mut steps = Vec::with_capacity(self.steps.len());
-        for (index, draft) in self.steps.iter().enumerate() {
+        for (index, draft) in self.steps.iter().take(count).enumerate() {
             let mut step = draft.step.clone();
             if !self
                 .requests
@@ -178,51 +371,100 @@ impl ChainSheet {
                 .any(|choice| choice.id == step.request_id)
             {
                 return Err(format!(
-                    "Step {} references a missing request. Replace or remove it.",
+                    "Node {} references a missing request. Replace or remove it.",
                     index + 1
                 ));
             }
-            step.assertions = serde_json::from_str(draft.assertions.read(cx).value().as_ref())
-                .map_err(|error| {
-                    format!(
-                        "Step {} assertions: invalid rules at line {}, column {}.",
-                        index + 1,
-                        error.line(),
-                        error.column()
-                    )
-                })?;
-            step.captures = serde_json::from_str(draft.captures.read(cx).value().as_ref())
-                .map_err(|error| {
-                    format!(
-                        "Step {} captures: invalid rules at line {}, column {}.",
-                        index + 1,
-                        error.line(),
-                        error.column()
-                    )
-                })?;
+            step.assertions = draft
+                .assertions
+                .iter()
+                .enumerate()
+                .map(|(rule, draft)| {
+                    draft
+                        .assertion(cx)
+                        .map_err(|error| format!("Node {}, check {}: {error}", index + 1, rule + 1))
+                })
+                .collect::<Result<_, _>>()?;
+            let mut names = std::collections::BTreeSet::new();
+            step.captures.retain(|rule| {
+                self.steps.iter().take(count).any(|target| {
+                    target.inputs.iter().any(|input| {
+                        input.binding.source_step_id == draft.step.id
+                            && input.binding.capture_name == rule.name
+                    })
+                })
+            });
+            names.extend(step.captures.iter().map(|rule| rule.name.clone()));
+            step.captures.extend(
+                draft
+                    .captures
+                    .iter()
+                    .enumerate()
+                    .map(|(rule, draft)| {
+                        let capture = draft.capture(cx).map_err(|error| {
+                            format!("Node {}, output {}: {error}", index + 1, rule + 1)
+                        })?;
+                        if !names.insert(capture.name.clone()) {
+                            return Err(format!("Node {} has duplicate output names.", index + 1));
+                        }
+                        Ok(capture)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            step.inputs = draft.inputs.iter().map(|input| input.build(cx)).collect();
             steps.push(step);
         }
-        Ok(RequestChain {
+        let chain = RequestChain {
             id: self.chain_id.clone(),
             name,
             steps,
-        })
+        };
+        validate_chain_inputs(&chain).map_err(|error| error.to_string())?;
+        Ok(chain)
+    }
+
+    pub(super) fn has_changes(&self, cx: &App) -> bool {
+        self.build(cx).map_or(true, |draft| draft != self.original)
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub(super) fn matches_project(&self, id: &str) -> bool {
+        self.project_id == id
     }
 
     fn save(&mut self, delete: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         let result = (|| {
             let chain = if delete { None } else { Some(self.build(cx)?) };
             self.workspace
                 .update(cx, |view, cx| {
-                    view.save_chain_definition(&self.project_id, &self.chain_id, chain, window, cx)
+                    view.save_chain_definition(
+                        &self.project_id,
+                        &self.chain_id,
+                        chain.clone(),
+                        window,
+                        cx,
+                    )
                 })
                 .map_err(|_| "Workspace closed.".to_owned())?
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok(chain)
         })();
         match result {
-            Ok(()) if delete => window.close_sheet(cx),
-            Ok(()) => {
+            Ok(None) => {
+                let _ = self
+                    .workspace
+                    .update(cx, |view, cx| view.close_chain_editor(cx));
+            }
+            Ok(Some(chain)) => {
                 self.saved = true;
+                self.original = chain;
+                self.confirming_discard = false;
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
@@ -231,10 +473,18 @@ impl ChainSheet {
     }
 
     fn run(&mut self, cx: &mut Context<Self>) {
+        self.run_prefix(self.steps.len(), cx);
+    }
+
+    pub(super) fn run_prefix(&mut self, count: usize, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         let result = (|| {
-            let chain = self.build(cx)?;
+            let chain = self.build_prefix(count, cx)?;
             let origin = self.origin.read(cx).value().trim().to_owned();
             if origin.is_empty() {
+                self.show_run_settings = true;
                 return Err("Enter the primary origin to authorize this run.".into());
             }
             let trusted: Vec<_> = self
@@ -274,9 +524,10 @@ impl ChainSheet {
         self.running = true;
         self.error = None;
         self.reports.clear();
+        self.response_fields.clear();
         self.run_definition = Some(chain);
         let worker = runtime.spawn(async move {
-            run_chain_with_progress(
+            run_chain_observed(
                 &project,
                 &chain_id,
                 env.as_deref(),
@@ -289,17 +540,33 @@ impl ChainSheet {
                 async {
                     let _ = cancelled.await;
                 },
-                |report| {
-                    let _ = progress.send(report.clone());
+                |report, response| {
+                    let fields = response
+                        .filter(|response| !response.truncated)
+                        .and_then(|response| serde_json::from_str(&response.body).ok())
+                        .map_or_else(Vec::new, |value| {
+                            let mut fields = Vec::new();
+                            json_fields(&value, "", &mut fields);
+                            fields
+                        });
+                    let _ = progress.send((report.clone(), fields));
                 },
             )
             .await
             .map(|_| ())
         });
         cx.spawn(async move |this, cx| {
-            while let Some(report) = updates.recv().await {
+            while let Some((report, fields)) = updates.recv().await {
                 if this
                     .update(cx, |view, cx| {
+                        if let Some(step) = view
+                            .run_definition
+                            .as_ref()
+                            .and_then(|chain| chain.steps.get(view.reports.len()))
+                        {
+                            view.response_fields
+                                .insert(StepRequestKey::new(&step.id, &step.request_id), fields);
+                        }
                         view.reports.push(report);
                         cx.notify();
                     })
@@ -324,30 +591,46 @@ impl ChainSheet {
         cx.notify();
     }
 
-    fn edit_step(&mut self, edit: StepEdit, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn add_step_for_request(
+        &mut self,
+        request_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running || self.steps.len() >= MAX_CHAIN_STEPS {
+            return;
+        }
+        self.maybe_prefill_origin(&request_id, window, cx);
+        let next = self.steps.len();
+        self.steps
+            .push(StepDraft::new(ChainStep::new(request_id), window, cx));
+        self.select_step(Some(next), window, cx);
+        self.clear_results(cx);
+    }
+
+    pub(super) fn edit_step(
+        &mut self,
+        edit: StepEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.running {
             return;
         }
-        self.reports.clear();
-        self.run_definition = None;
         match edit {
             StepEdit::Add => {
-                if let Some(id) = self.request.read(cx).selected_value().cloned()
-                    && self.steps.len() < MAX_CHAIN_STEPS
-                {
-                    self.selected = Some(self.steps.len());
-                    self.steps
-                        .push(StepDraft::new(ChainStep::new(id), window, cx));
+                if self.steps.len() >= MAX_CHAIN_STEPS {
+                    return;
                 }
+                self.selected = Some(self.steps.len());
+                self.steps
+                    .push(StepDraft::new(ChainStep::new(""), window, cx));
             }
             _ => {
-                let Some(index) = self.selected else { return };
+                let Some(index) = self.selected.filter(|&i| i < self.steps.len()) else {
+                    return;
+                };
                 match edit {
-                    StepEdit::Replace => {
-                        if let Some(id) = self.request.read(cx).selected_value() {
-                            self.steps[index].step.request_id = id.clone();
-                        }
-                    }
                     StepEdit::Toggle => {
                         self.steps[index].step.enabled = !self.steps[index].step.enabled
                     }
@@ -365,188 +648,252 @@ impl ChainSheet {
                             self.selected = Some(next);
                         }
                     }
+                    StepEdit::Duplicate => {
+                        if self.steps.len() >= MAX_CHAIN_STEPS {
+                            return;
+                        }
+                        if let Ok(built) = self.build_prefix(index + 1, cx)
+                            && let Some(mut cloned) = built.steps.get(index).cloned()
+                        {
+                            cloned.id = ChainStep::new("").id;
+                            let next = index + 1;
+                            self.steps.insert(next, StepDraft::new(cloned, window, cx));
+                            self.selected = Some(next);
+                        }
+                    }
                     StepEdit::Add => unreachable!(),
                 }
             }
         }
+        self.select_step(self.selected, window, cx);
+        self.clear_results(cx);
+    }
+
+    pub(super) fn clear_results(&mut self, cx: &mut Context<Self>) {
+        self.reports.clear();
+        self.run_definition = None;
+        self.error = None;
         cx.notify();
     }
 
-    fn render_steps(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.selected;
-        let choose = |label, id, edit| {
-            Button::new(id)
-                .small()
-                .outline()
-                .label(label)
-                .disabled(self.running)
-                .on_click(cx.listener(move |view, _, window, cx| view.edit_step(edit, window, cx)))
-        };
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(format!("Steps · {}/{}", self.steps.len(), MAX_CHAIN_STEPS))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Select::new(&self.request)
-                                .small()
-                                .placeholder("Choose a saved request"),
-                        ),
-                    )
-                    .child(choose("Add step", "add-chain-step", StepEdit::Add))
-                    .when(selected.is_some(), |el| {
-                        el.child(choose(
-                            "Replace selected",
-                            "replace-chain-step",
-                            StepEdit::Replace,
-                        ))
-                    }),
-            );
-        for (index, draft) in self.steps.iter().enumerate() {
-            let request = self
-                .requests
+    pub(super) fn select_step(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = index.filter(|&i| i < self.steps.len());
+        self.selected = index;
+        let request_index = index.and_then(|index| {
+            let request_id = &self.steps[index].step.request_id;
+            self.requests
                 .iter()
-                .find(|choice| choice.id == draft.step.request_id);
-            let state = self.reports.get(index).map_or(
-                if draft.step.enabled {
-                    ""
-                } else {
-                    " · Disabled"
-                },
-                step_state,
+                .position(|request| &request.id == request_id)
+        });
+        self.request.update(cx, |state, cx| {
+            state.set_selected_index(
+                request_index.map(|row| IndexPath::default().row(row)),
+                window,
+                cx,
             );
-            let name = request.map_or("Missing request", |choice| choice.label.as_ref());
-            let button = Button::new(("chain-step", index))
-                .small()
-                .label(format!("{}. {name}{state}", index + 1))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.selected = Some(index);
-                    cx.notify();
-                }));
-            section = section.child(if selected == Some(index) {
-                button.primary()
-            } else {
-                button.outline()
-            });
-        }
-        if let Some(index) = selected {
-            let draft = &self.steps[index];
-            section = section.child(div().flex().gap_2()
-                .child(choose("Up", "chain-step-up", StepEdit::Move(-1)))
-                .child(choose("Down", "chain-step-down", StepEdit::Move(1)))
-                .child(choose(if draft.step.enabled { "Disable" } else { "Enable" }, "toggle-chain-step", StepEdit::Toggle))
-                .child(choose("Remove", "remove-chain-step", StepEdit::Remove)))
-                .child("Assertions (JSON array): status, header, json_field, or latency")
-                .child(div().text_sm().child(r#"[{"kind":"status","expected":200}]"#))
-                .child(Editor::new(&draft.assertions).small().h(px(100.)))
-                .child("Captures (JSON array): name, source, required, sensitive")
-                .child(div().text_sm().child(r#"[{"name":"token","source":{"kind":"header","name":"X-Token"},"required":true,"sensitive":true}]"#))
-                .child(div().text_sm().child("Use {{token}} in a later request. Source kinds: header, json_field, status."))
-                .child(Editor::new(&draft.captures).small().h(px(100.)));
-        }
-        section.into_any_element()
+        });
+        cx.notify();
     }
 
-    fn render_result(&self) -> Option<AnyElement> {
-        let index = self.selected?;
-        let report = self.reports.get(index)?;
-        let mut result = div().flex().flex_col().gap_1().child(format!(
-            "Step {}{} · {} ms",
-            index + 1,
-            step_state(report),
-            report.elapsed.as_millis()
-        ));
-        if let Some(failure) = report.failure {
-            result = result.child(format!("Failure: {failure:?}"));
-        }
-        if let ChainStepOutcome::CheckFailed(error) = &report.outcome {
-            result = result.child(error.to_string());
-        }
-        if let Some(response) = &report.response {
-            result = result.child(format!(
-                "HTTP {} · {} bytes{} · response content hidden",
-                response.status,
-                response.bytes_received,
-                if response.truncated {
-                    " (truncated)"
-                } else {
-                    ""
-                },
-            ));
-        }
-        if let Some(step) = self
-            .run_definition
-            .as_ref()
-            .and_then(|chain| chain.steps.get(index))
+    pub(super) fn link_field(
+        &mut self,
+        index: usize,
+        field: &ResponseField,
+        target: ChainInputTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running
+            || self.selected != Some(index)
+            || !self.steps.get(index).is_some_and(|s| s.step.enabled)
         {
-            for rule in report
-                .captures
-                .iter()
-                .filter_map(|&rule| step.captures.get(rule))
-            {
-                let source = match &rule.source {
-                    CaptureSource::Status => "HTTP status".to_owned(),
-                    CaptureSource::Header { name } => format!("header {name}"),
-                    CaptureSource::JsonField { pointer } => format!("JSON {pointer}"),
-                };
-                let sensitivity = if rule.sensitive { " · sensitive" } else { "" };
-                result = result.child(format!("{} ← {source} · masked{sensitivity}", rule.name));
-            }
+            return;
         }
-        Some(result.into_any_element())
+        let Some(source) = self.steps[..index].iter().position(|step| {
+            step.step.enabled
+                && step.step.id == field.step_id
+                && step.step.request_id == field.request_id
+        }) else {
+            return;
+        };
+        let source_kind = CaptureSource::LinkedJsonField {
+            pointer: field.pointer.clone(),
+        };
+        let name = if let Some(rule) = self.steps[source]
+            .step
+            .captures
+            .iter()
+            .find(|rule| rule.source == source_kind)
+        {
+            rule.name.clone()
+        } else {
+            let name = (1..)
+                .map(|suffix| format!("response_field_{suffix}"))
+                .find(|name| {
+                    self.steps.iter().all(|step| {
+                        step.step.captures.iter().all(|rule| &rule.name != name)
+                            && step
+                                .captures
+                                .iter()
+                                .all(|rule| &rule.output_name(cx) != name)
+                    })
+                })
+                .expect("finite capture names");
+            self.steps[source].step.captures.push(CaptureRule {
+                name: name.clone(),
+                source: source_kind,
+                required: true,
+                sensitive: true,
+            });
+            name
+        };
+        let binding = ChainInput {
+            source_step_id: field.step_id.clone(),
+            capture_name: name,
+            target,
+        };
+        let inputs = &mut self.steps[index].inputs;
+        if let Some(existing) = inputs
+            .iter_mut()
+            .find(|input| input.build(cx).target == binding.target)
+        {
+            *existing = InputDraft::new(binding, window, cx);
+        } else {
+            inputs.push(InputDraft::new(binding, window, cx));
+        }
+        self.clear_results(cx);
+    }
+
+    fn rules_mut(&mut self, index: usize, outputs: bool) -> Option<&mut Vec<Rule>> {
+        let draft = self.steps.get_mut(index)?;
+        Some(if outputs {
+            &mut draft.captures
+        } else {
+            &mut draft.assertions
+        })
     }
 }
 
 #[derive(Clone, Copy)]
-enum StepEdit {
+pub(super) enum StepEdit {
     Add,
-    Replace,
     Toggle,
     Remove,
+    Duplicate,
     Move(isize),
 }
 
-fn step_state(report: &ChainStepReport) -> &'static str {
+pub(super) fn step_state(report: &ChainStepReport) -> &'static str {
     match report.outcome {
-        ChainStepOutcome::Passed { .. } => " · Passed",
-        ChainStepOutcome::RequestFailed | ChainStepOutcome::CheckFailed(_) => " · Failed",
-        ChainStepOutcome::Disabled => " · Disabled",
-        ChainStepOutcome::Skipped => " · Skipped",
+        ChainStepOutcome::Passed { .. } => "Passed",
+        ChainStepOutcome::RequestFailed | ChainStepOutcome::CheckFailed(_) => "Failed",
+        ChainStepOutcome::Disabled => "Disabled",
+        ChainStepOutcome::Skipped => "Skipped",
+    }
+}
+
+pub(super) fn target_label(target: &ChainInputTarget) -> &'static str {
+    match target {
+        ChainInputTarget::Variable { .. } => "Request variable",
+        ChainInputTarget::BearerToken => "Bearer token",
+        ChainInputTarget::BasicUsername => "Basic username",
+        ChainInputTarget::BasicPassword => "Basic password",
+    }
+}
+
+pub(super) fn target_short_label(target: &ChainInputTarget, var_name: &str) -> String {
+    match target {
+        ChainInputTarget::Variable { .. } => {
+            let trimmed = var_name.trim();
+            if trimmed.is_empty() {
+                "{{var}}".to_owned()
+            } else {
+                format!("{{{{{trimmed}}}}}")
+            }
+        }
+        ChainInputTarget::BearerToken => "Bearer".to_owned(),
+        ChainInputTarget::BasicUsername => "Basic user".to_owned(),
+        ChainInputTarget::BasicPassword => "Basic pass".to_owned(),
     }
 }
 
 impl Render for ChainSheet {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("chain-editor")
+        let dirty = self.has_changes(cx);
+        let border = cx.theme().border;
+        let has_trusted = !self.trusted.read(cx).value().trim().is_empty();
+        let controls = div()
+            .flex_shrink_0()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(border)
+            .bg(cx.theme().background)
             .flex()
             .flex_col()
-            .min_h_0()
-            .gap_3()
-            .overflow_y_scroll()
-            .child("Chain name")
-            .child(Input::new(&self.name).small())
-            .when(self.saved, |el| {
-                el.child(
-                    div()
-                        .text_sm()
-                        .child(format!("Chain ID: {}", self.chain_id)),
-                )
-            })
+            .gap_2()
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap_2()
                     .child(
-                        Button::new("save-chain")
+                        div()
+                            .w(px(280.))
+                            .min_w_0()
+                            .child(Input::new(&self.name).small()),
+                    )
+                    .child(div().w(px(1.)).h(px(18.)).bg(border))
+                    .child(
+                        div()
+                            .w(px(148.))
+                            .min_w_0()
+                            .child(Select::new(&self.environment).small()),
+                    )
+                    .child(
+                        div()
+                            .w(px(210.))
+                            .min_w_0()
+                            .child(Input::new(&self.origin).small()),
+                    )
+                    .child(
+                        Button::new("run-settings")
+                            .ghost()
                             .small()
-                            .primary()
-                            .label("Save chain")
+                            .icon(svg_icon("icons/globe.svg").xsmall())
+                            .label(if self.show_run_settings {
+                                "Hide origins"
+                            } else {
+                                "Origins"
+                            })
+                            .when(has_trusted, |btn| {
+                                btn.child(dot_indicator(crate::theme::brand_accent(
+                                    cx.theme().is_dark(),
+                                )))
+                            })
+                            .tooltip("Configure additional trusted origins")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.show_run_settings = !view.show_run_settings;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("save-chain")
+                            .outline()
+                            .small()
+                            .icon(svg_icon("icons/save.svg").xsmall())
+                            .label("Save")
+                            .when(dirty, |btn| {
+                                btn.child(dot_indicator(crate::theme::brand_accent(
+                                    cx.theme().is_dark(),
+                                )))
+                            })
                             .disabled(self.running)
                             .on_click(
                                 cx.listener(|view, _, window, cx| view.save(false, window, cx)),
@@ -555,13 +902,13 @@ impl Render for ChainSheet {
                     .when(self.saved, |el| {
                         el.child(
                             Button::new("delete-chain")
+                                .ghost()
                                 .small()
-                                .outline()
                                 .disabled(self.running)
                                 .label(if self.confirming_delete {
-                                    "Confirm delete chain"
+                                    "Confirm delete"
                                 } else {
-                                    "Delete chain"
+                                    "Delete"
                                 })
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     if view.confirming_delete {
@@ -572,70 +919,118 @@ impl Render for ChainSheet {
                                     }
                                 })),
                         )
-                    }),
-            )
-            .child("Run environment")
-            .child(Select::new(&self.environment).small())
-            .child("Primary origin (required for each run)")
-            .child(Input::new(&self.origin).small())
-            .child("Additional trusted origins")
-            .child(Input::new(&self.trusted).small())
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
+                    })
                     .child(
-                        Button::new("run-chain")
+                        Button::new("close-chain")
+                            .ghost()
                             .small()
-                            .primary()
-                            .label("Run chain")
+                            .label(if self.confirming_discard {
+                                "Confirm discard"
+                            } else {
+                                "Close"
+                            })
                             .disabled(self.running)
-                            .on_click(cx.listener(|view, _, _, cx| view.run(cx))),
-                    )
-                    .when(self.running, |el| {
-                        el.child(
-                            Button::new("cancel-chain")
-                                .small()
-                                .outline()
-                                .label(if self.cancel.is_some() {
-                                    "Cancel run"
-                                } else {
-                                    "Cancelling…"
-                                })
-                                .disabled(self.cancel.is_none())
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    if let Some(cancel) = view.cancel.take() {
-                                        let _ = cancel.send(());
-                                    }
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.has_changes(cx) && !view.confirming_discard {
+                                    view.confirming_discard = true;
                                     cx.notify();
-                                })),
-                        )
+                                } else {
+                                    let _ = view.workspace.update(cx, |workspace, cx| {
+                                        workspace.close_chain_editor(cx)
+                                    });
+                                }
+                            })),
+                    )
+                    .child(div().w(px(1.)).h(px(18.)).bg(border))
+                    .child(if self.running {
+                        Button::new("cancel-chain")
+                            .outline()
+                            .small()
+                            .icon(svg_icon("icons/square.svg").xsmall())
+                            .label(if self.cancel.is_some() {
+                                "Cancel run"
+                            } else {
+                                "Cancelling…"
+                            })
+                            .disabled(self.cancel.is_none())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(cancel) = view.cancel.take() {
+                                    let _ = cancel.send(());
+                                }
+                                cx.notify();
+                            }))
+                    } else {
+                        Button::new("run-chain")
+                            .primary()
+                            .small()
+                            .icon(svg_icon("icons/play.svg").xsmall())
+                            .label("Run chain")
+                            .on_click(cx.listener(|view, _, _, cx| view.run(cx)))
                     }),
             )
-            .when(self.run_definition.is_some(), |el| {
-                el.child(format!(
-                    "{} / {} steps reported{}",
-                    self.reports.len(),
-                    self.run_definition
-                        .as_ref()
-                        .map_or(0, |chain| chain.steps.len()),
-                    if self.running { " · Running" } else { "" },
-                ))
+            .when(self.show_run_settings, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .pt_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Trusted origins (optional):"),
+                        )
+                        .child(div().w(px(360.)).child(Input::new(&self.trusted).small()))
+                        .when(self.saved, |el| {
+                            el.child(div().flex_1()).child(
+                                div()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("ID: {}", self.chain_id)),
+                            )
+                        }),
+                )
             })
-            .children(
-                self.error
-                    .as_ref()
-                    .map(|error| div().text_color(cx.theme().danger).child(error.clone())),
+            .children(self.error.as_ref().map(|error| {
+                div()
+                    .px_2p5()
+                    .py_1()
+                    .rounded(px(6.))
+                    .bg(cx.theme().danger.opacity(0.12))
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone())
+            }));
+
+        div()
+            .id("chain-editor")
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(controls)
+            .child(
+                div().flex_1().min_h_0().child(
+                    v_resizable("chain-editor-split")
+                        .child(
+                            resizable_panel()
+                                .size_range(px(220.)..px(1400.))
+                                .child(self.canvas.clone()),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(240.))
+                                .size_range(px(160.)..px(480.))
+                                .child(self.render_inspector(cx)),
+                        ),
+                ),
             )
-            .children(self.render_result())
-            .child(self.render_steps(cx))
     }
 }
 
-pub(super) fn explorer_button(
-    view: &WorkspaceView,
-    cx: &Context<WorkspaceView>,
-) -> impl IntoElement {
+pub(super) fn chain_picker(view: &WorkspaceView, cx: &Context<WorkspaceView>) -> impl IntoElement {
     let choices: Vec<_> = view
         .current()
         .chains
@@ -643,7 +1038,7 @@ pub(super) fn explorer_button(
         .map(|chain| (chain.id.clone(), chain.name.clone()))
         .collect();
     let workspace = cx.weak_entity();
-    Button::new("explorer-chains")
+    Button::new("chain-picker")
         .small()
         .outline()
         .label(format!("Chains ({})", choices.len()))
@@ -651,14 +1046,16 @@ pub(super) fn explorer_button(
             let workspace_new = workspace.clone();
             menu = menu.item(
                 PopupMenuItem::new("New chain").on_click(move |_, window, cx| {
-                    let _ = workspace_new.update(cx, |view, cx| open(view, None, window, cx));
+                    let _ = workspace_new
+                        .update(cx, |view, cx| view.open_chain_editor(None, window, cx));
                 }),
             );
             for (id, name) in &choices {
                 let (id, workspace) = (id.clone(), workspace.clone());
                 menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
                     move |_, window, cx| {
-                        let _ = workspace.update(cx, |view, cx| open(view, Some(&id), window, cx));
+                        let _ = workspace
+                            .update(cx, |view, cx| view.open_chain_editor(Some(&id), window, cx));
                     },
                 ));
             }
@@ -666,7 +1063,7 @@ pub(super) fn explorer_button(
         })
 }
 
-fn open(
+pub(super) fn open(
     view: &WorkspaceView,
     id: Option<&str>,
     window: &mut Window,
@@ -678,28 +1075,47 @@ fn open(
         None => RequestChain::new("New chain"),
     };
     let workspace = cx.weak_entity();
-    let editor = cx.new(|cx| ChainSheet::new(workspace, project, chain, id.is_some(), window, cx));
-    window.open_sheet(cx, {
-        let editor = editor.clone();
-        move |sheet, _, _| {
-            sheet
-                .size(px(680.))
-                .title("Request chain")
-                .child(editor.clone())
-        }
-    });
-    Some(editor)
+    Some(cx.new(|cx| ChainSheet::new(workspace, project, chain, id.is_some(), window, cx)))
+}
+
+fn extract_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    let scheme = &trimmed[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let rest = &trimmed[scheme_end + 3..];
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() || host.contains("{{") {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
 }
 
 fn collect_requests(
     requests: &[fastman_core::ApiRequest],
     folders: &[Folder],
     path: &str,
-    choices: &mut Vec<Choice>,
+    choices: &mut Vec<RequestChoice>,
 ) {
-    choices.extend(requests.iter().map(|request| Choice {
-        id: request.id.clone(),
-        label: format!("{path} / {} {}", request.method, request.name).into(),
+    choices.extend(requests.iter().map(|request| {
+        let url_preview = if request.url.trim().is_empty() {
+            "(no URL)".to_owned()
+        } else {
+            request.url.trim().to_owned()
+        };
+        RequestChoice {
+            id: request.id.clone(),
+            label: format!("{}  ·  {path}", request.name).into(),
+            name: request.name.clone().into(),
+            method: request.method.clone().into(),
+            origin: extract_origin(&request.url),
+            url_preview: url_preview.into(),
+            variables: fastman_core::template::inspect_request(request, &BTreeMap::new())
+                .missing_variables,
+        }
     }));
     for folder in folders {
         collect_requests(
@@ -713,8 +1129,11 @@ fn collect_requests(
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkspaceView, open};
-    use fastman_core::{ApiRequest, ChainStep, ChainStepOutcome, ProjectStore, RequestChain};
+    use super::{ResponseField, Rule, StepRequestKey, WorkspaceView};
+    use fastman_core::{
+        ApiRequest, AssertionRule, CaptureRule, CaptureSource, ChainInputTarget, ChainStep,
+        ChainStepOutcome, ProjectStore, RequestChain,
+    };
     use gpui::{AppContext as _, TestAppContext};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -739,6 +1158,7 @@ mod tests {
         let request = ApiRequest::new("GET", "Capture", format!("{origin}/capture"));
         project.collections[0].requests.push(request.clone());
         let mut chain = RequestChain::new("Capture chain");
+        chain.steps.push(ChainStep::new(request.id.clone()));
         chain.steps.push(ChainStep::new(request.id));
         project.chains.push(chain.clone());
         store.save(&project).unwrap();
@@ -750,7 +1170,8 @@ mod tests {
                 .unwrap();
             let mut request = [0; 1024];
             assert_ne!(stream.read(&mut request).unwrap(), 0);
-            stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\nX-Token: masked-canary\r\n\r\n").unwrap();
+            let body = r#"{"auth":{"access/token":"masked-canary"}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\nX-Token: masked-canary\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
@@ -764,26 +1185,34 @@ mod tests {
         let sheet = cx
             .update_window(window, |_, window, cx| {
                 workspace.update(cx, |view, cx| {
-                    open(view, Some(&chain.id), window, cx).unwrap()
+                    view.open_chain_editor(Some(&chain.id), window, cx);
+                    view.chain_editor.clone().unwrap()
                 })
             })
             .unwrap();
         cx.run_until_parked();
         cx.update_window(window, |_, window, cx| {
             sheet.update(cx, |view, cx| {
-                view.origin
-                    .update(cx, |input, cx| input.set_value(origin, window, cx));
-                view.steps[0].assertions.update(cx, |input, cx| {
-                    input.set_value(r#"[{"kind":"status","expected":200}]"#, window, cx);
-                });
-                view.steps[0].captures.update(cx, |input, cx| {
-                    input.set_value(
-                        r#"[{"name":"token","source":{"kind":"header","name":"X-Token"}}]"#,
-                        window,
-                        cx,
-                    );
-                });
-                view.run(cx);
+                // Origin should already be auto-detected from the first request!
+                assert_eq!(view.origin.read(cx).value().as_ref(), origin.as_str());
+                view.steps[0].assertions.push(Rule::from_assertion(
+                    AssertionRule::Status { expected: 200 },
+                    window,
+                    cx,
+                ));
+                view.steps[0].captures.push(Rule::from_capture(
+                    CaptureRule {
+                        name: "token".into(),
+                        source: CaptureSource::Header {
+                            name: "X-Token".into(),
+                        },
+                        required: true,
+                        sensitive: true,
+                    },
+                    window,
+                    cx,
+                ));
+                view.run_prefix(1, cx);
             });
         })
         .unwrap();
@@ -808,8 +1237,33 @@ mod tests {
             );
             assert_eq!(view.reports[0].captures, [0]);
             assert!(!format!("{:?}", view.reports).contains("masked-canary"));
-            assert!(view.render_result().is_some());
+            assert!(view.render_result(0, cx).is_some());
         });
+        cx.update_window(window, |_, window, cx| {
+            sheet.update(cx, |view, cx| {
+                let source = &view.steps[0].step;
+                let key = StepRequestKey::new(&source.id, &source.request_id);
+                let fields = &view.response_fields[&key];
+                assert_eq!(fields, &["/auth/access~1token"]);
+                assert_eq!(view.reports.len(), 1);
+                let field = ResponseField {
+                    step_id: source.id.clone(),
+                    request_id: source.request_id.clone(),
+                    pointer: fields[0].clone(),
+                };
+                view.select_step(Some(1), window, cx);
+                view.link_field(1, &field, ChainInputTarget::BearerToken, window, cx);
+                let saved = view.build(cx).unwrap();
+                let link = &saved.steps[1].inputs[0];
+                assert_eq!(link.target, ChainInputTarget::BearerToken);
+                assert!(saved.steps[0].captures.iter().any(|rule| {
+                    rule.name == link.capture_name
+                        && rule.sensitive
+                        && matches!(&rule.source, CaptureSource::LinkedJsonField { pointer } if pointer == &field.pointer)
+                }));
+            });
+        })
+        .unwrap();
         server.join().unwrap();
     }
 }

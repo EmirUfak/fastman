@@ -1,33 +1,53 @@
 use crate::{http::HttpResponse, model::AssertionRule};
 use serde_json::Value;
-use thiserror::Error;
+use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("Response assertion at index {rule_index} failed: {reason}")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertionFailure {
     pub rule_index: usize,
     pub reason: AssertionError,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+impl fmt::Display for AssertionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Response assertion at index {} failed: {}",
+            self.rule_index, self.reason
+        )
+    }
+}
+
+impl std::error::Error for AssertionFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssertionError {
-    #[error("status does not match")]
     StatusMismatch,
-    #[error("header is missing")]
     MissingHeader,
-    #[error("header value does not match")]
     HeaderMismatch,
-    #[error("response body was truncated")]
     TruncatedBody,
-    #[error("response body is not valid JSON")]
     MalformedJson,
-    #[error("JSON field is missing")]
     MissingJsonField,
-    #[error("JSON value or type does not match")]
     JsonMismatch,
-    #[error("response latency exceeds limit")]
     LatencyExceeded,
 }
+
+impl fmt::Display for AssertionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StatusMismatch => f.write_str("status does not match"),
+            Self::MissingHeader => f.write_str("header is missing"),
+            Self::HeaderMismatch => f.write_str("header value does not match"),
+            Self::TruncatedBody => f.write_str("response body was truncated"),
+            Self::MalformedJson => f.write_str("response body is not valid JSON"),
+            Self::MissingJsonField => f.write_str("JSON field is missing"),
+            Self::JsonMismatch => f.write_str("JSON value or type does not match"),
+            Self::LatencyExceeded => f.write_str("response latency exceeds limit"),
+        }
+    }
+}
+
+impl std::error::Error for AssertionError {}
 
 /// Evaluate rules in order, stopping at the first failure. Errors contain no response data.
 pub fn evaluate_assertions(

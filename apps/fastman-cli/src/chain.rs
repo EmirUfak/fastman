@@ -1,15 +1,17 @@
 use anyhow::{Context, Result, bail};
 use fastman_core::{
     ChainFailure, ChainRunOptions, ChainStepOutcome, OsSecretStore, ProjectStore,
-    run_chain_with_report,
+    run_chain_with_report, security::sanitize_terminal_line,
 };
 use serde_json::json;
 use std::future::pending;
 use std::time::Duration;
 
 pub(super) async fn run(mut args: impl Iterator<Item = String>) -> Result<i32> {
-    if args.next().as_deref() != Some("run") {
-        bail!("Expected `chain run` (see --help)");
+    match args.next().as_deref() {
+        Some("list") => return list(args),
+        Some("run") => {}
+        _ => bail!("Expected `chain list` or `chain run` (see --help)"),
     }
     let (mut project, mut chain, mut origin, mut environment, mut workspace) =
         (None, None, None, None, None);
@@ -72,7 +74,9 @@ pub(super) async fn run(mut args: impl Iterator<Item = String>) -> Result<i32> {
             ChainStepOutcome::Disabled => "disabled",
             ChainStepOutcome::Skipped => "skipped",
         };
-        if let Some(failure) = report.failure {
+        if exit_code == 0
+            && let Some(failure) = report.failure
+        {
             exit_code = match failure {
                 ChainFailure::Policy => 2,
                 ChainFailure::Transport
@@ -117,6 +121,49 @@ pub(super) async fn run(mut args: impl Iterator<Item = String>) -> Result<i32> {
         println!("{}", json!({ "exit_code": exit_code, "steps": steps }));
     }
     Ok(exit_code)
+}
+
+fn list(mut args: impl Iterator<Item = String>) -> Result<i32> {
+    let (mut project, mut workspace) = (None, None);
+    let mut json_output = false;
+    while let Some(flag) = args.next() {
+        let target = match flag.as_str() {
+            "--project" => &mut project,
+            "--workspace" => &mut workspace,
+            "--json" if !json_output => {
+                json_output = true;
+                continue;
+            }
+            _ => bail!("Unknown or repeated chain list option (see --help)"),
+        };
+        if target.is_some() {
+            bail!("Repeated chain list option (see --help)");
+        }
+        *target = Some(flag_value(&mut args)?);
+    }
+    let project_id = project.context("Missing --project")?;
+    let project = ProjectStore::system_default()
+        .and_then(|store| store.for_workspace(workspace.as_deref().unwrap_or("default")))
+        .and_then(|store| store.load(&project_id))
+        .map_err(|_| anyhow::anyhow!("Could not load or validate project"))?;
+    if json_output {
+        let chains: Vec<_> = project
+            .chains
+            .iter()
+            .map(|c| json!({ "id": c.id, "name": c.name, "steps": c.steps.len() }))
+            .collect();
+        println!("{}", json!({ "chains": chains }));
+    } else {
+        for chain in &project.chains {
+            println!(
+                "{}\t{}\t{} steps",
+                chain.id,
+                sanitize_terminal_line(&chain.name),
+                chain.steps.len()
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn flag_value(args: &mut impl Iterator<Item = String>) -> Result<String> {

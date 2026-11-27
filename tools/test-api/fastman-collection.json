@@ -1,0 +1,96 @@
+{
+  "info": {
+    "name": "Fastman Test API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login (sets cookie + token)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"demo\",\n  \"password\": \"secret\"\n}"
+            },
+            "url": { "raw": "http://127.0.0.1:4010/auth/login" }
+          }
+        },
+        {
+          "name": "Who am I (cookie or bearer)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "http://127.0.0.1:4010/auth/me" }
+          }
+        },
+        {
+          "name": "Cookie-only check (tests isolation)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "http://127.0.0.1:4010/auth/cookie-only" }
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "http://127.0.0.1:4010/auth/logout" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Items CRUD",
+      "item": [
+        {
+          "name": "Create item",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"fastman-chain-item\",\n  \"status\": \"active\"\n}"
+            },
+            "url": { "raw": "http://127.0.0.1:4010/items" }
+          }
+        },
+        {
+          "name": "Read item",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "http://127.0.0.1:4010/items/{{item_id}}" }
+          }
+        },
+        {
+          "name": "Update item",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"fastman-chain-item-updated\",\n  \"status\": \"archived\"\n}"
+            },
+            "url": { "raw": "http://127.0.0.1:4010/items/{{item_id}}" }
+          }
+        },
+        {
+          "name": "Delete item (cleanup)",
+          "request": {
+            "method": "DELETE",
+            "url": { "raw": "http://127.0.0.1:4010/items/{{item_id}}" }
+          }
+        },
+        {
+          "name": "Verify item deleted (404)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "http://127.0.0.1:4010/items/{{item_id}}" }
+          }
+        }
+      ]
+    }
+  ]
+}

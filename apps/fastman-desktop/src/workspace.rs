@@ -28,7 +28,7 @@ use gpui_kit::component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    select::{SearchableVec, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -97,6 +97,8 @@ pub struct WorkspaceView {
     pub(super) projects: Vec<Project>,
     pub(super) active_project: usize,
     pub(super) project_selector: Entity<SelectState<SearchableVec<ProjectChoice>>>,
+    chain_mode: bool,
+    pub(super) chain_editor: Option<Entity<crate::chain_sheet::ChainSheet>>,
     pub(super) explorer_search: Entity<InputState>,
     pub(super) editing_request_name: bool,
     pub(super) selected_id: Option<String>,
@@ -483,6 +485,8 @@ impl WorkspaceView {
             status: SharedString::new_static(initial_status),
             status_is_error: false,
             _subscriptions: subscriptions,
+            chain_mode: false,
+            chain_editor: None,
         }
     }
 
@@ -1334,7 +1338,12 @@ impl WorkspaceView {
     }
 
     pub(super) fn open_request(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chain_mode && self.chain_blocks_navigation(window, cx) {
+            return;
+        }
         if self.selected_id.as_ref() == Some(&id) {
+            self.chain_mode = false;
+            cx.notify();
             return;
         }
         self.flush_current_project_then(
@@ -1343,6 +1352,7 @@ impl WorkspaceView {
             cx,
             move |view, window, cx| {
                 view.cancel(cx);
+                view.chain_mode = false;
                 view.activate_request_tab(Some(id), window, cx);
             },
         );
@@ -1391,6 +1401,13 @@ impl WorkspaceView {
         }
     }
 
+    fn restore_project_selector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_project;
+        self.project_selector.update(cx, |selector, cx| {
+            selector.set_selected_index(Some(IndexPath::default().row(active)), window, cx);
+        });
+    }
+
     pub(super) fn switch_project(
         &mut self,
         index: usize,
@@ -1400,14 +1417,25 @@ impl WorkspaceView {
         if index == self.active_project || index >= self.projects.len() {
             return;
         }
+        if self.chain_blocks_navigation(window, cx) {
+            self.restore_project_selector(window, cx);
+            return;
+        }
         self.flush_current_project_then(
             "Cannot switch project",
             Some(window),
             cx,
-            move |view, window, cx| {
+            move |view, mut window, cx| {
                 if index >= view.projects.len() || index == view.active_project {
                     return;
                 }
+                if let Some(window) = window.as_deref_mut()
+                    && view.chain_blocks_navigation(window, cx)
+                {
+                    view.restore_project_selector(window, cx);
+                    return;
+                }
+                view.chain_editor = None;
                 view.cancel(cx);
                 view.active_project = index;
                 if let Some(window) = window {
@@ -1465,6 +1493,9 @@ impl WorkspaceView {
         if index == self.active_workspace || index >= self.workspaces.len() {
             return;
         }
+        if self.chain_blocks_navigation(window, cx) {
+            return;
+        }
         self.flush_current_project_then(
             "Cannot switch workspace",
             Some(window),
@@ -1493,6 +1524,13 @@ impl WorkspaceView {
                     }
                     match result {
                         Ok((store, projects, warnings)) => {
+                            if let Some(window) = window.as_deref_mut()
+                                && view.chain_blocks_navigation(window, cx)
+                            {
+                                view.set_status("Workspace switch cancelled", false, cx);
+                                return;
+                            }
+                            view.chain_editor = None;
                             view.cancel(cx);
                             view.responses.clear();
                             view.store = store;
@@ -2278,6 +2316,76 @@ impl WorkspaceView {
         crate::variables_sheet::open_variables_sheet(self, window, cx);
     }
 
+    fn chain_blocks_navigation(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = &self.chain_editor else {
+            return false;
+        };
+        let editor = editor.read(cx);
+        let message = if editor.is_running() {
+            "Finish or cancel the chain run before switching."
+        } else if editor.has_changes(cx) {
+            "Save or discard the chain draft before switching."
+        } else {
+            return false;
+        };
+        window.push_notification(Notification::warning(message), cx);
+        true
+    }
+
+    pub(super) fn open_chain_editor(
+        &mut self,
+        id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chain_blocks_navigation(window, cx) {
+            return;
+        }
+        self.chain_editor = crate::chain_sheet::open(self, id, window, cx);
+        self.chain_mode = true;
+        cx.notify();
+    }
+
+    pub(super) fn close_chain_editor(&mut self, cx: &mut Context<Self>) {
+        self.chain_editor = None;
+        cx.notify();
+    }
+
+    fn render_chain_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_6()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .w(px(220.))
+                    .child(Select::new(&self.project_selector).small()),
+            )
+            .child(crate::chain_sheet::chain_picker(self, cx));
+        let editor = self
+            .chain_editor
+            .as_ref()
+            .filter(|editor| editor.read(cx).matches_project(&self.current().id));
+        div().size_full().flex().flex_col()
+            .child(toolbar)
+            .child(div().flex_1().min_h_0()
+                .children(editor.cloned())
+                .when(editor.is_none(), |el| {
+                    el.flex().items_center().justify_center()
+                        .child(div().flex().flex_col().items_center().gap_2()
+                            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Build a request chain"))
+                            .child(div().text_color(cx.theme().muted_foreground)
+                                .child("Connect saved requests and pass outputs from one node to the next."))
+                            .child(Button::new("first-chain").small().primary().label("New chain")
+                                .on_click(cx.listener(|view, _, window, cx| view.open_chain_editor(None, window, cx)))))
+                }))
+            .into_any_element()
+    }
+
     pub(super) fn save_chain_definition(
         &mut self,
         project_id: &str,
@@ -2827,6 +2935,34 @@ impl Render for WorkspaceView {
                         )
                     }),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .children([(false, "Requests"), (true, "Chains")].map(
+                        |(chain_mode, label)| {
+                            let button =
+                                Button::new(label)
+                                    .small()
+                                    .label(label)
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        if view.chain_mode == chain_mode {
+                                            return;
+                                        }
+                                        if !chain_mode && view.chain_blocks_navigation(window, cx) {
+                                            return;
+                                        }
+                                        view.chain_mode = chain_mode;
+                                        cx.notify();
+                                    }));
+                            if self.chain_mode == chain_mode {
+                                button.primary()
+                            } else {
+                                button.ghost()
+                            }
+                        },
+                    )),
+            )
             .child(div().flex_1())
             .child(
                 Button::new("open-command-palette")
@@ -3070,27 +3206,41 @@ impl Render for WorkspaceView {
             .id("fastman-root")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|view, _: &SendRequest, window, cx| {
-                view.send(Some(window), cx);
+                if !view.chain_mode {
+                    view.send(Some(window), cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &SaveRequest, window, cx| {
-                view.save_with_toast(window, cx);
+                if !view.chain_mode {
+                    view.save_with_toast(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &NewRequest, window, cx| {
-                view.add_request(window, cx);
+                if view.chain_mode {
+                    view.open_chain_editor(None, window, cx);
+                } else {
+                    view.add_request(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &CloseActiveTab, window, cx| {
-                if let Some(id) = view.selected_id.clone() {
+                if !view.chain_mode
+                    && let Some(id) = view.selected_id.clone()
+                {
                     view.close_tab(&id, window, cx);
                 }
             }))
             .on_action(cx.listener(|view, _: &FocusUrl, window, cx| {
-                view.url.read(cx).focus_handle(cx).focus(window, cx);
+                if !view.chain_mode {
+                    view.url.read(cx).focus_handle(cx).focus(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
-                view.explorer_search
-                    .read(cx)
-                    .focus_handle(cx)
-                    .focus(window, cx);
+                if !view.chain_mode {
+                    view.explorer_search
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &ToggleTheme, window, cx| {
                 view.toggle_theme(window, cx);
@@ -3111,24 +3261,25 @@ impl Render for WorkspaceView {
             .text_size(px(13.))
             .text_color(fg)
             .child(header)
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("workspace-panels")
-                        .child(
-                            resizable_panel()
-                                .size(px(270.))
-                                .size_range(px(210.)..px(480.))
-                                .child(self.render_explorer_panel(cx)),
-                        )
-                        .child(
-                            resizable_panel().child(
-                                div()
-                                    .size_full()
-                                    .child(self.render_request_response_area(cx)),
-                            ),
+            .child(div().flex_1().min_h_0().child(if self.chain_mode {
+                self.render_chain_workspace(cx)
+            } else {
+                h_resizable("workspace-panels")
+                    .child(
+                        resizable_panel()
+                            .size(px(270.))
+                            .size_range(px(210.)..px(480.))
+                            .child(self.render_explorer_panel(cx)),
+                    )
+                    .child(
+                        resizable_panel().child(
+                            div()
+                                .size_full()
+                                .child(self.render_request_response_area(cx)),
                         ),
-                ),
-            )
+                    )
+                    .into_any_element()
+            }))
             .child(status_bar)
     }
 }

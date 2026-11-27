@@ -1,30 +1,145 @@
 use crate::captures::{MAX_CAPTURE_NAME_BYTES, MAX_CAPTURES};
 use crate::security::is_valid_http_method;
 use crate::template::inspect_request;
+use crate::{Auth, CaptureSource, ChainInputTarget, ChainStep, RequestChain};
 use crate::{
     CaptureFailure, ChainRunContext, ChainRunError, HttpEngine, HttpError, Project, SecretStore,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::{Future, pending};
 use std::time::Duration;
-use thiserror::Error;
 use tokio::time::{Instant, sleep_until};
 
 pub const MAX_CHAIN_STEPS: usize = 128;
 const MAX_RUN_TIME: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Error)]
+/// Check the saved links independently of the execution environment.
+pub fn validate_chain_inputs(chain: &RequestChain) -> Result<(), ChainExecutionError> {
+    input_sources(chain).map(|_| ())
+}
+
+fn input_sources(chain: &RequestChain) -> Result<BTreeSet<(String, String)>, ChainExecutionError> {
+    let mut step_ids = BTreeSet::new();
+    let mut earlier: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut sources = BTreeSet::new();
+    for (index, step) in chain.steps.iter().enumerate() {
+        let invalid = |reason| ChainExecutionError::InvalidStep { index, reason };
+        if step.id.is_empty() || !step_ids.insert(step.id.as_str()) {
+            return Err(invalid("missing or duplicate step ID"));
+        }
+        if !step.enabled {
+            continue;
+        }
+        let mut targets = BTreeSet::new();
+        for input in &step.inputs {
+            if !targets.insert(&input.target) || targets.len() > MAX_CAPTURES {
+                return Err(invalid("duplicate or too many input targets"));
+            }
+            if let ChainInputTarget::Variable { name } = &input.target
+                && !valid_capture_name(name)
+            {
+                return Err(invalid("invalid input variable name"));
+            }
+            let Some(captures) = earlier.get(input.source_step_id.as_str()) else {
+                return Err(invalid("input must come from an earlier enabled node"));
+            };
+            if !captures.contains(input.capture_name.as_str()) {
+                return Err(invalid("input refers to a missing output"));
+            }
+            sources.insert((input.source_step_id.clone(), input.capture_name.clone()));
+            if sources.len() > MAX_CAPTURES {
+                return Err(invalid("too many linked outputs"));
+            }
+        }
+        if targets.contains(&ChainInputTarget::BearerToken)
+            && (targets.contains(&ChainInputTarget::BasicUsername)
+                || targets.contains(&ChainInputTarget::BasicPassword))
+        {
+            return Err(invalid("choose either bearer or basic authentication"));
+        }
+        earlier.insert(
+            step.id.as_str(),
+            step.captures
+                .iter()
+                .map(|rule| rule.name.as_str())
+                .collect::<BTreeSet<_>>(),
+        );
+    }
+    Ok(sources)
+}
+
+fn valid_capture_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_CAPTURE_NAME_BYTES
+        && name.trim() == name
+        && !name.contains(['{', '}'])
+}
+
+/// Existing Basic credentials can supply the other field in desktop sessions.
+fn bind_auth(auth: &mut Auth, target: &ChainInputTarget, value: String) {
+    match target {
+        ChainInputTarget::BearerToken => *auth = Auth::Bearer { token: value },
+        ChainInputTarget::BasicUsername | ChainInputTarget::BasicPassword => {
+            if !matches!(auth, Auth::Basic { .. }) {
+                *auth = Auth::Basic {
+                    username: String::new(),
+                    password: String::new(),
+                };
+            }
+            if let Auth::Basic { username, password } = auth {
+                if *target == ChainInputTarget::BasicUsername {
+                    *username = value;
+                } else {
+                    *password = value;
+                }
+            }
+        }
+        ChainInputTarget::Variable { .. } => {}
+    }
+}
+
+#[derive(Debug)]
 pub enum ChainExecutionError {
-    #[error("chain does not exist or its ID is ambiguous")]
     UnknownChain,
-    #[error("chain must contain an enabled step and at most {MAX_CHAIN_STEPS} steps")]
     InvalidLength,
-    #[error("invalid chain step at index {index}: {reason}")]
     InvalidStep { index: usize, reason: &'static str },
-    #[error(transparent)]
-    Context(#[from] ChainRunError),
-    #[error("could not initialize chain HTTP session")]
+    Context(ChainRunError),
     Session,
+}
+
+impl fmt::Display for ChainExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownChain => f.write_str("chain does not exist or its ID is ambiguous"),
+            Self::InvalidLength => {
+                write!(
+                    f,
+                    "chain must contain an enabled step and at most {MAX_CHAIN_STEPS} steps"
+                )
+            }
+            Self::InvalidStep { index, reason } => {
+                write!(f, "invalid chain step at index {index}: {reason}")
+            }
+            Self::Context(err) => err.fmt(f),
+            Self::Session => f.write_str("could not initialize chain HTTP session"),
+        }
+    }
+}
+
+impl std::error::Error for ChainExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Context(err) => err.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<ChainRunError> for ChainExecutionError {
+    fn from(err: ChainRunError) -> Self {
+        Self::Context(err)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +251,31 @@ pub async fn run_chain_with_progress(
     cancel: impl Future<Output = ()>,
     mut progress: impl FnMut(&ChainStepReport),
 ) -> Result<Vec<ChainStepReport>, ChainExecutionError> {
+    run_chain_observed(
+        project,
+        chain_id,
+        env_id,
+        secret_store,
+        options,
+        cancel,
+        |report, _| {
+            progress(report);
+        },
+    )
+    .await
+}
+
+/// Like `run_chain_with_progress`, with an in-process view of the live response.
+/// Callers must keep response data out of logs and persisted reports.
+pub async fn run_chain_observed(
+    project: &Project,
+    chain_id: &str,
+    env_id: Option<&str>,
+    secret_store: &dyn SecretStore,
+    options: ChainRunOptions<'_>,
+    cancel: impl Future<Output = ()>,
+    mut progress: impl FnMut(&ChainStepReport, Option<&crate::HttpResponse>),
+) -> Result<Vec<ChainStepReport>, ChainExecutionError> {
     let deadline = Instant::now() + options.timeout.min(MAX_RUN_TIME);
     let deadline_timer = sleep_until(deadline);
     tokio::pin!(cancel, deadline_timer);
@@ -148,6 +288,8 @@ pub async fn run_chain_with_progress(
         return Err(ChainExecutionError::InvalidLength);
     }
     let mut context = ChainRunContext::new(project, env_id, secret_store)?;
+    let sources = input_sources(chain)?;
+    context.retain_sources(sources.clone());
     let engine = HttpEngine::for_chain(options.primary_origin, options.trusted_origins)
         .map_err(|_| ChainExecutionError::Session)?;
     let mut available = context.resolved_variables().values;
@@ -166,7 +308,38 @@ pub async fn run_chain_with_progress(
             plan.push((step.clone(), request.clone(), None));
             continue;
         }
-        let inspection = inspect_request(request, &available);
+        let mut inspection_request = request.clone();
+        let mut step_variables = available.clone();
+        if step
+            .inputs
+            .iter()
+            .any(|input| !matches!(input.target, ChainInputTarget::Variable { .. }))
+        {
+            inspection_request
+                .headers
+                .retain(|header| !header.key.trim().eq_ignore_ascii_case("authorization"));
+        }
+        for input in &step.inputs {
+            if let ChainInputTarget::Variable { name } = &input.target {
+                step_variables.insert(name.clone(), "fastman-capture".into());
+            } else {
+                bind_auth(
+                    &mut inspection_request.auth,
+                    &input.target,
+                    "fastman-capture".into(),
+                );
+            }
+        }
+        if let Auth::Basic { username, password } = &inspection_request.auth
+            && !step.inputs.is_empty()
+            && !matches!(request.auth, Auth::Basic { .. })
+            && (username.is_empty() || password.is_empty())
+        {
+            return Err(invalid(
+                "bind both Basic fields when the saved request has no Basic auth",
+            ));
+        }
+        let inspection = inspect_request(&inspection_request, &step_variables);
         if inspection.unclosed || !inspection.missing_variables.is_empty() {
             return Err(invalid("request has unresolved or malformed variables"));
         }
@@ -176,50 +349,52 @@ pub async fn run_chain_with_progress(
         // A placeholder permits path/query captures while keeping the approved
         // origin fixed. Check that origin again after substituting real values.
         let url = engine
-            .resolve_url(request, &available, &Default::default())
+            .resolve_url(request, &step_variables, &Default::default())
             .map_err(|_| invalid("invalid or unapproved request destination"))?;
-        plan.push((
-            step.clone(),
-            request.clone(),
-            Some(url.origin().ascii_serialization()),
-        ));
+        let mut step = step.clone();
+        step.captures.retain(|rule| {
+            !matches!(rule.source, CaptureSource::LinkedJsonField { .. })
+                || sources.contains(&(step.id.clone(), rule.name.clone()))
+        });
         let mut names = BTreeSet::new();
         for rule in &step.captures {
-            if rule.name.is_empty()
-                || rule.name.len() > MAX_CAPTURE_NAME_BYTES
-                || rule.name.trim() != rule.name
-                || rule.name.contains(['{', '}'])
-                || !names.insert(&rule.name)
-            {
+            if !valid_capture_name(&rule.name) || !names.insert(&rule.name) {
                 return Err(invalid("invalid or duplicate capture name"));
             }
-            capture_names.insert(&rule.name);
-            if rule.required {
+            capture_names.insert(rule.name.clone());
+            if rule.required && !matches!(rule.source, CaptureSource::LinkedJsonField { .. }) {
                 available.insert(rule.name.clone(), "fastman-capture".into());
             }
         }
         if capture_names.len() > MAX_CAPTURES {
             return Err(invalid("chain exceeds capture limit"));
         }
+        plan.push((
+            step,
+            request.clone(),
+            Some(url.origin().ascii_serialization()),
+        ));
     }
     drop(available);
 
     let mut stopped = false;
+    let mut aborted = false;
     let mut outcomes = Vec::with_capacity(plan.len());
     for (step, request, origin) in plan {
         let started = Instant::now();
         let mut failure = None;
         let mut preview = None;
         let mut captures = Vec::new();
+        let mut received = None;
         let outcome = match origin {
             None => ChainStepOutcome::Disabled,
-            Some(_) if stopped => ChainStepOutcome::Skipped,
+            Some(_) if aborted || (stopped && !step.always_run) => ChainStepOutcome::Skipped,
             Some(origin) => {
                 let send = async {
                     if Instant::now() >= deadline {
                         return Err(ChainFailure::RunTimeout);
                     }
-                    send_step(&engine, &context, &request, &origin).await
+                    send_step(&engine, &context, request, &step, &origin).await
                 };
                 let result = tokio::select! {
                     biased;
@@ -235,22 +410,31 @@ pub async fn run_chain_with_progress(
                             truncated: response.truncated,
                         });
                         let checked = context.apply_step_response(&step, &response);
+                        let status = response.status;
+                        received = Some(response);
                         match checked {
                             _ if Instant::now() >= deadline => {
                                 failure = Some(ChainFailure::RunTimeout);
                                 ChainStepOutcome::RequestFailed
                             }
                             Ok(()) => {
-                                captures.extend(step.captures.iter().enumerate().filter_map(
-                                    |(index, rule)| {
-                                        (context.capture_origin(&rule.name)
-                                            == Some(step.id.as_str()))
-                                        .then_some(index)
-                                    },
-                                ));
-                                ChainStepOutcome::Passed {
-                                    status: response.status,
-                                }
+                                captures.extend(
+                                    chain.steps[outcomes.len()]
+                                        .captures
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(index, rule)| {
+                                            let active = !matches!(
+                                                rule.source,
+                                                CaptureSource::LinkedJsonField { .. }
+                                            ) || sources
+                                                .contains(&(step.id.clone(), rule.name.clone()));
+                                            (active
+                                                && context.has_step_capture(&step.id, &rule.name))
+                                            .then_some(index)
+                                        }),
+                                );
+                                ChainStepOutcome::Passed { status }
                             }
                             Err(error) => {
                                 failure = Some(match &error {
@@ -270,6 +454,12 @@ pub async fn run_chain_with_progress(
                 }
             }
         };
+        if matches!(
+            failure,
+            Some(ChainFailure::Cancelled | ChainFailure::RunTimeout)
+        ) {
+            aborted = true;
+        }
         stopped |= failure.is_some();
         let report = ChainStepReport {
             elapsed: if matches!(
@@ -285,7 +475,7 @@ pub async fn run_chain_with_progress(
             response: preview,
             captures,
         };
-        progress(&report);
+        progress(&report, received.as_ref());
         outcomes.push(report);
     }
     Ok(outcomes)
@@ -294,18 +484,48 @@ pub async fn run_chain_with_progress(
 async fn send_step(
     engine: &HttpEngine,
     context: &ChainRunContext,
-    request: &crate::ApiRequest,
+    mut request: crate::ApiRequest,
+    step: &ChainStep,
     origin: &str,
 ) -> Result<crate::HttpResponse, ChainFailure> {
-    let resolved = context.resolved_variables();
+    let mut resolved = context.resolved_variables();
+    let mut next_key = 0;
+    for input in &step.inputs {
+        let key = match &input.target {
+            ChainInputTarget::Variable { name } => name.clone(),
+            target => loop {
+                let key = format!("__fastman_chain_auth_{next_key}");
+                next_key += 1;
+                if !resolved.values.contains_key(&key)
+                    && !resolved.unresolved_secrets.contains_key(&key)
+                    && !step.inputs.iter().any(|input| matches!(&input.target, ChainInputTarget::Variable { name } if name == &key))
+                {
+                    bind_auth(&mut request.auth, target, format!("{{{{{key}}}}}"));
+                    break key;
+                }
+            },
+        };
+        context
+            .bind_capture(&mut resolved, input, key)
+            .ok_or(ChainFailure::Capture)?;
+    }
     let url = engine
-        .resolve_url(request, &resolved.values, &resolved.unresolved_secrets)
+        .resolve_url(&request, &resolved.values, &resolved.unresolved_secrets)
         .map_err(|_| ChainFailure::Policy)?;
     if url.origin().ascii_serialization() != origin {
         return Err(ChainFailure::Policy);
     }
+    let isolated;
+    let engine = if step.isolate_cookies {
+        isolated = engine
+            .isolated_cookies()
+            .map_err(|_| ChainFailure::Policy)?;
+        &isolated
+    } else {
+        engine
+    };
     engine
-        .send_with_secrets(request, &resolved)
+        .send_with_secrets(&request, &resolved)
         .await
         .map_err(|error| match error {
             HttpError::Transport(error) if error.is_timeout() => ChainFailure::RequestTimeout,
@@ -317,10 +537,7 @@ async fn send_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ApiRequest, AssertionRule, Auth, CaptureRule, CaptureSource, ChainStep, MemorySecretStore,
-        RequestChain,
-    };
+    use crate::{ApiRequest, AssertionRule, CaptureRule, CaptureSource, MemorySecretStore};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -335,6 +552,9 @@ mod tests {
                 request_id: request.id.clone(),
                 enabled: true,
                 assertions: vec![],
+                inputs: vec![],
+                isolate_cookies: false,
+                always_run: false,
                 captures: vec![],
             })
             .collect();
@@ -466,7 +686,7 @@ mod tests {
         let comment = ApiRequest::new(
             "POST",
             "Comment",
-            format!("{origin}/posts/{{{{post_id}}}}/comments"),
+            format!("{origin}/posts/{{{{comment_post}}}}/comments"),
         );
         let verify = ApiRequest::new(
             "GET",
@@ -478,6 +698,9 @@ mod tests {
             request_id: request.id.clone(),
             enabled: true,
             assertions: Vec::new(),
+            inputs: Vec::new(),
+            isolate_cookies: false,
+            always_run: false,
             captures: Vec::new(),
         };
         let mut first = step(0, &login);
@@ -485,6 +708,14 @@ mod tests {
             name: "token".into(),
             source: CaptureSource::Header {
                 name: "X-Token".into(),
+            },
+            required: true,
+            sensitive: true,
+        });
+        first.captures.push(CaptureRule {
+            name: "login_bearer".into(),
+            source: CaptureSource::LinkedJsonField {
+                pointer: "/auth/token".into(),
             },
             required: true,
             sensitive: true,
@@ -497,6 +728,46 @@ mod tests {
             },
             required: true,
             sensitive: false,
+        });
+        create_step.captures.push(CaptureRule {
+            name: "token".into(),
+            source: CaptureSource::Header {
+                name: "X-Token".into(),
+            },
+            required: true,
+            sensitive: true,
+        });
+        create_step.captures.push(CaptureRule {
+            name: "username".into(),
+            source: CaptureSource::Header {
+                name: "X-Username".into(),
+            },
+            required: true,
+            sensitive: true,
+        });
+        let mut comment_step = step(3, &comment);
+        for (capture, target) in [
+            (
+                "post_id",
+                ChainInputTarget::Variable {
+                    name: "comment_post".into(),
+                },
+            ),
+            ("username", ChainInputTarget::BasicUsername),
+            ("token", ChainInputTarget::BasicPassword),
+        ] {
+            comment_step.inputs.push(crate::ChainInput {
+                source_step_id: create_step.id.clone(),
+                capture_name: capture.into(),
+                target,
+            });
+        }
+        let mut verify_step = step(4, &verify);
+        verify_step.isolate_cookies = true;
+        verify_step.inputs.push(crate::ChainInput {
+            source_step_id: first.id.clone(),
+            capture_name: "login_bearer".into(),
+            target: ChainInputTarget::BearerToken,
         });
         let mut denied = step(5, &profile);
         denied
@@ -511,8 +782,8 @@ mod tests {
                 first,
                 step(1, &profile),
                 create_step,
-                step(3, &comment),
-                step(4, &verify),
+                comment_step,
+                verify_step,
                 denied,
                 disabled,
                 step(7, &profile),
@@ -527,18 +798,24 @@ mod tests {
         project.collections[0]
             .requests
             .extend([profile, create, comment, verify]);
+        project.chains[0].steps.swap(0, 4);
+        assert!(matches!(
+            run_chain(&project, "chain", None, &store, &origin, &[]).await,
+            Err(ChainExecutionError::InvalidStep { index: 0, .. })
+        ));
+        project.chains[0].steps.swap(0, 4);
         let server = tokio::spawn(async move {
             for (start, reply, body, bearer) in [
                 (
                     "POST /login HTTP/",
                     "HTTP/1.1 200 OK\r\nSet-Cookie: session=fixture\r\nX-Token: fixture-token",
-                    "",
+                    r#"{"auth":{"token":"fixture-token"}}"#,
                     false,
                 ),
                 ("GET /profile HTTP/", "HTTP/1.1 200 OK", "", true),
                 (
                     "POST /posts HTTP/",
-                    "HTTP/1.1 201 Created",
+                    "HTTP/1.1 201 Created\r\nX-Token: replacement-token\r\nX-Username: fixture-user",
                     r#"{"id":42}"#,
                     false,
                 ),
@@ -548,8 +825,13 @@ mod tests {
                     "",
                     false,
                 ),
-                ("GET /posts/42 HTTP/", "HTTP/1.1 200 OK", "", false),
-                ("GET /profile HTTP/", "HTTP/1.1 403 Forbidden", "", true),
+                (
+                    "GET /posts/42 HTTP/",
+                    "HTTP/1.1 200 OK\r\nSet-Cookie: isolated=fixture",
+                    "",
+                    true,
+                ),
+                ("GET /profile HTTP/", "HTTP/1.1 403 Forbidden", "", false),
             ] {
                 let (mut conn, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -561,8 +843,19 @@ mod tests {
                 if bearer {
                     assert!(request.contains("authorization: Bearer fixture-token\r\n"));
                 }
-                if !start.starts_with("POST /login") {
+                if reply.contains("403") {
+                    assert!(request.contains("authorization: Bearer replacement-token\r\n"));
+                }
+                if start.contains("/comments") {
+                    assert!(request.contains(
+                        "authorization: Basic Zml4dHVyZS11c2VyOnJlcGxhY2VtZW50LXRva2Vu\r\n"
+                    ));
+                }
+                if start.starts_with("GET /posts/42 HTTP/") {
+                    assert!(!request.contains("cookie:"));
+                } else if !start.starts_with("POST /login") {
                     assert!(request.contains("cookie: session=fixture\r\n"));
+                    assert!(!request.contains("isolated=fixture"));
                 }
                 conn.write_all(
                     format!(
@@ -589,6 +882,105 @@ mod tests {
                 ChainStepOutcome::CheckFailed(_),
                 ChainStepOutcome::Disabled,
                 ChainStepOutcome::Skipped,
+            ]
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn always_run_cleanup_runs_after_assertion_failure_and_validates_step_ids() {
+        let mut invalid = RequestChain::new("Invalid");
+        let mut s1 = ChainStep::new("req");
+        s1.id = "dup".into();
+        let mut s2 = ChainStep::new("req");
+        s2.id = "dup".into();
+        invalid.steps = vec![s1, s2];
+        assert!(validate_chain_inputs(&invalid).is_err());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut project = Project::new("CRUD");
+        let create = ApiRequest::new("POST", "Create", format!("{origin}/items"));
+        let check = ApiRequest::new("GET", "Check", format!("{origin}/items/{{{{item_id}}}}"));
+        let delete = ApiRequest::new(
+            "DELETE",
+            "Cleanup",
+            format!("{origin}/items/{{{{item_id}}}}"),
+        );
+        project.collections[0]
+            .requests
+            .extend([create.clone(), check.clone(), delete.clone()]);
+
+        let mut step_create = ChainStep::new(create.id.clone());
+        step_create.captures.push(CaptureRule {
+            name: "item_id".into(),
+            source: CaptureSource::JsonField {
+                pointer: "/id".into(),
+            },
+            required: true,
+            sensitive: false,
+        });
+        let mut step_check = ChainStep::new(check.id.clone());
+        step_check
+            .assertions
+            .push(AssertionRule::Status { expected: 200 });
+        let mut step_delete = ChainStep::new(delete.id.clone());
+        step_delete.always_run = true;
+        step_delete
+            .assertions
+            .push(AssertionRule::Status { expected: 204 });
+
+        project.chains.push(RequestChain {
+            id: "crud".into(),
+            name: "CRUD".into(),
+            steps: vec![step_create, step_check, step_delete],
+        });
+
+        let server = tokio::spawn(async move {
+            for (expected_prefix, response) in [
+                (
+                    "POST /items HTTP/",
+                    "HTTP/1.1 201 Created\r\nConnection: close\r\nContent-Length: 10\r\n\r\n{\"id\":777}",
+                ),
+                (
+                    "GET /items/777 HTTP/",
+                    "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                ),
+                (
+                    "DELETE /items/777 HTTP/",
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                ),
+            ] {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                while !req.ends_with(b"\r\n\r\n") {
+                    req.push(conn.read_u8().await.unwrap());
+                }
+                assert!(
+                    std::str::from_utf8(&req)
+                        .unwrap()
+                        .starts_with(expected_prefix)
+                );
+                conn.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let outcomes = run_chain(
+            &project,
+            "crud",
+            None,
+            &MemorySecretStore::new(),
+            &origin,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [
+                ChainStepOutcome::Passed { status: 201 },
+                ChainStepOutcome::CheckFailed(_),
+                ChainStepOutcome::Passed { status: 204 },
             ]
         ));
         server.await.unwrap();

@@ -1548,15 +1548,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
-dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
 name = "dirs-sys"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1864,12 +1855,10 @@ name = "fastman-core"
 version = "0.3.1"
 dependencies = [
  "anyhow",
- "dirs 7.0.0",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "uuid",
 ]
@@ -5819,7 +5808,6 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
- "encoding_rs",
  "futures-core",
  "h2",
  "http",
@@ -5830,7 +5818,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",

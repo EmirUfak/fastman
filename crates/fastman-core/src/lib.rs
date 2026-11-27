@@ -19,12 +19,14 @@ pub use captures::{CaptureError, CaptureFailure, CapturedValue, capture_step_res
 pub use chain_runner::{
     ChainExecutionError, ChainFailure, ChainResponsePreview, ChainRunOptions, ChainStepOutcome,
     ChainStepReport, run_chain, run_chain_with_progress, run_chain_with_report,
+    validate_chain_inputs,
 };
 pub use chain_runtime::{ChainRunContext, ChainRunError};
 pub use http::{HttpEngine, HttpError, HttpResponse};
 pub use model::{
-    ApiRequest, AssertionRule, Auth, CaptureRule, CaptureSource, ChainStep, Collection,
-    Environment, Folder, HttpBody, KeyValue, Project, RequestChain, SecretRef,
+    ApiRequest, AssertionRule, Auth, CaptureRule, CaptureSource, ChainInput, ChainInputTarget,
+    ChainStep, Collection, Environment, Folder, HttpBody, KeyValue, Project, RequestChain,
+    SecretRef,
 };
 pub use secrets::{
     MemorySecretStore, OsSecretStore, ResolvedVariables, SecretChangePlan, SecretStore,

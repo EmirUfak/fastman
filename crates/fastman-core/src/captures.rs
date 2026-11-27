@@ -1,6 +1,6 @@
 use crate::{AssertionFailure, CaptureSource, ChainStep, HttpResponse, evaluate_assertions};
 use serde_json::Value;
-use thiserror::Error;
+use std::fmt;
 
 pub(crate) const MAX_CAPTURES: usize = 64;
 pub(crate) const MAX_CAPTURE_NAME_BYTES: usize = 128;
@@ -13,30 +13,63 @@ pub struct CapturedValue {
     pub sensitive: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureFailure {
-    #[error(transparent)]
-    Assertion(#[from] AssertionFailure),
-    #[error("capture rule count exceeds {MAX_CAPTURES}")]
+    Assertion(AssertionFailure),
     TooManyRules,
-    #[error("Response capture at index {rule_index} failed: {reason}")]
     Extraction {
         rule_index: usize,
         reason: CaptureError,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+impl fmt::Display for CaptureFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Assertion(err) => err.fmt(f),
+            Self::TooManyRules => write!(f, "capture rule count exceeds {MAX_CAPTURES}"),
+            Self::Extraction { rule_index, reason } => {
+                write!(f, "Response capture at index {rule_index} failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaptureFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Assertion(err) => err.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<AssertionFailure> for CaptureFailure {
+    fn from(err: AssertionFailure) -> Self {
+        Self::Assertion(err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
-    #[error("required value is missing")]
     MissingValue,
-    #[error("response body was truncated")]
     TruncatedBody,
-    #[error("response body is not valid JSON")]
     MalformedJson,
-    #[error("capture name or value exceeds its size limit")]
     TooLarge,
 }
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue => f.write_str("required value is missing"),
+            Self::TruncatedBody => f.write_str("response body was truncated"),
+            Self::MalformedJson => f.write_str("response body is not valid JSON"),
+            Self::TooLarge => f.write_str("capture name or value exceeds its size limit"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
 
 /// Stage captures for an executed step. Return nothing unless all assertions and
 /// captures succeed. Optional rules skip missing values, not unreadable JSON.
@@ -59,7 +92,7 @@ pub fn capture_step_response(
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(_, value)| Value::String(value.clone())),
-            CaptureSource::JsonField { pointer } => {
+            CaptureSource::JsonField { pointer } | CaptureSource::LinkedJsonField { pointer } => {
                 if response.truncated {
                     return Err(failure(CaptureError::TruncatedBody));
                 }

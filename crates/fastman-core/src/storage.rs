@@ -126,8 +126,9 @@ impl ProjectStore {
 
     pub fn system_default() -> Result<Self> {
         let root = std::env::var_os("FASTMAN_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| dirs::data_local_dir().map(|p| p.join("fastman")))
+            .or_else(|| os_local_data_dir().map(|p| p.join("fastman")))
             .context("No application data directory; set FASTMAN_HOME")?;
         Ok(Self::at(root))
     }
@@ -142,7 +143,40 @@ impl ProjectStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
 
+fn os_local_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local/share"))
+            })
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        None
+    }
+}
+
+impl ProjectStore {
     pub fn create(&self, name: impl Into<String>) -> Result<Project> {
         let project = Project::new(name);
         self.save(&project)?;
@@ -1100,7 +1134,10 @@ mod tests {
 
     #[test]
     fn persists_chain_definitions_and_validates_references() {
-        use crate::{AssertionRule, CaptureRule, CaptureSource, ChainStep, RequestChain};
+        use crate::{
+            AssertionRule, CaptureRule, CaptureSource, ChainInput, ChainInputTarget, ChainStep,
+            RequestChain,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let store = ProjectStore::at(dir.path());
@@ -1119,6 +1156,8 @@ mod tests {
         assert!(step.enabled);
         assert!(step.assertions.is_empty());
         assert!(step.captures.is_empty());
+        assert!(step.inputs.is_empty());
+        assert!(!step.isolate_cookies);
         assert!(
             serde_json::to_value(&step)
                 .unwrap()
@@ -1132,6 +1171,15 @@ mod tests {
                 .is_none()
         );
         let second = ChainStep {
+            inputs: vec![ChainInput {
+                source_step_id: step.id.clone(),
+                capture_name: "status".into(),
+                target: ChainInputTarget::Variable {
+                    name: "login_status".into(),
+                },
+            }],
+            isolate_cookies: true,
+            always_run: false,
             id: "second".into(),
             enabled: false,
             captures: vec![CaptureRule {
@@ -1156,10 +1204,17 @@ mod tests {
             ],
             ..step.clone()
         };
+        let mut first = step.clone();
+        first.captures.push(CaptureRule {
+            name: "status".into(),
+            source: CaptureSource::Status,
+            required: true,
+            sensitive: false,
+        });
         project.chains.push(RequestChain {
             id: "chain".into(),
             name: "Profile checks".into(),
-            steps: vec![step.clone(), second],
+            steps: vec![first, second],
         });
         store.save(&project).unwrap();
         let loaded = store.load(&project.id).unwrap();

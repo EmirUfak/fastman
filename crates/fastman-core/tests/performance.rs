@@ -30,6 +30,7 @@ async fn localhost_request_latency() {
     let server = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             server_connections.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.into_split();

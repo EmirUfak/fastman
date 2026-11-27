@@ -1,29 +1,55 @@
 use crate::captures::{CaptureFailure, CapturedValue, MAX_CAPTURES, capture_step_response};
 use crate::{ChainStep, HttpResponse, Project, ResolvedVariables, SecretStore};
 use std::collections::{BTreeMap, BTreeSet};
-use thiserror::Error;
+use std::fmt;
+use std::sync::Arc;
 
 /// Private state for one run. Never serialized, logged, or shared between runs.
 pub struct ChainRunContext {
     base: ResolvedVariables,
     captures: BTreeMap<String, RunCapture>,
+    sources: BTreeMap<(String, String), Option<Arc<CapturedValue>>>,
 }
 
 struct RunCapture {
     source_step_id: String,
-    captured: CapturedValue,
+    captured: Arc<CapturedValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainRunError {
-    #[error("selected environment does not exist in this project")]
     UnknownEnvironment,
-    #[error(transparent)]
-    Capture(#[from] CaptureFailure),
-    #[error("run capture count exceeds {MAX_CAPTURES}")]
+    Capture(CaptureFailure),
     TooManyCaptures,
-    #[error("step captured the same variable more than once")]
     DuplicateCapture,
+}
+
+impl fmt::Display for ChainRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownEnvironment => {
+                f.write_str("selected environment does not exist in this project")
+            }
+            Self::Capture(err) => err.fmt(f),
+            Self::TooManyCaptures => write!(f, "run capture count exceeds {MAX_CAPTURES}"),
+            Self::DuplicateCapture => f.write_str("step captured the same variable more than once"),
+        }
+    }
+}
+
+impl std::error::Error for ChainRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(err) => err.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<CaptureFailure> for ChainRunError {
+    fn from(err: CaptureFailure) -> Self {
+        Self::Capture(err)
+    }
 }
 
 impl ChainRunContext {
@@ -39,6 +65,7 @@ impl ChainRunContext {
         Ok(Self {
             base: project.resolve_variables(env_id, secret_store),
             captures: BTreeMap::new(),
+            sources: BTreeMap::new(),
         })
     }
 
@@ -46,26 +73,41 @@ impl ChainRunContext {
     pub fn resolved_variables(&self) -> ResolvedVariables {
         let mut resolved = self.base.clone();
         for (name, entry) in &self.captures {
-            let value = &entry.captured.value;
-            let text = match value.as_str() {
-                Some(text) => text.to_owned(),
-                None => value.to_string(),
-            };
-            resolved.values.insert(name.clone(), text);
-            resolved.unresolved_secrets.remove(name);
-            if entry.captured.sensitive {
-                resolved.secret_names.insert(name.clone());
-            } else {
-                resolved.secret_names.remove(name);
-            }
+            insert_capture(&mut resolved, name.clone(), &entry.captured);
         }
         resolved
+    }
+
+    pub(crate) fn retain_sources(&mut self, sources: BTreeSet<(String, String)>) {
+        self.sources = sources.into_iter().map(|key| (key, None)).collect();
+    }
+
+    pub(crate) fn bind_capture(
+        &self,
+        resolved: &mut ResolvedVariables,
+        source: &crate::ChainInput,
+        target: String,
+    ) -> Option<()> {
+        let captured = self
+            .sources
+            .get(&(source.source_step_id.clone(), source.capture_name.clone()))?
+            .as_ref()?;
+        insert_capture(resolved, target, captured);
+        Some(())
     }
 
     pub fn capture_origin(&self, name: &str) -> Option<&str> {
         self.captures
             .get(name)
             .map(|entry| entry.source_step_id.as_str())
+    }
+
+    pub(crate) fn has_step_capture(&self, step_id: &str, name: &str) -> bool {
+        self.capture_origin(name) == Some(step_id)
+            || self
+                .sources
+                .get(&(step_id.to_owned(), name.to_owned()))
+                .is_some_and(Option::is_some)
     }
 
     /// Commit one executed step's captures atomically, only after assertions pass.
@@ -75,18 +117,37 @@ impl ChainRunContext {
         response: &HttpResponse,
     ) -> Result<(), ChainRunError> {
         let staged = capture_step_response(step, response)?;
+        let linked: BTreeSet<_> = step
+            .captures
+            .iter()
+            .filter(|rule| matches!(rule.source, crate::CaptureSource::LinkedJsonField { .. }))
+            .map(|rule| rule.name.as_str())
+            .collect();
         let mut names = BTreeSet::new();
         let mut total = self.captures.len();
         for capture in &staged {
             if !names.insert(&capture.name) {
                 return Err(ChainRunError::DuplicateCapture);
             }
-            total += usize::from(!self.captures.contains_key(&capture.name));
+            total += usize::from(
+                !linked.contains(capture.name.as_str())
+                    && !self.captures.contains_key(&capture.name),
+            );
         }
         if total > MAX_CAPTURES {
             return Err(ChainRunError::TooManyCaptures);
         }
         for captured in staged {
+            let captured = Arc::new(captured);
+            if let Some(source) = self
+                .sources
+                .get_mut(&(step.id.clone(), captured.name.clone()))
+            {
+                *source = Some(Arc::clone(&captured));
+            }
+            if linked.contains(captured.name.as_str()) {
+                continue;
+            }
             self.captures.insert(
                 captured.name.clone(),
                 RunCapture {
@@ -96,6 +157,20 @@ impl ChainRunContext {
             );
         }
         Ok(())
+    }
+}
+
+fn insert_capture(resolved: &mut ResolvedVariables, name: String, capture: &CapturedValue) {
+    let value = &capture.value;
+    let text = value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned);
+    resolved.values.insert(name.clone(), text);
+    resolved.unresolved_secrets.remove(&name);
+    if capture.sensitive {
+        resolved.secret_names.insert(name);
+    } else {
+        resolved.secret_names.remove(&name);
     }
 }
 
@@ -110,6 +185,9 @@ mod tests {
             request_id: "request".into(),
             enabled: true,
             assertions: vec![],
+            inputs: vec![],
+            isolate_cookies: false,
+            always_run: false,
             captures: names
                 .into_iter()
                 .map(|name| CaptureRule {

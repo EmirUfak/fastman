@@ -10,42 +10,74 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
-    sync::Arc,
+    fmt,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use thiserror::Error;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 use crate::template::MAX_INTERPOLATED_BYTES;
 const MAX_REDIRECT_HOPS: usize = 10;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum HttpError {
-    #[error("Unknown variable: {{{{{0}}}}}")]
     MissingVariable(String),
-    #[error("Secret variable {{{{{name}}}}} could not be resolved: {reason}")]
     UnresolvedSecret { name: String, reason: String },
-    #[error("Unclosed variable expression")]
     UnclosedVariable,
-    #[error("Interpolated value exceeds maximum size ({0} bytes)")]
     InterpolatedTooLarge(usize),
-    #[error("Invalid URL: {0}")]
     InvalidUrl(String),
-    #[error("Invalid HTTP method: {0}")]
     Method(String),
-    #[error("Invalid header name: {0}")]
     HeaderName(String),
-    #[error("Invalid header value for {0}")]
     HeaderValue(String),
-    #[error("API key query parameter name is empty")]
     EmptyApiKeyParam,
-    #[error("invalid chain origin")]
     InvalidChainOrigin,
-    #[error("request destination is not allowed in this chain session")]
     ChainDestination,
-    #[error("HTTP request failed: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingVariable(name) => write!(f, "Unknown variable: {{{{{name}}}}}"),
+            Self::UnresolvedSecret { name, reason } => {
+                write!(
+                    f,
+                    "Secret variable {{{{{name}}}}} could not be resolved: {reason}"
+                )
+            }
+            Self::UnclosedVariable => f.write_str("Unclosed variable expression"),
+            Self::InterpolatedTooLarge(max) => {
+                write!(f, "Interpolated value exceeds maximum size ({max} bytes)")
+            }
+            Self::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
+            Self::Method(method) => write!(f, "Invalid HTTP method: {method}"),
+            Self::HeaderName(name) => write!(f, "Invalid header name: {name}"),
+            Self::HeaderValue(name) => write!(f, "Invalid header value for {name}"),
+            Self::EmptyApiKeyParam => f.write_str("API key query parameter name is empty"),
+            Self::InvalidChainOrigin => f.write_str("invalid chain origin"),
+            Self::ChainDestination => {
+                f.write_str("request destination is not allowed in this chain session")
+            }
+            Self::Transport(err) => write!(f, "HTTP request failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for HttpError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(err)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +179,7 @@ pub fn configured_env_proxy_summary() -> Option<String> {
 #[derive(Clone)]
 pub struct HttpEngine {
     client: Client,
+    insecure_client: Arc<OnceLock<Client>>,
     session: Option<Arc<ChainSession>>,
 }
 
@@ -188,6 +221,7 @@ impl HttpEngine {
         let client = Self::build_client(true, None)?;
         Ok(Self {
             client,
+            insecure_client: Arc::new(OnceLock::new()),
             session: None,
         })
     }
@@ -216,6 +250,15 @@ impl HttpEngine {
         if origins[0].scheme() == "https" && origins.iter().any(|url| url.scheme() == "http") {
             return Err(HttpError::InvalidChainOrigin);
         }
+        Self::chain_session(origins)
+    }
+
+    pub(crate) fn isolated_cookies(&self) -> Result<Self, HttpError> {
+        let session = self.session.as_ref().ok_or(HttpError::InvalidChainOrigin)?;
+        Self::chain_session(session.origins.clone())
+    }
+
+    fn chain_session(origins: Vec<Url>) -> Result<Self, HttpError> {
         let session = Arc::new(ChainSession {
             origins,
             cookies: Arc::new(Jar::default()),
@@ -223,6 +266,7 @@ impl HttpEngine {
         let client = Self::build_client(true, Some(&session))?;
         Ok(Self {
             client,
+            insecure_client: Arc::new(OnceLock::new()),
             session: Some(session),
         })
     }
@@ -339,7 +383,7 @@ impl HttpEngine {
                 }
                 let value = interpolate_resolved(value, variables, unresolved_secrets)?;
                 pairs.append_pair(key, &value);
-                query_credential = Some(value);
+                query_credential = Some(value.into_owned());
             }
         }
         let mut credentials = Vec::new();
@@ -362,7 +406,7 @@ impl HttpEngine {
                 let value_text = interpolate_resolved(value, variables, unresolved_secrets)?;
                 let header_value = HeaderValue::from_str(&value_text)
                     .map_err(|_| HttpError::HeaderValue(name.clone()))?;
-                credentials.push(value_text);
+                credentials.push(value_text.into_owned());
                 Some((header_name, header_value))
             }
             _ => None,
@@ -402,7 +446,7 @@ impl HttpEngine {
                 {
                     credentials.push(credential.trim().to_owned());
                 }
-                credentials.push(value_text);
+                credentials.push(value_text.into_owned());
             }
             if name == CONTENT_TYPE || name == AUTHORIZATION {
                 header_map.insert(name, value);
@@ -430,12 +474,13 @@ impl HttpEngine {
         }
         let has_content_type = header_map.contains_key(CONTENT_TYPE);
         let timeout = Duration::from_millis(request.timeout_ms.clamp(100, 300_000));
-        let insecure_client;
         let client = if request.verify_tls {
             &self.client
+        } else if let Some(cached) = self.insecure_client.get() {
+            cached
         } else {
-            insecure_client = Self::build_client(false, self.session.as_deref())?;
-            &insecure_client
+            let built = Self::build_client(false, self.session.as_deref())?;
+            self.insecure_client.get_or_init(|| built)
         };
         let mut builder = client
             .request(method, url)
@@ -447,14 +492,14 @@ impl HttpEngine {
             Auth::Basic { username, password } => {
                 let username = interpolate_resolved(username, variables, unresolved_secrets)?;
                 let password = interpolate_resolved(password, variables, unresolved_secrets)?;
-                let builder = builder.basic_auth(&username, Some(&password));
-                credentials.push(password);
+                let builder = builder.basic_auth(username.as_ref(), Some(password.as_ref()));
+                credentials.push(password.into_owned());
                 builder
             }
             Auth::Bearer { token } => {
                 let token = interpolate_resolved(token, variables, unresolved_secrets)?;
-                let builder = builder.bearer_auth(&token);
-                credentials.push(token);
+                let builder = builder.bearer_auth(token.as_ref());
+                credentials.push(token.into_owned());
                 builder
             }
             Auth::ApiKeyHeader { .. } => {
@@ -468,14 +513,14 @@ impl HttpEngine {
 
         builder = match &request.body {
             HttpBody::None => builder,
-            HttpBody::Text(text) => {
-                builder.body(interpolate_resolved(text, variables, unresolved_secrets)?)
-            }
+            HttpBody::Text(text) => builder
+                .body(interpolate_resolved(text, variables, unresolved_secrets)?.into_owned()),
             HttpBody::Json(text) => {
                 if !has_content_type {
                     builder = builder.header(CONTENT_TYPE, "application/json");
                 }
-                builder.body(interpolate_resolved(text, variables, unresolved_secrets)?)
+                builder
+                    .body(interpolate_resolved(text, variables, unresolved_secrets)?.into_owned())
             }
             HttpBody::FormUrlEncoded(rows) => {
                 let data = expand_pairs(rows, variables, unresolved_secrets)?;
@@ -527,7 +572,11 @@ impl HttpEngine {
                 (k.to_string(), value.to_owned())
             })
             .collect();
-        let mut received = Vec::with_capacity(8192);
+        let initial_capacity = response
+            .content_length()
+            .and_then(|len| usize::try_from(len).ok())
+            .map_or(8192, |len| len.min(MAX_RESPONSE_BYTES));
+        let mut received = Vec::with_capacity(initial_capacity);
         let mut truncated = false;
         while let Some(chunk) = response
             .chunk()
@@ -609,11 +658,13 @@ fn hex_preview(bytes: &[u8], limit: usize) -> String {
         .join(" ")
 }
 
-fn expand_pairs(
-    items: &[KeyValue],
-    variables: &BTreeMap<String, String>,
-    unresolved_secrets: &BTreeMap<String, String>,
-) -> Result<Vec<(String, String)>, HttpError> {
+type ExpandedPairs<'a> = Vec<(Cow<'a, str>, Cow<'a, str>)>;
+
+fn expand_pairs<'a>(
+    items: &'a [KeyValue],
+    variables: &'a BTreeMap<String, String>,
+    unresolved_secrets: &'a BTreeMap<String, String>,
+) -> Result<ExpandedPairs<'a>, HttpError> {
     items
         .iter()
         .filter(|item| item.enabled && !item.key.trim().is_empty())
@@ -626,11 +677,11 @@ fn expand_pairs(
         .collect()
 }
 
-fn interpolate_resolved(
-    input: &str,
-    variables: &BTreeMap<String, String>,
-    unresolved_secrets: &BTreeMap<String, String>,
-) -> Result<String, HttpError> {
+fn interpolate_resolved<'a>(
+    input: &'a str,
+    variables: &'a BTreeMap<String, String>,
+    unresolved_secrets: &'a BTreeMap<String, String>,
+) -> Result<Cow<'a, str>, HttpError> {
     crate::template::expand(
         input,
         |name, _| {
@@ -653,7 +704,7 @@ fn interpolate_resolved(
 /// Single-pass substitution; values are not recursively interpreted and total
 /// output length is bounded to prevent memory exhaustion bombs.
 pub fn interpolate(input: &str, variables: &BTreeMap<String, String>) -> Result<String, HttpError> {
-    interpolate_resolved(input, variables, &BTreeMap::new())
+    interpolate_resolved(input, variables, &BTreeMap::new()).map(Cow::into_owned)
 }
 
 #[cfg(test)]

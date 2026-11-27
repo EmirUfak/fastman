@@ -1,6 +1,7 @@
 use crate::model::{ApiRequest, Auth, HttpBody, KeyValue};
 use crate::secrets::ResolvedVariables;
 use crate::security::is_sensitive_var_name;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
 pub const MAX_INTERPOLATED_BYTES: usize = 4 * 1024 * 1024;
@@ -65,7 +66,13 @@ pub(crate) fn expand<'a, E>(
     input: &'a str,
     mut resolve: impl FnMut(Option<&'a str>, &'a str) -> Result<&'a str, E>,
     too_large: impl Fn() -> E,
-) -> Result<String, E> {
+) -> Result<Cow<'a, str>, E> {
+    let Some(first_start) = input.find("{{") else {
+        if input.len() > MAX_INTERPOLATED_BYTES {
+            return Err(too_large());
+        }
+        return Ok(Cow::Borrowed(input));
+    };
     let mut output = String::with_capacity(input.len().min(MAX_INTERPOLATED_BYTES));
     let mut push = |piece: &str| {
         if piece.len() > MAX_INTERPOLATED_BYTES - output.len() {
@@ -74,19 +81,22 @@ pub(crate) fn expand<'a, E>(
         output.push_str(piece);
         Ok(())
     };
-    let mut remainder = input;
-    while let Some(start) = remainder.find("{{") {
-        push(&remainder[..start])?;
-        let raw = &remainder[start..];
-        let Some((name, token, rest)) = split_placeholder(raw) else {
-            push(resolve(None, raw)?)?;
-            return Ok(output);
+    push(&input[..first_start])?;
+    let mut remainder = &input[first_start..];
+    loop {
+        let Some((name, token, rest)) = split_placeholder(remainder) else {
+            push(resolve(None, remainder)?)?;
+            return Ok(Cow::Owned(output));
         };
         push(resolve(Some(name), token)?)?;
         remainder = rest;
+        let Some(next_start) = remainder.find("{{") else {
+            push(remainder)?;
+            return Ok(Cow::Owned(output));
+        };
+        push(&remainder[..next_start])?;
+        remainder = &remainder[next_start..];
     }
-    push(remainder)?;
-    Ok(output)
 }
 
 fn push_unique(list: &mut Vec<String>, item: &str) {
@@ -143,7 +153,7 @@ pub fn inspect_with_secrets(
 
     match expanded {
         Ok(preview) => TemplateInspection {
-            preview,
+            preview: preview.into_owned(),
             used_variables,
             missing_variables,
             unclosed,

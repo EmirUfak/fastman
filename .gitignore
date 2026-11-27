@@ -11,3 +11,4 @@ fastman-data/
 .env.*
 !*.example
 /docs/
+tools/test-api/node_modules/
