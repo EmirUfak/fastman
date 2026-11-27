@@ -325,7 +325,18 @@ impl HttpEngine {
         variables: &BTreeMap<String, String>,
         unresolved_secrets: &BTreeMap<String, String>,
     ) -> Result<Url, HttpError> {
-        let url_text = interpolate_resolved(&request.url, variables, unresolved_secrets)?;
+        let mut url_text =
+            interpolate_resolved(&request.url, variables, unresolved_secrets)?.into_owned();
+        if !request.path_params.is_empty() {
+            let mut resolved_path = Vec::with_capacity(request.path_params.len());
+            for item in &request.path_params {
+                if item.enabled && !item.key.trim().is_empty() {
+                    let value = interpolate_resolved(&item.value, variables, unresolved_secrets)?;
+                    resolved_path.push(KeyValue::new(item.key.trim(), value.into_owned()));
+                }
+            }
+            url_text = crate::template::substitute_path_params(&url_text, &resolved_path, true);
+        }
         let url = Url::parse(&url_text).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
         if url.scheme() != "https" && url.scheme() != "http" {
             return Err(HttpError::InvalidUrl(

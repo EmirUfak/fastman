@@ -389,6 +389,8 @@ pub(super) struct PrecomputedResponse {
     pub(super) pretty_body: Option<SharedString>,
     pretty_lines: Arc<Vec<HighlightedLine>>,
     raw_lines: Arc<Vec<SharedString>>,
+    max_pretty_line_chars: usize,
+    max_raw_line_chars: usize,
     headers: Arc<Vec<(SharedString, SharedString)>>,
     cookies: Arc<Vec<ParsedCookie>>,
 }
@@ -479,6 +481,16 @@ impl ResponseCacheEntry {
             .map(precompute_json_lines)
             .map(Arc::new)
             .unwrap_or_else(|| Arc::new(Vec::new()));
+        let max_raw_line_chars = raw_lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        let max_pretty_line_chars = pretty_lines
+            .iter()
+            .map(HighlightedLine::char_len)
+            .max()
+            .unwrap_or(0);
         let cookies = Arc::new(parse_cookies(&response));
         let headers: Arc<Vec<(SharedString, SharedString)>> = Arc::new(
             response
@@ -509,6 +521,8 @@ impl ResponseCacheEntry {
                 pretty_body: pretty_body.map(SharedString::from),
                 pretty_lines,
                 raw_lines,
+                max_pretty_line_chars,
+                max_raw_line_chars,
                 headers,
                 cookies,
             }),
@@ -942,11 +956,18 @@ impl WorkspaceView {
                     let show_effective_url = entry.is_some_and(|e| {
                         !e.sent_url.is_empty() && e.sent_url.as_ref() != resp.final_url.as_ref()
                     });
-                    let code_lines = if !self.response_raw && resp.pretty_body.is_some() {
-                        CodeLines::Json(resp.pretty_lines.clone())
-                    } else {
-                        CodeLines::Plain(resp.raw_lines.clone())
-                    };
+                    let (code_lines, max_line_chars) =
+                        if !self.response_raw && resp.pretty_body.is_some() {
+                            (
+                                CodeLines::Json(resp.pretty_lines.clone()),
+                                resp.max_pretty_line_chars,
+                            )
+                        } else {
+                            (
+                                CodeLines::Plain(resp.raw_lines.clone()),
+                                resp.max_raw_line_chars,
+                            )
+                        };
                     let search_lower = if self.response_find_open {
                         self.response_search_lower.as_str()
                     } else {
@@ -957,8 +978,101 @@ impl WorkspaceView {
                         self.response_wrap,
                         search_lower,
                         &self.response_scroll,
+                        &self.response_hscroll,
+                        max_line_chars,
                         cx,
                     );
+                    let top_hscrollbar = (!self.response_wrap).then(|| {
+                        let hscroll_paint = self.response_hscroll.clone();
+                        let thumb_color = if self.response_hscroll_drag.is_some() {
+                            brand_accent(cx.theme().is_dark())
+                        } else {
+                            muted_fg.opacity(0.45)
+                        };
+                        let track_bg = cx.theme().secondary.opacity(0.32);
+                        div()
+                            .id("response-top-hscrollbar")
+                            .h(px(14.))
+                            .w_full()
+                            .flex_shrink_0()
+                            .bg(track_bg)
+                            .border_b_1()
+                            .border_color(border.opacity(0.75))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    let bounds = view.response_hscroll.bounds();
+                                    let max_x =
+                                        f32::from(view.response_hscroll.max_offset().x).max(0.0);
+                                    let track_w = f32::from(bounds.size.width).max(1.0);
+                                    if max_x <= 0.5 {
+                                        return;
+                                    }
+                                    let total_w = track_w + max_x;
+                                    let thumb_w =
+                                        (track_w * (track_w / total_w)).clamp(36.0, track_w);
+                                    let usable = (track_w - thumb_w).max(1.0);
+                                    let cur_scroll = (-f32::from(view.response_hscroll.offset().x))
+                                        .clamp(0.0, max_x);
+                                    let thumb_left = (cur_scroll / max_x) * usable;
+                                    let local_x = f32::from(event.position.x - bounds.origin.x);
+                                    let target_scroll = if local_x >= thumb_left
+                                        && local_x <= thumb_left + thumb_w
+                                    {
+                                        cur_scroll
+                                    } else {
+                                        let ratio =
+                                            ((local_x - thumb_w * 0.5) / usable).clamp(0.0, 1.0);
+                                        let next = ratio * max_x;
+                                        view.response_hscroll.set_offset(point(px(-next), px(0.)));
+                                        next
+                                    };
+                                    view.response_hscroll_drag =
+                                        Some((event.position.x, target_scroll));
+                                    window.refresh();
+                                }),
+                            )
+                            .child(
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, (), window, _| {
+                                        let max_x =
+                                            f32::from(hscroll_paint.max_offset().x).max(0.0);
+                                        let track_w = f32::from(bounds.size.width);
+                                        if max_x <= 0.5 || track_w <= 4.0 {
+                                            return;
+                                        }
+                                        let total_w = track_w + max_x;
+                                        let thumb_w =
+                                            (track_w * (track_w / total_w)).clamp(36.0, track_w);
+                                        let usable = (track_w - thumb_w).max(0.0);
+                                        let cur_scroll = (-f32::from(hscroll_paint.offset().x))
+                                            .clamp(0.0, max_x);
+                                        let thumb_x = if max_x > 0.0 {
+                                            (cur_scroll / max_x) * usable
+                                        } else {
+                                            0.0
+                                        };
+                                        window.paint_quad(
+                                            fill(
+                                                Bounds {
+                                                    origin: point(
+                                                        bounds.origin.x + px(thumb_x),
+                                                        bounds.origin.y + px(3.),
+                                                    ),
+                                                    size: size(px(thumb_w), px(7.)),
+                                                },
+                                                thumb_color,
+                                            )
+                                            .corner_radii(px(3.5)),
+                                        );
+                                    },
+                                )
+                                .size_full(),
+                            )
+                    });
                     let body_container = div()
                         .flex_1()
                         .min_h_0()
@@ -1002,6 +1116,7 @@ impl WorkspaceView {
                                     ),
                             )
                         })
+                        .when_some(top_hscrollbar, |el, bar| el.child(bar))
                         .child(body_container)
                         .into_any_element()
                 }
@@ -1034,10 +1149,17 @@ impl WorkspaceView {
         };
 
         div()
+            .id("response-panel-root")
             .size_full()
             .flex()
             .flex_col()
             .bg(bg)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, _| {
+                    view.active_pane = crate::workspace::ActivePane::Response;
+                }),
+            )
             .child(toolbar)
             .when_some(find_bar, |el, bar| el.child(bar))
             .child(content)

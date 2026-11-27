@@ -213,6 +213,24 @@ fn request(item: &Value, warnings: &mut Vec<String>) -> Result<Option<ApiRequest
         .with_context(|| format!("Invalid URL in imported request '{name}'"))?;
 
     let mut result = ApiRequest::new(raw_method, name, url);
+    if let Some(vars) = data
+        .get("url")
+        .and_then(|u| u.get("variable"))
+        .and_then(Value::as_array)
+    {
+        for var in vars {
+            let key = var.get("key").and_then(Value::as_str).unwrap_or("").trim();
+            let value = var.get("value").and_then(Value::as_str).unwrap_or("");
+            if !key.is_empty() {
+                let mut pair = KeyValue::new(key, value);
+                pair.enabled = !var
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                result.path_params.push(pair);
+            }
+        }
+    }
     if let Some(headers) = data.get("header").and_then(Value::as_array) {
         for header in headers {
             let key = header

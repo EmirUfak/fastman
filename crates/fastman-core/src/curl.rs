@@ -341,6 +341,18 @@ pub fn to_curl_export_with_secrets(
     };
 
     let mut full_url = resolver.resolve(&request.url)?;
+    if !request.path_params.is_empty() {
+        let mut resolved_path = Vec::with_capacity(request.path_params.len());
+        for p in &request.path_params {
+            if !p.enabled || p.key.trim().is_empty() {
+                continue;
+            }
+            let k = p.key.trim().to_owned();
+            let v = resolver.resolve(&p.value)?;
+            resolved_path.push(KeyValue::new(k, v));
+        }
+        full_url = crate::template::substitute_path_params(&full_url, &resolved_path, true);
+    }
     validate_template_or_http_url(&full_url)?;
 
     let redacted = redact_url_secrets(&full_url);

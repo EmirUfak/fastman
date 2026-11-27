@@ -69,6 +69,8 @@ pub struct ApiRequest {
     pub url: String,
     #[serde(default)]
     pub params: Vec<KeyValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_params: Vec<KeyValue>,
     #[serde(default)]
     pub headers: Vec<KeyValue>,
     #[serde(default)]
@@ -97,6 +99,7 @@ impl ApiRequest {
             method: method.into(),
             url: url.into(),
             params: vec![],
+            path_params: vec![],
             headers: vec![],
             body: HttpBody::None,
             timeout_ms: default_timeout(),

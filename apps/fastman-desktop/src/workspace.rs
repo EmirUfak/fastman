@@ -86,6 +86,20 @@ struct DestructiveDialogSpec {
 }
 
 /// Retained window state: project model + editor entities + request lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ActivePane {
+    #[default]
+    Explorer,
+    Request,
+    Response,
+}
+
+pub(super) struct PathParamRow {
+    pub(super) key: String,
+    pub(super) value: Entity<InputState>,
+    _sub: Subscription,
+}
+
 pub struct WorkspaceView {
     window_handle: AnyWindowHandle,
     pub(super) focus_handle: FocusHandle,
@@ -125,6 +139,7 @@ pub struct WorkspaceView {
     pub(super) url: Entity<InputState>,
     pub(super) request_name: Entity<InputState>,
     pub(super) params_table: KvTable,
+    pub(super) path_params: Vec<PathParamRow>,
     pub(super) headers_table: KvTable,
     pub(super) form_table: KvTable,
     pub(super) body_editor: Entity<EditorState>,
@@ -153,6 +168,7 @@ pub struct WorkspaceView {
     pub(super) draft_sensitive_findings: Vec<SensitiveFieldFinding>,
     pub(super) explorer_filter_lower: String,
     pub(super) response_tab: usize,
+    pub(super) active_pane: ActivePane,
     pub(super) response_position: ResponsePosition,
     pub(super) response_raw: bool,
     pub(super) response_wrap: bool,
@@ -162,6 +178,8 @@ pub struct WorkspaceView {
     pub(super) response_search_matches: usize,
     pub(super) explorer_scroll: UniformListScrollHandle,
     pub(super) response_scroll: UniformListScrollHandle,
+    pub(super) response_hscroll: ScrollHandle,
+    pub(super) response_hscroll_drag: Option<(Pixels, f32)>,
     pub(super) headers_scroll: UniformListScrollHandle,
     pub(super) cookies_scroll: UniformListScrollHandle,
     pub(super) status: SharedString,
@@ -365,6 +383,8 @@ impl WorkspaceView {
                     if !prev_started_curl && curl::looks_like_curl_command(&raw) {
                         view.try_apply_curl_from_url_bar(&raw, prior_url, view.dirty, window, cx);
                     } else {
+                        view.sync_path_params_from_url(None, window, cx);
+                        view.refresh_kv_counts(cx);
                         view.mark_dirty(cx);
                     }
                 }
@@ -443,6 +463,7 @@ impl WorkspaceView {
             url,
             request_name,
             params_table: KvTable::new("param", "value", true),
+            path_params: Vec::new(),
             headers_table: KvTable::new("Header-Name", "value", true),
             form_table: KvTable::new("field", "value", true),
             body_editor,
@@ -471,6 +492,7 @@ impl WorkspaceView {
             draft_sensitive_findings: Vec::new(),
             explorer_filter_lower: String::new(),
             response_tab: 0,
+            active_pane: ActivePane::Explorer,
             response_position: ui_settings.response_position,
             response_raw: ui_settings.response_raw,
             response_wrap: ui_settings.response_wrap,
@@ -480,6 +502,8 @@ impl WorkspaceView {
             response_search_matches: 0,
             explorer_scroll: UniformListScrollHandle::new(),
             response_scroll: UniformListScrollHandle::new(),
+            response_hscroll: ScrollHandle::new(),
+            response_hscroll_drag: None,
             headers_scroll: UniformListScrollHandle::new(),
             cookies_scroll: UniformListScrollHandle::new(),
             status: SharedString::new_static(initial_status),
@@ -645,13 +669,28 @@ impl WorkspaceView {
 
     fn refresh_url_tokens(&mut self, cx: &mut Context<Self>) {
         let text = self.url.read(cx).value().to_string();
-        let spans =
+        let var_spans =
             fastman_core::template::find_resolved_spans(&text, &self.resolved_variables.values);
-        let mut content = InputContent::new(text.clone());
-        for span in spans {
+        let path_spans = fastman_core::template::find_path_param_spans(&text);
+        let mut all_tokens: Vec<(std::ops::Range<usize>, InlineToken)> = Vec::new();
+        for span in var_spans {
             let raw = &text[span.range.clone()];
-            let token = InlineToken::new(format!("var:{}", span.name), raw.to_owned());
-            if let Ok(next) = content.clone().with_token(span.range, token) {
+            all_tokens.push((
+                span.range,
+                InlineToken::new(format!("var:{}", span.name), raw.to_owned()),
+            ));
+        }
+        for span in path_spans {
+            let raw = &text[span.range.clone()];
+            all_tokens.push((
+                span.range,
+                InlineToken::new(format!("path:{}", span.name), raw.to_owned()),
+            ));
+        }
+        all_tokens.sort_by_key(|(r, _)| r.start);
+        let mut content = InputContent::new(text);
+        for (range, token) in all_tokens {
+            if let Ok(next) = content.clone().with_token(range, token) {
                 content = next;
             }
         }
@@ -660,12 +699,69 @@ impl WorkspaceView {
         });
     }
 
+    pub(super) fn sync_path_params_from_url(
+        &mut self,
+        saved: Option<&[fastman_core::KeyValue]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.url.read(cx).value().to_string();
+        let keys = fastman_core::template::extract_path_param_names(&url);
+        let existing: HashMap<String, String> = self
+            .path_params
+            .iter()
+            .map(|row| (row.key.clone(), row.value.read(cx).value().to_string()))
+            .collect();
+        let saved_map: HashMap<String, String> = saved
+            .unwrap_or(&[])
+            .iter()
+            .filter(|kv| kv.enabled && !kv.key.trim().is_empty())
+            .map(|kv| (kv.key.trim().to_owned(), kv.value.clone()))
+            .collect();
+
+        let mut next = Vec::with_capacity(keys.len());
+        for key in keys {
+            let initial = saved_map
+                .get(&key)
+                .or_else(|| existing.get(&key))
+                .cloned()
+                .unwrap_or_default();
+            let value = cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("Value");
+                if !initial.is_empty() {
+                    input.set_value(initial, window, cx);
+                }
+                input
+            });
+            let sub = cx.subscribe_in(&value, window, |view, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) && !view.suppress_dirty {
+                    view.mark_dirty(cx);
+                }
+            });
+            next.push(PathParamRow {
+                key,
+                value,
+                _sub: sub,
+            });
+        }
+        self.path_params = next;
+    }
+
+    pub(super) fn path_params_to_key_values(&self, cx: &App) -> Vec<fastman_core::KeyValue> {
+        self.path_params
+            .iter()
+            .map(|row| {
+                fastman_core::KeyValue::new(row.key.clone(), row.value.read(cx).value().to_string())
+            })
+            .collect()
+    }
+
     fn refresh_request_count(&mut self) {
         self.cached_request_count = self.current().request_count();
     }
 
     pub(super) fn refresh_kv_counts(&mut self, cx: &App) {
-        self.params_active_count = self.params_table.active_count(cx);
+        self.params_active_count = self.params_table.active_count(cx) + self.path_params.len();
         self.headers_active_count = self.headers_table.active_count(cx);
     }
 
@@ -708,8 +804,10 @@ impl WorkspaceView {
         });
     }
 
-    fn reset_response_scroll(&self) {
+    fn reset_response_scroll(&mut self) {
         self.response_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.response_hscroll.set_offset(point(px(0.), px(0.)));
+        self.response_hscroll_drag = None;
         self.headers_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.cookies_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
@@ -918,6 +1016,7 @@ impl WorkspaceView {
             cx,
             Self::kv_change_handler(KvTableKind::Params),
         );
+        self.sync_path_params_from_url(Some(&request.path_params), window, cx);
         self.headers_table.load(
             &request.headers,
             window,
@@ -1025,6 +1124,7 @@ impl WorkspaceView {
                 cx,
                 Self::kv_change_handler(KvTableKind::Params),
             );
+            self.path_params.clear();
             self.headers_table.load(
                 &[],
                 window,
@@ -3235,13 +3335,74 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
-                if !view.chain_mode {
+                if view.chain_mode {
+                    return;
+                }
+                let in_response = view.active_pane == ActivePane::Response
+                    || view
+                        .response_search
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                if in_response
+                    && view
+                        .active_response_entry()
+                        .and_then(|entry| entry.response.as_ref())
+                        .is_some()
+                {
+                    view.response_tab = 0;
+                    view.response_find_open = true;
+                    view.response_search
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                    view.refresh_response_search_matches(cx);
+                    cx.notify();
+                } else {
                     view.explorer_search
                         .read(cx)
                         .focus_handle(cx)
                         .focus(window, cx);
                 }
             }))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                if let Some((start_x, start_scroll)) = view.response_hscroll_drag {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        cx.stop_propagation();
+                        let bounds = view.response_hscroll.bounds();
+                        let max_x = f32::from(view.response_hscroll.max_offset().x).max(0.0);
+                        let track_w = f32::from(bounds.size.width).max(1.0);
+                        if max_x > 0.5 {
+                            let total_w = track_w + max_x;
+                            let thumb_w = (track_w * (track_w / total_w)).clamp(36.0, track_w);
+                            let usable = (track_w - thumb_w).max(1.0);
+                            let dx = f32::from(event.position.x - start_x);
+                            let next = (start_scroll + (dx / usable) * max_x).clamp(0.0, max_x);
+                            view.response_hscroll.set_offset(point(px(-next), px(0.)));
+                            window.refresh();
+                        }
+                    } else {
+                        view.response_hscroll_drag = None;
+                        window.refresh();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, window, _| {
+                    if view.response_hscroll_drag.take().is_some() {
+                        window.refresh();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, window, _| {
+                    if view.response_hscroll_drag.take().is_some() {
+                        window.refresh();
+                    }
+                }),
+            )
             .on_action(cx.listener(|view, _: &ToggleTheme, window, cx| {
                 view.toggle_theme(window, cx);
             }))
@@ -3269,7 +3430,18 @@ impl Render for WorkspaceView {
                         resizable_panel()
                             .size(px(270.))
                             .size_range(px(210.)..px(480.))
-                            .child(self.render_explorer_panel(cx)),
+                            .child(
+                                div()
+                                    .id("explorer-panel-root")
+                                    .size_full()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|view, _, _, _| {
+                                            view.active_pane = ActivePane::Explorer;
+                                        }),
+                                    )
+                                    .child(self.render_explorer_panel(cx)),
+                            ),
                     )
                     .child(
                         resizable_panel().child(

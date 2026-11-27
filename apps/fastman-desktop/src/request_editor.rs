@@ -120,6 +120,7 @@ pub(super) struct RequestDraft {
     method: String,
     url: String,
     params: Vec<KeyValue>,
+    path_params: Vec<KeyValue>,
     headers: Vec<KeyValue>,
     body: HttpBody,
     auth: Auth,
@@ -135,6 +136,7 @@ impl RequestDraft {
         request.method = self.method;
         request.url = self.url;
         request.params = self.params;
+        request.path_params = self.path_params;
         request.headers = self.headers;
         request.body = self.body;
         request.auth = self.auth;
@@ -177,6 +179,7 @@ impl WorkspaceView {
             text(&self.url),
         );
         req.params = self.params_table.to_key_values(cx);
+        req.path_params = self.path_params_to_key_values(cx);
         req.headers = self.headers_table.to_key_values(cx);
         req.body = body;
         req.auth = auth;
@@ -199,6 +202,7 @@ impl WorkspaceView {
             method: snap.method,
             url: snap.url,
             params: snap.params,
+            path_params: snap.path_params,
             headers: snap.headers,
             body: snap.body,
             auth: snap.auth,
@@ -869,10 +873,17 @@ impl WorkspaceView {
         });
 
         div()
+            .id("request-panel-root")
             .size_full()
             .flex()
             .flex_col()
             .bg(bg)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, _| {
+                    view.active_pane = crate::workspace::ActivePane::Request;
+                }),
+            )
             .child(tab_strip)
             .child(url_bar)
             .when_some(url_assist_bar, |el, bar| el.child(bar))
@@ -898,8 +909,87 @@ impl WorkspaceView {
         match self.section {
             0 => {
                 let has_query = fastman_core::security::has_url_query(&self.url.read(cx).value());
+                let has_path_params = !self.path_params.is_empty();
+                let path_table = has_path_params.then(|| {
+                    let row_border = cx.theme().table_row_border;
+                    let head_bg = cx.theme().table_head;
+                    let head_fg = cx.theme().table_head_foreground;
+                    let rows = self.path_params.iter().map(|row| {
+                        div()
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(row_border)
+                            .child(
+                                div()
+                                    .w(px(180.))
+                                    .flex_shrink_0()
+                                    .px_2p5()
+                                    .font_family(mono.clone())
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cx.theme().foreground)
+                                    .truncate()
+                                    .child(row.key.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_1p5()
+                                    .border_l_1()
+                                    .border_color(row_border)
+                                    .child(Input::new(&row.value).xsmall()),
+                            )
+                    });
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .pt_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted_fg)
+                                .child("Path Variables (matched from :param segments in URL)"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(border)
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .h(px(26.))
+                                        .flex()
+                                        .items_center()
+                                        .bg(head_bg)
+                                        .text_color(head_fg)
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(div().w(px(180.)).px_2p5().child("KEY"))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .px_2p5()
+                                                .border_l_1()
+                                                .border_color(row_border)
+                                                .child("VALUE"),
+                                        ),
+                                )
+                                .children(rows),
+                        )
+                });
                 div()
+                    .id("params-table-scroll")
                     .size_full()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -914,7 +1004,7 @@ impl WorkspaceView {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(muted_fg)
-                                    .child("Query Parameters (interpolates {{variables}})"),
+                                    .child("Query Params (interpolates {{variables}})"),
                             )
                             .when(has_query, |el| {
                                 el.child(
@@ -929,29 +1019,23 @@ impl WorkspaceView {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .id("params-table-scroll")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(render_kv_table(
-                                "params",
-                                &self.params_table,
-                                cx,
-                                |view, idx, cx| {
-                                    view.params_table.toggle_row(idx);
-                                    view.refresh_kv_counts(cx);
-                                    view.mark_dirty(cx);
-                                },
-                                |view, idx, window, cx| {
-                                    view.remove_kv_row(KvTableKind::Params, idx, window, cx);
-                                },
-                                |view, window, cx| {
-                                    view.add_kv_row(KvTableKind::Params, window, cx);
-                                },
-                            )),
-                    )
+                    .child(render_kv_table(
+                        "params",
+                        &self.params_table,
+                        cx,
+                        |view, idx, cx| {
+                            view.params_table.toggle_row(idx);
+                            view.refresh_kv_counts(cx);
+                            view.mark_dirty(cx);
+                        },
+                        |view, idx, window, cx| {
+                            view.remove_kv_row(KvTableKind::Params, idx, window, cx);
+                        },
+                        |view, window, cx| {
+                            view.add_kv_row(KvTableKind::Params, window, cx);
+                        },
+                    ))
+                    .when_some(path_table, |el, table| el.child(table))
                     .into_any_element()
             }
             1 => {

@@ -224,13 +224,119 @@ pub fn inspect_request_with_secrets(
     )
 }
 
+/// Byte span of a `:param` path variable segment inside a URL template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathParamSpan {
+    pub name: String,
+    pub range: std::ops::Range<usize>,
+}
+
+fn url_path_bounds(url: &str) -> Option<std::ops::Range<usize>> {
+    let trimmed_end = url.find(['?', '#']).unwrap_or(url.len());
+    let head = &url[..trimmed_end];
+    let path_start = if let Some(scheme_pos) = head.find("://") {
+        let after_scheme = scheme_pos + 3;
+        head[after_scheme..].find('/').map(|i| after_scheme + i)?
+    } else if head.starts_with('/') {
+        0
+    } else {
+        head.find('/')?
+    };
+    Some(path_start..trimmed_end)
+}
+
+fn is_valid_path_param_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Find all `:name` path variable segments in the path portion of `url`.
+/// Ignores host ports like `:8080`, schemes like `https://`, query strings, and fragments.
+pub fn find_path_param_spans(url: &str) -> Vec<PathParamSpan> {
+    let Some(path_range) = url_path_bounds(url) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let path = &url[path_range.clone()];
+    let mut seg_start = 0usize;
+    for segment in path.split('/') {
+        if let Some(name) = segment.strip_prefix(':')
+            && is_valid_path_param_name(name)
+        {
+            let abs_start = path_range.start + seg_start;
+            let abs_end = abs_start + segment.len();
+            spans.push(PathParamSpan {
+                name: name.to_owned(),
+                range: abs_start..abs_end,
+            });
+        }
+        seg_start += segment.len() + 1;
+    }
+    spans
+}
+
+/// Extract unique `:name` path variable names from `url` in order of appearance.
+pub fn extract_path_param_names(url: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for span in find_path_param_spans(url) {
+        push_unique(&mut names, &span.name);
+    }
+    names
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Replace `:name` path segments in `url` with matching enabled `path_params` values.
+/// When `percent_encode` is true, unsafe segment characters (e.g. `/`, `?`, `#`, spaces) are encoded.
+pub fn substitute_path_params(url: &str, path_params: &[KeyValue], percent_encode: bool) -> String {
+    let spans = find_path_param_spans(url);
+    if spans.is_empty() || path_params.is_empty() {
+        return url.to_owned();
+    }
+    let mut out = String::with_capacity(url.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        out.push_str(&url[cursor..span.range.start]);
+        if let Some(kv) = path_params
+            .iter()
+            .find(|kv| kv.enabled && kv.key.trim() == span.name && !kv.value.is_empty())
+        {
+            if percent_encode {
+                out.push_str(&encode_path_segment(&kv.value));
+            } else {
+                out.push_str(&kv.value);
+            }
+        } else {
+            out.push_str(&url[span.range.clone()]);
+        }
+        cursor = span.range.end;
+    }
+    out.push_str(&url[cursor..]);
+    out
+}
+
 fn inspect_request_parts(
     request: &ApiRequest,
     variables: &BTreeMap<String, String>,
     secret_names: &HashSet<String>,
     unresolved_map: &BTreeMap<String, String>,
 ) -> RequestTemplateInspection {
-    let url_has_templates = request.url.contains("{{");
+    let has_path_params = !find_path_param_spans(&request.url).is_empty();
+    let url_has_templates = request.url.contains("{{") || has_path_params;
     let url_result = inspect_with_secrets(&request.url, variables, secret_names, true);
     let url_resolved_count = url_result.used_variables.len();
     let mut missing_variables = url_result.missing_variables;
@@ -242,6 +348,24 @@ fn inspect_request_parts(
         &mut missing_variables,
         &mut unclosed,
     );
+    scan_pairs(
+        &request.path_params,
+        variables,
+        &mut missing_variables,
+        &mut unclosed,
+    );
+    let resolved_path_params: Vec<KeyValue> = request
+        .path_params
+        .iter()
+        .map(|kv| {
+            let mut copy = kv.clone();
+            if kv.enabled && !kv.value.is_empty() {
+                copy.value = inspect_with_secrets(&kv.value, variables, secret_names, true).preview;
+            }
+            copy
+        })
+        .collect();
+    let url_preview = substitute_path_params(&url_result.preview, &resolved_path_params, false);
     scan_pairs(
         &request.headers,
         variables,
@@ -284,7 +408,7 @@ fn inspect_request_parts(
     let url_preview = if url_result.truncated {
         "<preview exceeds 4 MiB limit>".to_owned()
     } else {
-        url_result.preview
+        url_preview
     };
 
     RequestTemplateInspection {
@@ -300,6 +424,28 @@ fn inspect_request_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_params_extract_and_substitute_without_matching_ports() {
+        let url = "{{liveURL}}/tournaments/:slug/media/:day_id?sort=:ignored#frag";
+        assert_eq!(extract_path_param_names(url), vec!["slug", "day_id"]);
+
+        let port_url = "http://127.0.0.1:4010/items/:id";
+        assert_eq!(extract_path_param_names(port_url), vec!["id"]);
+
+        let params = vec![
+            KeyValue::new("slug", "pgl-major-singapore-2026"),
+            KeyValue::new("day_id", "day 1/final"),
+        ];
+        assert_eq!(
+            substitute_path_params(url, &params, true),
+            "{{liveURL}}/tournaments/pgl-major-singapore-2026/media/day%201%2Ffinal?sort=:ignored#frag"
+        );
+        assert_eq!(
+            substitute_path_params(url, &params, false),
+            "{{liveURL}}/tournaments/pgl-major-singapore-2026/media/day 1/final?sort=:ignored#frag"
+        );
+    }
 
     #[test]
     fn find_resolved_spans_matches_defined_placeholders_only() {

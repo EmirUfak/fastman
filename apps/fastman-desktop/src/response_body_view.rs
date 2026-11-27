@@ -33,6 +33,18 @@ pub struct HighlightedLine {
     tokens: Vec<(Range<usize>, JsonTokenKind)>,
 }
 
+impl HighlightedLine {
+    pub fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+}
+
+/// Estimated horizontal width (in pixels) needed to render the longest unwrapped code line.
+pub fn content_width_px(max_line_chars: usize) -> f32 {
+    // 46px line-number gutter + 24px horizontal padding + 16px trailing breathing room + ~7.8px/char at 12px mono.
+    (46.0 + 40.0 + max_line_chars as f32 * 7.8).ceil()
+}
+
 #[derive(Clone)]
 pub enum CodeLines {
     Json(Arc<Vec<HighlightedLine>>),
@@ -442,6 +454,8 @@ pub fn render_virtual_code_lines(
     wrap: bool,
     search_lower: &str,
     scroll_handle: &UniformListScrollHandle,
+    hscroll_handle: &ScrollHandle,
+    max_line_chars: usize,
     cx: &App,
 ) -> AnyElement {
     let is_dark = cx.theme().is_dark();
@@ -495,7 +509,8 @@ pub fn render_virtual_code_lines(
 
     let search_owned = search_lower.to_owned();
     let mono_list = mono.clone();
-    uniform_list(
+    let content_w = content_width_px(max_line_chars);
+    let list = uniform_list(
         "response-body-list",
         line_count,
         move |range, _, _| -> Vec<AnyElement> {
@@ -531,8 +546,15 @@ pub fn render_virtual_code_lines(
     .line_height(px(20.))
     .text_color(foreground)
     .track_scroll(scroll_handle)
-    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-    .into_any_element()
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
+
+    div()
+        .id("response-body-hscroll")
+        .size_full()
+        .overflow_x_scroll()
+        .track_scroll(hscroll_handle)
+        .child(div().h_full().min_w_full().w(px(content_w)).child(list))
+        .into_any_element()
 }
 
 fn render_code_row(
@@ -578,7 +600,7 @@ fn render_code_row(
         .child(
             div()
                 .flex_1()
-                .min_w_0()
+                .when(wrap, |d| d.min_w_0())
                 .border_l_1()
                 .border_color(border)
                 .px_3()
@@ -667,6 +689,7 @@ mod tests {
                 struct WrapProbe {
                     lines: CodeLines,
                     scroll: UniformListScrollHandle,
+                    hscroll: ScrollHandle,
                 }
 
                 impl gpui::Render for WrapProbe {
@@ -682,6 +705,8 @@ mod tests {
                                     true,
                                     "",
                                     &self.scroll,
+                                    &self.hscroll,
+                                    0,
                                     cx,
                                 ),
                             ),
@@ -699,6 +724,7 @@ mod tests {
                 let (_, vcx) = cx.add_window_view(move |_, _| WrapProbe {
                     lines,
                     scroll: UniformListScrollHandle::new(),
+                    hscroll: ScrollHandle::new(),
                 });
                 vcx.simulate_resize(gpui::size(px(360.), px(220.)));
                 vcx.update(|window, cx| {
