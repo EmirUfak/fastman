@@ -3979,6 +3979,8 @@ mod tests {
         })
         .unwrap();
 
+        drain_persistence(&mut cx, &view);
+
         // Reload in a fresh view against the same store root and verify persisted UI settings.
         let (window2, view2) = cx
             .update(|cx| {
